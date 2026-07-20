@@ -1788,6 +1788,97 @@ mod tests {
         assert_eq!(rows.load(Ordering::Relaxed), 516);
     }
 
+    struct GrowingVirtualScrollApp {
+        content_height: u32,
+        builds: Arc<AtomicUsize>,
+        rows: Arc<AtomicUsize>,
+    }
+
+    impl App for GrowingVirtualScrollApp {
+        type Message = ();
+
+        fn update(&mut self, (): ()) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            let builds = Arc::clone(&self.builds);
+            let rows = Arc::clone(&self.rows);
+            Node::virtual_scroll_viewport_with_options(
+                "growing-virtual-scroll",
+                Size::new(3, self.content_height),
+                crate::ScrollViewportOptions {
+                    axis: crate::ScrollAxis::Vertical,
+                    stick_to_end: true,
+                    ..crate::ScrollViewportOptions::default()
+                },
+                move |viewport| {
+                    builds.fetch_add(1, Ordering::Relaxed);
+                    rows.fetch_add(viewport.size.height as usize, Ordering::Relaxed);
+                    let start = viewport.offset.y;
+                    let end = start.saturating_add(viewport.size.height);
+                    let visible = (start..end).map(|row| Node::text(row.to_string()));
+                    crate::VirtualFragment::new(ScrollOffset::new(0, start), Node::column(visible))
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn virtual_scroll_viewport_builds_once_when_following_growing_end() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let rows = Arc::new(AtomicUsize::new(0));
+        let mut runtime = Runtime::with_clock(
+            GrowingVirtualScrollApp {
+                content_height: 4,
+                builds: Arc::clone(&builds),
+                rows: Arc::clone(&rows),
+            },
+            RuntimeConfig::new(Size::new(3, 2)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+
+        let initial = runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert_eq!(rows.load(Ordering::Relaxed), 2);
+        assert_eq!(initial.surface().cell(0, 0).unwrap().content(), "2");
+        assert_eq!(initial.surface().cell(0, 1).unwrap().content(), "3");
+
+        runtime.app_mut().content_height = 5;
+        let grown = runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        assert_eq!(rows.load(Ordering::Relaxed), 4);
+        assert_eq!(grown.surface().cell(0, 0).unwrap().content(), "3");
+        assert_eq!(grown.surface().cell(0, 1).unwrap().content(), "4");
+        let state = runtime
+            .interaction()
+            .scroll_state(&NodeId::from("growing-virtual-scroll"))
+            .unwrap();
+        assert_eq!(state.offset, ScrollOffset::new(0, 3));
+        assert_eq!(state.maximum, ScrollOffset::new(0, 3));
+        assert!(state.at_end);
+
+        assert!(runtime.set_scroll_offset(
+            &NodeId::from("growing-virtual-scroll"),
+            ScrollOffset::new(0, 1),
+        ));
+        runtime.render_if_dirty().unwrap().unwrap();
+        runtime.app_mut().content_height = 6;
+        let away = runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(builds.load(Ordering::Relaxed), 4);
+        assert_eq!(rows.load(Ordering::Relaxed), 8);
+        assert_eq!(away.surface().cell(0, 0).unwrap().content(), "1");
+        assert_eq!(away.surface().cell(0, 1).unwrap().content(), "2");
+        let state = runtime
+            .interaction()
+            .scroll_state(&NodeId::from("growing-virtual-scroll"))
+            .unwrap();
+        assert_eq!(state.offset, ScrollOffset::new(0, 1));
+        assert_eq!(state.maximum, ScrollOffset::new(0, 4));
+        assert!(!state.at_end);
+    }
+
     struct OverscannedScrollApp;
 
     impl App for OverscannedScrollApp {

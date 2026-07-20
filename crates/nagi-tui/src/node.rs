@@ -949,13 +949,23 @@ impl<Message> Node<Message> {
                     .id
                     .as_ref()
                     .expect("VirtualScrollViewport always has a NodeId");
+                let state = interaction.preview_scroll(
+                    id,
+                    virtual_scroll_maximum(
+                        virtual_node.content_size,
+                        rect,
+                        virtual_node.options.axis,
+                    ),
+                    virtual_node.options.axis,
+                    virtual_node.options.stick_to_end,
+                );
                 if let Some(fragment) = virtual_fragment(
                     virtual_node.content_size,
                     virtual_node.options.axis,
                     virtual_node.builder.as_ref(),
                     &virtual_node.cache,
                     rect,
-                    interaction.scroll_offset(id),
+                    state.offset,
                 ) {
                     fragment.fragment.node.build_index(
                         virtual_fragment_rect(rect, &fragment),
@@ -1021,16 +1031,12 @@ impl<Message> Node<Message> {
                     .id
                     .as_ref()
                     .expect("VirtualScrollViewport always has a NodeId");
-                let content = resolved_virtual_content_size(
-                    virtual_node.content_size,
-                    rect.size(),
-                    virtual_node.options.axis,
-                );
                 let state = interaction.prepare_scroll(
                     id,
-                    ScrollOffset::new(
-                        content.width.saturating_sub(rect.width),
-                        content.height.saturating_sub(rect.height),
+                    virtual_scroll_maximum(
+                        virtual_node.content_size,
+                        rect,
+                        virtual_node.options.axis,
                     ),
                     virtual_node.options.axis,
                     virtual_node.options.stick_to_end,
@@ -1658,6 +1664,14 @@ fn resolved_virtual_content_size(declared: Size, viewport: Size, _axis: ScrollAx
     Size::new(
         declared.width.max(viewport.width),
         declared.height.max(viewport.height),
+    )
+}
+
+fn virtual_scroll_maximum(declared: Size, viewport: Rect, axis: ScrollAxis) -> ScrollOffset {
+    let content = resolved_virtual_content_size(declared, viewport.size(), axis);
+    ScrollOffset::new(
+        content.width.saturating_sub(viewport.width),
+        content.height.saturating_sub(viewport.height),
     )
 }
 

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use nagi_tui::{
-    App, Effect, Node, NodeId, Runtime, ScrollOffset, Size, Subscription, ViewContext,
-    VirtualFragment,
+    App, Effect, Node, NodeId, Runtime, ScrollAxis, ScrollOffset, ScrollViewportOptions, Size,
+    Subscription, ViewContext, VirtualFragment,
 };
 
 const ROWS: usize = 100_000;
@@ -136,6 +136,10 @@ struct EagerViewport;
 
 struct VirtualViewportApp;
 
+struct GrowingVirtualViewportApp {
+    rows: u32,
+}
+
 struct IdentifiedVirtualViewportApp {
     row_ids: Arc<[NodeId]>,
 }
@@ -181,6 +185,36 @@ impl App for VirtualViewportApp {
             let rows = (start..end).map(|_| Node::text("row"));
             VirtualFragment::new(ScrollOffset::new(0, start), Node::column(rows))
         })
+    }
+
+    fn subscriptions(&self) -> Subscription<Self::Message> {
+        Subscription::none()
+    }
+}
+
+impl App for GrowingVirtualViewportApp {
+    type Message = ();
+
+    fn update(&mut self, (): ()) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: ViewContext) -> Node<Self::Message> {
+        Node::virtual_scroll_viewport_with_options(
+            "viewport",
+            Size::new(80, self.rows),
+            ScrollViewportOptions {
+                axis: ScrollAxis::Vertical,
+                stick_to_end: true,
+                ..ScrollViewportOptions::default()
+            },
+            |viewport| {
+                let start = viewport.offset.y;
+                let end = start.saturating_add(viewport.size.height);
+                let rows = (start..end).map(|_| Node::text("row"));
+                VirtualFragment::new(ScrollOffset::new(0, start), Node::column(rows))
+            },
+        )
     }
 
     fn subscriptions(&self) -> Subscription<Self::Message> {
@@ -250,6 +284,25 @@ fn sample_virtual() -> Vec<Sample> {
     samples
 }
 
+fn sample_growing_virtual() -> Vec<Sample> {
+    let mut runtime = Runtime::new(
+        GrowingVirtualViewportApp { rows: ROWS as u32 },
+        Size::new(80, 24),
+    )
+    .expect("runtime");
+    warm_runtime(&mut runtime);
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let rows = runtime.app().rows.saturating_add(1);
+        runtime.app_mut().rows = rows;
+        let baseline = reset_metrics();
+        let started = Instant::now();
+        black_box(runtime.render_if_dirty().expect("benchmark frame"));
+        samples.push(read_metrics(started.elapsed(), baseline));
+    }
+    samples
+}
+
 fn sample_identified_virtual() -> Vec<Sample> {
     let mut runtime =
         Runtime::new(IdentifiedVirtualViewportApp::new(), Size::new(80, 24)).expect("runtime");
@@ -297,5 +350,6 @@ fn report(label: &str, samples: Vec<Sample>) {
 fn main() {
     report("eager", sample_eager());
     report("virtual", sample_virtual());
+    report("virtual-stick-to-end-growth", sample_growing_virtual());
     report("virtual-identified", sample_identified_virtual());
 }

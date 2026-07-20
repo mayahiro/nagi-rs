@@ -85,6 +85,12 @@ pub(crate) struct ScrollInteraction {
     initialized: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PreparedScroll {
+    state: ScrollState,
+    following_end: bool,
+}
+
 impl Default for ScrollInteraction {
     fn default() -> Self {
         Self {
@@ -186,6 +192,17 @@ impl InteractionState {
         Some((scroll.state, scroll.state != previous))
     }
 
+    pub(crate) fn preview_scroll(
+        &self,
+        id: &NodeId,
+        maximum: ScrollOffset,
+        axis: ScrollAxis,
+        stick_to_end: bool,
+    ) -> ScrollState {
+        let scroll = self.scrolls.get(id).copied().unwrap_or_default();
+        resolve_prepared_scroll(scroll, maximum, axis, stick_to_end).state
+    }
+
     pub(crate) fn prepare_scroll(
         &mut self,
         id: &NodeId,
@@ -194,31 +211,12 @@ impl InteractionState {
         stick_to_end: bool,
     ) -> ScrollState {
         let scroll = self.scrolls.entry(id.clone()).or_default();
-        let was_initialized = scroll.initialized;
-        let was_sticking = scroll.stick_to_end;
-        let requested = scroll.requested.take();
-        let maximum = normalize_scroll_offset(axis, maximum);
-        let follow_existing_end = was_initialized
-            && stick_to_end
-            && (scroll.following_end || (!was_sticking && scroll.state.at_end));
-        let requested_offset = if let Some(requested) = requested {
-            requested
-        } else if !was_initialized && stick_to_end || follow_existing_end {
-            maximum
-        } else {
-            scroll.state.offset
-        };
+        let prepared = resolve_prepared_scroll(*scroll, maximum, axis, stick_to_end);
+        scroll.requested = None;
         scroll.axis = axis;
         scroll.stick_to_end = stick_to_end;
-        scroll.state = resolve_scroll_state(axis, maximum, requested_offset);
-        scroll.following_end = stick_to_end
-            && if requested.is_some() {
-                scroll.state.at_end
-            } else if !was_initialized {
-                true
-            } else {
-                follow_existing_end
-            };
+        scroll.state = prepared.state;
+        scroll.following_end = prepared.following_end;
         scroll.initialized = true;
         scroll.state
     }
@@ -243,6 +241,40 @@ impl InteractionState {
         }
         self.text_inputs.retain(|id, _| active.contains(id));
         self.scrolls.retain(|id, _| active.contains(id));
+    }
+}
+
+fn resolve_prepared_scroll(
+    scroll: ScrollInteraction,
+    maximum: ScrollOffset,
+    axis: ScrollAxis,
+    stick_to_end: bool,
+) -> PreparedScroll {
+    let was_initialized = scroll.initialized;
+    let was_sticking = scroll.stick_to_end;
+    let maximum = normalize_scroll_offset(axis, maximum);
+    let follow_existing_end = was_initialized
+        && stick_to_end
+        && (scroll.following_end || (!was_sticking && scroll.state.at_end));
+    let requested_offset = if let Some(requested) = scroll.requested {
+        requested
+    } else if !was_initialized && stick_to_end || follow_existing_end {
+        maximum
+    } else {
+        scroll.state.offset
+    };
+    let state = resolve_scroll_state(axis, maximum, requested_offset);
+    let following_end = stick_to_end
+        && if scroll.requested.is_some() {
+            state.at_end
+        } else if !was_initialized {
+            true
+        } else {
+            follow_existing_end
+        };
+    PreparedScroll {
+        state,
+        following_end,
     }
 }
 
