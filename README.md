@@ -83,6 +83,7 @@ Run commands from the Rust repository root
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
 | [Log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
+| [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
 | [Widget gallery](crates/nagi-tui-widgets/examples/widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example widget_gallery` |
 | [Extended widget gallery](crates/nagi-tui-widgets/examples/extended_widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example extended_widget_gallery` |
 | [Dashboard](crates/nagi-tui-widgets/examples/dashboard/README.md) | `cargo run -p nagi-tui-widgets --example dashboard` |
@@ -100,9 +101,9 @@ is disabled by default. Raw mode and screen restoration are best effort on
 normal return, error, and panic paths. Process abort, nested terminal sessions,
 suspend and resume, and `/dev/tty` acquisition are not supported
 
-`ScrollViewport` clips and scrolls an already constructed child tree. It does
-not virtualize child construction, measurement, or render-tree traversal, so
-applications must bound the supplied children when displaying large data sets
+`ScrollViewport` clips and scrolls an eager child tree. Large data sets can use
+`Node::virtual_scroll_viewport`, which declares the complete cell extent and
+constructs only the current visible or bounded-overscan `VirtualFragment`
 
 CLI process integration supports Linux and macOS, preserves Unix argument
 values, and converts SIGINT into cooperative cancellation. Shell completion,

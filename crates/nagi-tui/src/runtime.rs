@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nagi_surface::SurfaceError;
@@ -167,7 +168,7 @@ impl From<QueueFull> for RuntimeEventError {
 #[derive(Clone, Debug)]
 pub struct Frame {
     timestamp: Timestamp,
-    surface: Surface,
+    surface: Arc<Surface>,
     operations: Vec<TerminalOp>,
 }
 
@@ -180,8 +181,8 @@ impl Frame {
 
     /// Returns the normalized rendered surface
     #[must_use]
-    pub const fn surface(&self) -> &Surface {
-        &self.surface
+    pub fn surface(&self) -> &Surface {
+        self.surface.as_ref()
     }
 
     /// Returns typed VT operations relative to the previous frame
@@ -202,7 +203,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     urgent_frame: bool,
     minimum_frame_interval: Duration,
     last_frame: Option<Timestamp>,
-    previous_surface: Option<Surface>,
+    previous_surface: Option<Arc<Surface>>,
     interaction: InteractionState,
     view_tree: Option<Node<Application::Message>>,
     tree_index: TreeIndex,
@@ -969,8 +970,9 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         let tree_index = self.ensure_focused_visible(&view, tree_index)?;
         let mut surface = Surface::new(self.size.width, self.size.height)?;
         view.render_to(&mut surface, &self.interaction);
-        let frame_operations = operations(self.previous_surface.as_ref(), &surface);
-        self.previous_surface = Some(surface.clone());
+        let frame_operations = operations(self.previous_surface.as_deref(), &surface);
+        let surface = Arc::new(surface);
+        self.previous_surface = Some(Arc::clone(&surface));
         self.view_tree = Some(view);
         self.tree_index = tree_index;
         self.dirty = false;
@@ -1015,6 +1017,8 @@ fn visible_axis_offset(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
     use std::thread;
     use std::time::Duration;
@@ -1655,6 +1659,150 @@ mod tests {
             runtime.interaction().scroll_offset(&NodeId::from("scroll")),
             ScrollOffset::new(0, 1)
         );
+    }
+
+    struct VirtualScrollApp {
+        builds: Arc<AtomicUsize>,
+        rows: Arc<AtomicUsize>,
+    }
+
+    impl App for VirtualScrollApp {
+        type Message = ();
+
+        fn update(&mut self, (): ()) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            let builds = Arc::clone(&self.builds);
+            let rows = Arc::clone(&self.rows);
+            Node::virtual_scroll_viewport_with_options(
+                "virtual-scroll",
+                Size::new(3, 1_000_000),
+                crate::ScrollViewportOptions {
+                    axis: crate::ScrollAxis::Vertical,
+                    ..crate::ScrollViewportOptions::default()
+                },
+                move |viewport| {
+                    builds.fetch_add(1, Ordering::Relaxed);
+                    rows.fetch_add(viewport.size.height as usize, Ordering::Relaxed);
+                    let start = viewport.offset.y;
+                    let end = start.saturating_add(viewport.size.height);
+                    let visible = (start..end).map(|row| {
+                        Node::text((row % 10).to_string()).with_id(format!("row-{row}"))
+                    });
+                    crate::VirtualFragment::new(ScrollOffset::new(0, start), Node::column(visible))
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn virtual_scroll_viewport_bounds_construction_to_visible_rows() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let rows = Arc::new(AtomicUsize::new(0));
+        let mut runtime = Runtime::with_clock(
+            VirtualScrollApp {
+                builds: Arc::clone(&builds),
+                rows: Arc::clone(&rows),
+            },
+            RuntimeConfig::new(Size::new(3, 2)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+
+        let first = runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert_eq!(rows.load(Ordering::Relaxed), 2);
+        assert_eq!(runtime.tree_index.records.len(), 3);
+        assert_eq!(first.surface().cell(0, 0).unwrap().content(), "0");
+        assert_eq!(first.surface().cell(0, 1).unwrap().content(), "1");
+
+        assert!(runtime.set_scroll_offset(
+            &NodeId::from("virtual-scroll"),
+            ScrollOffset::new(0, u32::MAX),
+        ));
+        let last = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        assert_eq!(rows.load(Ordering::Relaxed), 4);
+        assert_eq!(runtime.tree_index.records.len(), 3);
+        assert_eq!(last.surface().cell(0, 0).unwrap().content(), "8");
+        assert_eq!(last.surface().cell(0, 1).unwrap().content(), "9");
+        assert_eq!(
+            runtime
+                .interaction()
+                .scroll_state(&NodeId::from("virtual-scroll"))
+                .unwrap()
+                .maximum,
+            ScrollOffset::new(0, 999_998),
+        );
+
+        for offset in 0..256 {
+            assert!(runtime.set_scroll_offset(
+                &NodeId::from("virtual-scroll"),
+                ScrollOffset::new(0, offset),
+            ));
+            assert!(runtime.render_if_dirty().unwrap().is_some());
+            assert_eq!(runtime.tree_index.records.len(), 3);
+        }
+        assert_eq!(builds.load(Ordering::Relaxed), 258);
+        assert_eq!(rows.load(Ordering::Relaxed), 516);
+    }
+
+    struct OverscannedScrollApp;
+
+    impl App for OverscannedScrollApp {
+        type Message = ();
+
+        fn update(&mut self, (): ()) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::virtual_scroll_viewport_with_options(
+                "overscanned-scroll",
+                Size::new(3, 6),
+                crate::ScrollViewportOptions {
+                    axis: crate::ScrollAxis::Vertical,
+                    ..crate::ScrollViewportOptions::default()
+                },
+                |viewport| {
+                    let start = viewport.offset.y.saturating_sub(1);
+                    let end = viewport
+                        .offset
+                        .y
+                        .saturating_add(viewport.size.height)
+                        .saturating_add(1)
+                        .min(viewport.content_size.height);
+                    let rows = (start..end).map(|row| {
+                        Node::text(row.to_string()).with_id(format!("overscan-row-{row}"))
+                    });
+                    crate::VirtualFragment::new(ScrollOffset::new(0, start), Node::column(rows))
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn virtual_scroll_viewport_positions_bounded_overscan() {
+        let mut runtime = Runtime::with_clock(
+            OverscannedScrollApp,
+            RuntimeConfig::new(Size::new(3, 2)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        assert!(
+            runtime
+                .set_scroll_offset(&NodeId::from("overscanned-scroll"), ScrollOffset::new(0, 2),)
+        );
+
+        let frame = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(frame.surface().cell(0, 0).unwrap().content(), "2");
+        assert_eq!(frame.surface().cell(0, 1).unwrap().content(), "3");
+        assert_eq!(runtime.tree_index.records.len(), 5);
     }
 
     enum LifecycleMessage {

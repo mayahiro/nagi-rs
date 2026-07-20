@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use nagi_tui::{EventResult, Length, Node, NodeId, ScrollAxis, ScrollViewportOptions, Style};
+use nagi_tui::{
+    EventResult, Insets, Length, Node, NodeId, ScrollAxis, ScrollOffset, ScrollViewportOptions,
+    Size, Style, VirtualFragment,
+};
 
 use crate::event::is_activation_event;
 use crate::navigation::navigate_event;
@@ -143,12 +146,13 @@ impl<Message: 'static> List<Message> {
         self.window(page.saturating_mul(page_size), page_size)
     }
 
-    /// Wraps the list in a Core ScrollViewport using a sizing rule
+    /// Wraps the list in a virtual Core ScrollViewport using a sizing rule
     ///
     /// `viewport_id` must differ from the list root and item IDs. Applications
     /// may control its retained offset through `Runtime::set_scroll_offset`.
-    /// This does not limit item construction; use [`Self::window`] or
-    /// [`Self::paginate`] before the viewport for large collections
+    /// Semantic row construction is bounded by the visible height. Item
+    /// metadata collection and filtering remain eager. Viewport rows are one
+    /// Cell high and clip content that would otherwise wrap
     #[must_use]
     pub fn viewport(mut self, viewport_id: impl Into<NodeId>, height: Length) -> Self {
         self.viewport = Some((viewport_id.into(), height));
@@ -157,13 +161,26 @@ impl<Message: 'static> List<Message> {
 
     /// Builds the public semantic node for this list
     #[must_use]
-    pub fn into_node(self) -> Node<Message> {
+    pub fn into_node(mut self) -> Node<Message> {
         let mut visible = list_visible_indices(&self.items, &self.filter);
         if let Some((offset, limit)) = self.window {
             visible = list_window(&visible, offset, limit);
         }
         let selected = normalized_list_selection(&visible, self.selected);
         let visible = Arc::new(visible);
+        if let Some((viewport_id, height)) = self.viewport.take() {
+            return virtual_list_node(
+                self.id,
+                self.items,
+                visible,
+                selected,
+                self.enabled,
+                self.style,
+                self.on_select,
+                viewport_id,
+                height,
+            );
+        }
         let mut children = Vec::with_capacity(visible.len());
         let root_id = self.id;
         for (position, original_index) in visible.iter().copied().enumerate() {
@@ -222,33 +239,163 @@ impl<Message: 'static> List<Message> {
             );
         }
 
-        let root = if self.enabled && selected.is_some() {
+        if self.enabled && selected.is_some() {
             Node::column(children)
         } else {
             Node::column(children).with_id(root_id)
-        };
-        with_list_viewport(root, self.viewport)
+        }
     }
 }
 
-fn with_list_viewport<Message>(
-    root: Node<Message>,
-    viewport: Option<(NodeId, Length)>,
+#[allow(clippy::too_many_arguments)]
+fn virtual_list_node<Message: 'static>(
+    root_id: NodeId,
+    items: Vec<ListItem>,
+    visible: Arc<Vec<usize>>,
+    selected: Option<usize>,
+    enabled: bool,
+    style: ListStyle,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+    viewport_id: NodeId,
+    height: Length,
 ) -> Node<Message> {
-    let Some((id, height)) = viewport else {
-        return root;
-    };
-    Node::column([Node::scroll_viewport_with_options(
-        id,
-        root,
+    let content_height = u32::try_from(visible.len()).unwrap_or(u32::MAX);
+    let items = Arc::new(items);
+    let outer_root_id = root_id.clone();
+    let viewport = Node::virtual_scroll_viewport_with_options(
+        viewport_id,
+        Size::new(0, content_height),
         ScrollViewportOptions {
             axis: ScrollAxis::Vertical,
             ensure_focused_visible: true,
             ..ScrollViewportOptions::default()
         },
+        move |viewport| {
+            let start = usize::try_from(viewport.offset.y)
+                .unwrap_or(usize::MAX)
+                .min(visible.len());
+            let count = usize::try_from(viewport.size.height).unwrap_or(usize::MAX);
+            let end = start.saturating_add(count).min(visible.len());
+            let rows = (start..end).map(|position| {
+                virtual_list_row(
+                    &items, &visible, selected, position, enabled, style, &root_id, &on_select,
+                )
+            });
+            let visible_rows = Node::padding(
+                Node::column(rows),
+                Insets::new(u32::try_from(start).unwrap_or(u32::MAX), 0, 0, 0),
+            );
+            let mut layers = vec![visible_rows];
+            if enabled {
+                if let Some(position) =
+                    selected.filter(|position| *position < start || *position >= end)
+                {
+                    let proxy = list_navigation_target(
+                        Node::spacer(0, 1),
+                        root_id.clone(),
+                        Arc::clone(&visible),
+                        position,
+                        None,
+                        Arc::clone(&on_select),
+                    );
+                    layers.push(Node::padding(
+                        proxy,
+                        Insets::new(u32::try_from(position).unwrap_or(u32::MAX), 0, 0, 0),
+                    ));
+                }
+            }
+            VirtualFragment::new(ScrollOffset::default(), Node::stack(layers))
+        },
     )
     .tab_stop(false)
-    .with_length(height)])
+    .with_length(height);
+    let root = Node::column([viewport]);
+    if enabled && selected.is_some() {
+        root
+    } else {
+        root.with_id(outer_root_id)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn virtual_list_row<Message: 'static>(
+    items: &[ListItem],
+    visible: &Arc<Vec<usize>>,
+    selected: Option<usize>,
+    position: usize,
+    enabled: bool,
+    style: ListStyle,
+    root_id: &NodeId,
+    on_select: &Arc<dyn Fn(usize) -> Message>,
+) -> Node<Message> {
+    let original_index = visible[position];
+    let item = &items[original_index];
+    let is_selected = selected == Some(position);
+    let marker = if is_selected { "> " } else { "  " };
+    let row_style = if !enabled {
+        style.disabled
+    } else if is_selected {
+        style.selected
+    } else {
+        style.normal
+    };
+    let content = format!("{marker}{}", item.label);
+    if !enabled {
+        return Node::styled_text(content, row_style)
+            .with_id(item.id.clone())
+            .with_length(Length::Fixed(1));
+    }
+    let item_id = item.id.clone();
+    let click_focus = root_id.clone();
+    let click_select = Arc::clone(on_select);
+    let row = Node::styled_text(content, row_style)
+        .with_id(item_id.clone())
+        .on_event(item_id, move |event| {
+            if is_activation_event(event) {
+                EventResult::message(click_select(original_index)).focus(click_focus.clone())
+            } else {
+                EventResult::ignored()
+            }
+        });
+    if !is_selected {
+        return row.with_length(Length::Fixed(1));
+    }
+    list_navigation_target(
+        Node::column([row]),
+        root_id.clone(),
+        Arc::clone(visible),
+        position,
+        Some(style.focused),
+        Arc::clone(on_select),
+    )
+    .with_length(Length::Fixed(1))
+}
+
+fn list_navigation_target<Message: 'static>(
+    node: Node<Message>,
+    root_id: NodeId,
+    visible: Arc<Vec<usize>>,
+    position: usize,
+    focused_style: Option<Style>,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+) -> Node<Message> {
+    let navigation_focus = root_id.clone();
+    let mut node = node
+        .focusable(root_id.clone())
+        .on_event(root_id, move |event| {
+            let Some(next) = navigate_event(event, visible.len(), position) else {
+                return EventResult::ignored();
+            };
+            let mut result = EventResult::consumed().focus(navigation_focus.clone());
+            if next != position {
+                result = result.emit(on_select(visible[next]));
+            }
+            result
+        });
+    if let Some(style) = focused_style {
+        node = node.with_focused_style(style);
+    }
+    node
 }
 
 fn list_visible_indices(items: &[ListItem], query: &str) -> Vec<usize> {

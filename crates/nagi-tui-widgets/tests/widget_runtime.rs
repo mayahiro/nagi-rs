@@ -242,6 +242,158 @@ fn table_is_one_tab_stop_and_selection_follows_its_viewport() {
     );
 }
 
+struct ListViewportApp {
+    selected: usize,
+}
+
+impl App for ListViewportApp {
+    type Message = usize;
+
+    fn update(&mut self, selected: Self::Message) -> Effect<Self::Message> {
+        self.selected = selected;
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        List::new(
+            "large-list",
+            (0..5).map(|index| ListItem::new(format!("list-row-{index}"), index.to_string())),
+            self.selected,
+            |selected| selected,
+        )
+        .viewport("list-body", Length::Fixed(2))
+        .into_node()
+    }
+}
+
+#[test]
+fn list_selection_follows_its_virtual_viewport() {
+    let mut runtime = Runtime::with_clock(
+        ListViewportApp { selected: 0 },
+        nagi_tui::RuntimeConfig::new(Size::new(12, 2)),
+        VirtualClock::new(),
+    )
+    .expect("runtime");
+    runtime.render_if_dirty().expect("initial render");
+    assert!(
+        runtime
+            .request_focus(&NodeId::from("large-list"))
+            .expect("focus list")
+    );
+
+    runtime.dispatch_event(&key(KeyCode::End)).expect("End");
+    assert_eq!(runtime.process_pending().expect("select last"), 1);
+    runtime.render_if_dirty().expect("follow selection");
+    let state = runtime
+        .interaction()
+        .scroll_state(&NodeId::from("list-body"))
+        .expect("list scroll state");
+    assert_eq!(state.offset.y, 3);
+    assert_eq!(state.maximum.y, 3);
+
+    runtime.app_mut().selected = 0;
+    runtime.render_if_dirty().expect("return to start");
+    runtime
+        .dispatch_event(&Event::Mouse(MouseEvent {
+            kind: MouseKind::Press,
+            button: MouseButton::Left,
+            x: 0,
+            y: 1,
+            modifiers: Modifiers::NONE,
+        }))
+        .expect("click second row");
+    assert_eq!(runtime.process_pending().expect("mouse selection"), 1);
+    assert_eq!(runtime.app().selected, 1);
+    assert_eq!(
+        runtime.interaction().focused(),
+        Some(&NodeId::from("large-list"))
+    );
+}
+
+struct WrappedListViewportApp;
+
+impl App for WrappedListViewportApp {
+    type Message = usize;
+
+    fn update(&mut self, _selected: Self::Message) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        List::new(
+            "wrapped-list",
+            [
+                ListItem::new("wrapped-first", "ABCDEFGHIJ"),
+                ListItem::new("wrapped-second", "B"),
+            ],
+            0,
+            |selected| selected,
+        )
+        .viewport("wrapped-list-body", Length::Fixed(2))
+        .into_node()
+    }
+}
+
+#[test]
+fn virtual_list_rows_are_one_cell_high() {
+    let mut runtime = Runtime::with_clock(
+        WrappedListViewportApp,
+        nagi_tui::RuntimeConfig::new(Size::new(6, 2)),
+        VirtualClock::new(),
+    )
+    .expect("runtime");
+
+    let frame = runtime
+        .render_if_dirty()
+        .expect("render")
+        .expect("initial frame");
+
+    assert_eq!(row_text(frame.surface(), 0), "> ABCD");
+    assert_eq!(row_text(frame.surface(), 1), "  B   ");
+}
+
+struct MultilineTableViewportApp;
+
+impl App for MultilineTableViewportApp {
+    type Message = usize;
+
+    fn update(&mut self, _selected: Self::Message) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        Table::new(
+            "multiline-table",
+            [TableColumn::new("Value", Length::Fixed(4))],
+            [
+                TableRow::new("multiline-first", ["A\nX"]),
+                TableRow::new("multiline-second", ["B"]),
+            ],
+            0,
+            |selected| selected,
+        )
+        .viewport("multiline-table-body", Length::Fixed(2))
+        .into_node()
+    }
+}
+
+#[test]
+fn virtual_table_rows_are_one_cell_high() {
+    let mut runtime = Runtime::with_clock(
+        MultilineTableViewportApp,
+        nagi_tui::RuntimeConfig::new(Size::new(6, 3)),
+        VirtualClock::new(),
+    )
+    .expect("runtime");
+
+    let frame = runtime
+        .render_if_dirty()
+        .expect("render")
+        .expect("initial frame");
+
+    assert_eq!(frame.surface().cell(2, 2).unwrap().content(), "B");
+}
+
 fn key(code: KeyCode) -> Event {
     Event::Key(KeyEvent {
         code,

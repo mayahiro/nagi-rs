@@ -246,7 +246,7 @@ impl InteractionState {
     }
 }
 
-fn normalize_scroll_offset(axis: ScrollAxis, offset: ScrollOffset) -> ScrollOffset {
+pub(crate) fn normalize_scroll_offset(axis: ScrollAxis, offset: ScrollOffset) -> ScrollOffset {
     ScrollOffset {
         x: if axis.allows_horizontal() {
             offset.x

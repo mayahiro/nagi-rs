@@ -1,4 +1,7 @@
-.PHONY: build check format format-check lint test unicode
+.PHONY: bench build check format format-check lint test unicode
+
+bench:
+	cargo bench -p nagi-tui --bench scroll_viewport
 
 build:
 	cargo build --workspace --all-targets

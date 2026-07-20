@@ -42,7 +42,10 @@ pub use nagi_vt::{
     KeyProtocol, Modifiers, MouseButton, MouseEvent, MouseKind, MouseTracking, SgrColor, SgrStyle,
     Style, TerminalOp, encode,
 };
-pub use node::{HorizontalAlignment, Insets, Node, ScrollViewportOptions, VerticalAlignment};
+pub use node::{
+    HorizontalAlignment, Insets, Node, ScrollViewportOptions, VerticalAlignment, VirtualFragment,
+    VirtualViewport,
+};
 pub use panel::{BorderKind, PanelOptions, PanelStyle};
 pub use rich_text::{ParagraphOptions, TextSpan, WrapMode};
 pub use routing::{EventDispatch, EventResult};

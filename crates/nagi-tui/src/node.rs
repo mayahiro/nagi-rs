@@ -1,3 +1,4 @@
+use std::cell::{Ref, RefCell};
 use std::marker::PhantomData;
 
 use nagi_surface::{Cursor, Surface};
@@ -94,6 +95,40 @@ impl<Message> Default for ScrollViewportOptions<Message> {
     }
 }
 
+/// Visible content range requested by a virtual ScrollViewport
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VirtualViewport {
+    /// First visible cell in content coordinates
+    pub offset: ScrollOffset,
+    /// Visible viewport size in cells
+    pub size: Size,
+    /// Complete resolved content extent in cells
+    pub content_size: Size,
+}
+
+/// Lazily constructed fragment returned for one [`VirtualViewport`]
+pub struct VirtualFragment<Message> {
+    origin: ScrollOffset,
+    node: Box<Node<Message>>,
+}
+
+impl<Message> VirtualFragment<Message> {
+    /// Creates a fragment whose node begins at `origin` in content coordinates
+    #[must_use]
+    pub fn new(origin: ScrollOffset, node: Node<Message>) -> Self {
+        Self {
+            origin,
+            node: Box::new(node),
+        }
+    }
+
+    /// Returns the fragment origin in content coordinates
+    #[must_use]
+    pub const fn origin(&self) -> ScrollOffset {
+        self.origin
+    }
+}
+
 /// A semantic view node rebuilt by an application for each frame
 pub struct Node<Message> {
     kind: NodeKind<Message>,
@@ -145,12 +180,31 @@ enum NodeKind<Message> {
         child: Box<Node<Message>>,
         options: ScrollViewportOptions<Message>,
     },
+    VirtualScrollViewport(Box<VirtualScrollViewportNode<Message>>),
     Modal(Box<Node<Message>>),
     Panel {
         title: String,
         options: PanelOptions,
         child: Box<Node<Message>>,
     },
+}
+
+struct VirtualScrollViewportNode<Message> {
+    content_size: Size,
+    builder: Box<dyn Fn(VirtualViewport) -> VirtualFragment<Message>>,
+    cache: RefCell<Option<VirtualCache<Message>>>,
+    options: ScrollViewportOptions<Message>,
+}
+
+struct VirtualCache<Message> {
+    request: VirtualViewport,
+    fragment: VirtualFragment<Message>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollBehavior {
+    pub(crate) axis: ScrollAxis,
+    pub(crate) ensure_focused_visible: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -354,8 +408,8 @@ impl<Message> Node<Message> {
 
     /// Creates a clipped viewport with runtime-owned two-dimensional offset
     ///
-    /// The supplied child tree is fully constructed and measured, and render
-    /// traversal is not virtualized
+    /// The supplied child tree is eager. Use [`Node::virtual_scroll_viewport`]
+    /// when content construction must be bounded by the visible region
     #[must_use]
     pub fn scroll_viewport(id: impl Into<NodeId>, child: Self) -> Self {
         Self::scroll_viewport_with_options(id, child, ScrollViewportOptions::default())
@@ -363,8 +417,9 @@ impl<Message> Node<Message> {
 
     /// Creates a clipped viewport with configured scrolling behavior
     ///
-    /// The supplied child tree is fully constructed and measured, and render
-    /// traversal is not virtualized
+    /// The supplied child tree is eager. Use
+    /// [`Node::virtual_scroll_viewport_with_options`] when content construction
+    /// must be bounded by the visible region
     #[must_use]
     pub fn scroll_viewport_with_options(
         id: impl Into<NodeId>,
@@ -375,6 +430,51 @@ impl<Message> Node<Message> {
             child: Box::new(child),
             options,
         });
+        node.id = Some(id.into());
+        node.focusable = true;
+        node
+    }
+
+    /// Creates a viewport that constructs only a visible content fragment
+    ///
+    /// `content_size` declares the complete scrollable cell extent without
+    /// constructing it. The builder receives the resolved visible range and is
+    /// cached for that range during the semantic frame. It may include bounded
+    /// overscan by returning an origin before the requested offset
+    #[must_use]
+    pub fn virtual_scroll_viewport(
+        id: impl Into<NodeId>,
+        content_size: Size,
+        builder: impl Fn(VirtualViewport) -> VirtualFragment<Message> + 'static,
+    ) -> Self {
+        Self::virtual_scroll_viewport_with_options(
+            id,
+            content_size,
+            ScrollViewportOptions::default(),
+            builder,
+        )
+    }
+
+    /// Creates a virtual viewport with configured scrolling behavior
+    ///
+    /// Only the cached fragment participates in measurement, rendering, focus,
+    /// hit testing, and event routing. Fragment Node IDs therefore represent
+    /// visible or overscanned content and must remain stable across requests
+    #[must_use]
+    pub fn virtual_scroll_viewport_with_options(
+        id: impl Into<NodeId>,
+        content_size: Size,
+        options: ScrollViewportOptions<Message>,
+        builder: impl Fn(VirtualViewport) -> VirtualFragment<Message> + 'static,
+    ) -> Self {
+        let mut node = Self::new(NodeKind::VirtualScrollViewport(Box::new(
+            VirtualScrollViewportNode {
+                content_size,
+                builder: Box::new(builder),
+                cache: RefCell::new(None),
+                options,
+            },
+        )));
         node.id = Some(id.into());
         node.focusable = true;
         node
@@ -502,6 +602,7 @@ impl<Message> Node<Message> {
                 child.measure(constraints)
             }
             NodeKind::ScrollViewport { child, .. } => child.measure(constraints),
+            NodeKind::VirtualScrollViewport(virtual_node) => virtual_node.content_size,
         };
         clamp_size(measured, constraints)
     }
@@ -582,6 +683,28 @@ impl<Message> Node<Message> {
                     scroll_child_rect(rect, child, interaction.scroll_offset(id), options.axis);
                 child.render(surface, child_rect, clip.intersection(rect), interaction);
             }
+            NodeKind::VirtualScrollViewport(virtual_node) => {
+                let id = self
+                    .id
+                    .as_ref()
+                    .expect("VirtualScrollViewport always has a NodeId");
+                if let Some(fragment) = virtual_fragment(
+                    virtual_node.content_size,
+                    virtual_node.options.axis,
+                    virtual_node.builder.as_ref(),
+                    &virtual_node.cache,
+                    rect,
+                    interaction.scroll_offset(id),
+                ) {
+                    let fragment_rect = virtual_fragment_rect(rect, &fragment);
+                    fragment.fragment.node.render(
+                        surface,
+                        fragment_rect,
+                        clip.intersection(rect),
+                        interaction,
+                    );
+                }
+            }
             NodeKind::Modal(child) => child.render(surface, rect, clip, interaction),
             NodeKind::Panel {
                 title,
@@ -620,49 +743,72 @@ impl<Message> Node<Message> {
     }
 
     pub(crate) fn handle_event(&self, id: &NodeId, event: &Event) -> Option<EventResult<Message>> {
-        self.find(id)
-            .and_then(|node| node.handler.as_ref())
-            .map(|handler| handler(event))
+        self.visit(id, &mut |node| {
+            node.handler.as_ref().map(|handler| handler(event))
+        })
     }
 
     pub(crate) fn text_input_message(&self, id: &NodeId, value: String) -> Option<Message> {
-        let node = self.find(id)?;
-        let NodeKind::TextInput { on_change, .. } = &node.kind else {
-            return None;
-        };
-        Some(on_change(value))
+        let mut value = Some(value);
+        self.visit(id, &mut |node| {
+            let NodeKind::TextInput { on_change, .. } = &node.kind else {
+                return None;
+            };
+            Some(on_change(
+                value.take().expect("a NodeId is unique within one view"),
+            ))
+        })
     }
 
-    pub(crate) fn scroll_options(&self, id: &NodeId) -> Option<&ScrollViewportOptions<Message>> {
-        let node = self.find(id)?;
-        let NodeKind::ScrollViewport { options, .. } = &node.kind else {
-            return None;
-        };
-        Some(options)
+    pub(crate) fn scroll_options(&self, id: &NodeId) -> Option<ScrollBehavior> {
+        self.visit(id, &mut |node| {
+            let options = match &node.kind {
+                NodeKind::ScrollViewport { options, .. } => options,
+                NodeKind::VirtualScrollViewport(virtual_node) => &virtual_node.options,
+                _ => return None,
+            };
+            Some(ScrollBehavior {
+                axis: options.axis,
+                ensure_focused_visible: options.ensure_focused_visible,
+            })
+        })
     }
 
     pub(crate) fn scroll_message(&self, id: &NodeId, state: ScrollState) -> Option<Message> {
-        self.scroll_options(id)?
-            .on_scroll
-            .as_ref()
-            .map(|map| map(state))
+        self.visit(id, &mut |node| {
+            let options = match &node.kind {
+                NodeKind::ScrollViewport { options, .. } => options,
+                NodeKind::VirtualScrollViewport(virtual_node) => &virtual_node.options,
+                _ => return None,
+            };
+            options.on_scroll.as_ref().map(|map| map(state))
+        })
     }
 
-    fn find(&self, id: &NodeId) -> Option<&Self> {
+    fn visit<Result>(
+        &self,
+        id: &NodeId,
+        operation: &mut impl FnMut(&Self) -> Option<Result>,
+    ) -> Option<Result> {
         if self.id.as_ref() == Some(id) {
-            return Some(self);
+            return operation(self);
         }
         match &self.kind {
             NodeKind::Row(children) | NodeKind::Column(children) | NodeKind::Stack(children) => {
-                children.iter().find_map(|child| child.find(id))
+                children.iter().find_map(|child| child.visit(id, operation))
             }
             NodeKind::Padding { child, .. }
             | NodeKind::Border { child, .. }
             | NodeKind::Align { child, .. }
             | NodeKind::Clip(child)
             | NodeKind::Modal(child)
-            | NodeKind::Panel { child, .. } => child.find(id),
-            NodeKind::ScrollViewport { child, .. } => child.find(id),
+            | NodeKind::Panel { child, .. }
+            | NodeKind::ScrollViewport { child, .. } => child.visit(id, operation),
+            NodeKind::VirtualScrollViewport(virtual_node) => virtual_node
+                .cache
+                .borrow()
+                .as_ref()
+                .and_then(|cached| cached.fragment.node.visit(id, operation)),
             NodeKind::Text { .. }
             | NodeKind::RichText { .. }
             | NodeKind::Surface(_)
@@ -686,7 +832,9 @@ impl<Message> Node<Message> {
         if let Some(id) = &self.id {
             let kind = match self.kind {
                 NodeKind::TextInput { .. } => InteractiveKind::TextInput,
-                NodeKind::ScrollViewport { .. } => InteractiveKind::ScrollViewport,
+                NodeKind::ScrollViewport { .. } | NodeKind::VirtualScrollViewport(_) => {
+                    InteractiveKind::ScrollViewport
+                }
                 NodeKind::Modal(_) => InteractiveKind::Modal,
                 _ => InteractiveKind::Generic,
             };
@@ -778,6 +926,29 @@ impl<Message> Node<Message> {
                     index,
                 )?;
             }
+            NodeKind::VirtualScrollViewport(virtual_node) => {
+                let id = self
+                    .id
+                    .as_ref()
+                    .expect("VirtualScrollViewport always has a NodeId");
+                if let Some(fragment) = virtual_fragment(
+                    virtual_node.content_size,
+                    virtual_node.options.axis,
+                    virtual_node.builder.as_ref(),
+                    &virtual_node.cache,
+                    rect,
+                    interaction.scroll_offset(id),
+                ) {
+                    fragment.fragment.node.build_index(
+                        virtual_fragment_rect(rect, &fragment),
+                        clip.intersection(rect),
+                        parent,
+                        false,
+                        interaction,
+                        index,
+                    )?;
+                }
+            }
             NodeKind::Modal(child) => {
                 child.build_index(rect, clip, parent, false, interaction, index)?
             }
@@ -825,6 +996,40 @@ impl<Message> Node<Message> {
                     scroll_child_rect(rect, child, state.offset, options.axis),
                     interaction,
                 );
+                return;
+            }
+            NodeKind::VirtualScrollViewport(virtual_node) => {
+                let id = self
+                    .id
+                    .as_ref()
+                    .expect("VirtualScrollViewport always has a NodeId");
+                let content = resolved_virtual_content_size(
+                    virtual_node.content_size,
+                    rect.size(),
+                    virtual_node.options.axis,
+                );
+                let state = interaction.prepare_scroll(
+                    id,
+                    ScrollOffset::new(
+                        content.width.saturating_sub(rect.width),
+                        content.height.saturating_sub(rect.height),
+                    ),
+                    virtual_node.options.axis,
+                    virtual_node.options.stick_to_end,
+                );
+                if let Some(fragment) = virtual_fragment(
+                    virtual_node.content_size,
+                    virtual_node.options.axis,
+                    virtual_node.builder.as_ref(),
+                    &virtual_node.cache,
+                    rect,
+                    state.offset,
+                ) {
+                    fragment
+                        .fragment
+                        .node
+                        .prepare_at(virtual_fragment_rect(rect, &fragment), interaction);
+                }
                 return;
             }
             _ => {}
@@ -876,7 +1081,8 @@ impl<Message> Node<Message> {
             | NodeKind::Spacer(_)
             | NodeKind::Gap(_)
             | NodeKind::TextInput { .. }
-            | NodeKind::ScrollViewport { .. } => {}
+            | NodeKind::ScrollViewport { .. }
+            | NodeKind::VirtualScrollViewport(_) => {}
         }
     }
 }
@@ -1284,6 +1490,101 @@ fn scroll_child_rect<Message>(
     )
 }
 
+fn virtual_fragment<'a, Message>(
+    declared_content_size: Size,
+    axis: ScrollAxis,
+    builder: &dyn Fn(VirtualViewport) -> VirtualFragment<Message>,
+    cache: &'a RefCell<Option<VirtualCache<Message>>>,
+    viewport: Rect,
+    requested: ScrollOffset,
+) -> Option<Ref<'a, VirtualCache<Message>>> {
+    if viewport.is_empty() || virtual_content_is_empty(declared_content_size, axis) {
+        cache.borrow_mut().take();
+        return None;
+    }
+    let content_size = resolved_virtual_content_size(declared_content_size, viewport.size(), axis);
+    let requested = crate::interaction::normalize_scroll_offset(axis, requested);
+    let offset = crate::interaction::clamp_scroll(
+        content_size.width,
+        content_size.height,
+        viewport.width,
+        viewport.height,
+        requested,
+    );
+    let request = VirtualViewport {
+        offset,
+        size: Size::new(
+            viewport
+                .width
+                .min(content_size.width.saturating_sub(offset.x)),
+            viewport
+                .height
+                .min(content_size.height.saturating_sub(offset.y)),
+        ),
+        content_size,
+    };
+    let rebuild = cache
+        .borrow()
+        .as_ref()
+        .is_none_or(|cached| cached.request != request);
+    if rebuild {
+        *cache.borrow_mut() = Some(VirtualCache {
+            request,
+            fragment: builder(request),
+        });
+    }
+    Some(Ref::map(cache.borrow(), |cached| {
+        cached
+            .as_ref()
+            .expect("virtual fragment was cached for a non-empty viewport")
+    }))
+}
+
+fn resolved_virtual_content_size(declared: Size, viewport: Size, _axis: ScrollAxis) -> Size {
+    Size::new(
+        declared.width.max(viewport.width),
+        declared.height.max(viewport.height),
+    )
+}
+
+fn virtual_content_is_empty(content: Size, axis: ScrollAxis) -> bool {
+    match axis {
+        ScrollAxis::Both => content.is_empty(),
+        ScrollAxis::Vertical => content.height == 0,
+        ScrollAxis::Horizontal => content.width == 0,
+    }
+}
+
+fn virtual_fragment_rect<Message>(viewport: Rect, cached: &VirtualCache<Message>) -> Rect {
+    let request = cached.request;
+    let origin = ScrollOffset::new(
+        cached.fragment.origin.x.min(request.content_size.width),
+        cached.fragment.origin.y.min(request.content_size.height),
+    );
+    let remaining = Size::new(
+        request.content_size.width.saturating_sub(origin.x),
+        request.content_size.height.saturating_sub(origin.y),
+    );
+    let measured = cached
+        .fragment
+        .node
+        .measure(Constraints::bounded(remaining));
+    let visible_end = ScrollOffset::new(
+        request.offset.x.saturating_add(request.size.width),
+        request.offset.y.saturating_add(request.size.height),
+    );
+    let coverage = Size::new(
+        visible_end.x.saturating_sub(origin.x),
+        visible_end.y.saturating_sub(origin.y),
+    );
+    Rect::new(
+        clamp_i64_to_i32(i64::from(viewport.x) + i64::from(origin.x) - i64::from(request.offset.x)),
+        clamp_i64_to_i32(i64::from(viewport.y) + i64::from(origin.y) - i64::from(request.offset.y)),
+        measured.width.max(coverage.width).min(remaining.width),
+        measured.height.max(coverage.height).min(remaining.height),
+    )
+}
+
 fn scroll_constraints(viewport: Rect, axis: ScrollAxis) -> Constraints {
     Constraints {
         width: if axis.allows_horizontal() {
@@ -1492,12 +1793,101 @@ fn clamp_i64_to_i32(value: i64) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use nagi_surface::Surface;
     use nagi_vt::Color;
 
     use super::*;
 
     enum Message {}
+
+    #[test]
+    fn virtual_scroll_requests_match_shared_fixtures() {
+        let Some(records) = crate::fixture_support::load(
+            "interaction/virtual-scroll.txt",
+            "virtual-scroll-request",
+            &[
+                "axis",
+                "content-width",
+                "content-height",
+                "viewport-width",
+                "viewport-height",
+                "request-x",
+                "request-y",
+                "expected-build",
+                "expected-x",
+                "expected-y",
+                "expected-width",
+                "expected-height",
+                "expected-content-width",
+                "expected-content-height",
+            ],
+        ) else {
+            return;
+        };
+
+        for record in records {
+            let axis = match record.field("axis") {
+                "both" => ScrollAxis::Both,
+                "vertical" => ScrollAxis::Vertical,
+                "horizontal" => ScrollAxis::Horizontal,
+                value => panic!("case {} has invalid axis {value}", record.id),
+            };
+            let declared = Size::new(
+                fixture_number(record.field("content-width")),
+                fixture_number(record.field("content-height")),
+            );
+            let viewport = Rect::new(
+                0,
+                0,
+                fixture_number(record.field("viewport-width")),
+                fixture_number(record.field("viewport-height")),
+            );
+            let requested = ScrollOffset::new(
+                fixture_number(record.field("request-x")),
+                fixture_number(record.field("request-y")),
+            );
+            let expected_build = fixture_number(record.field("expected-build")) == 1;
+            let expected = VirtualViewport {
+                offset: ScrollOffset::new(
+                    fixture_number(record.field("expected-x")),
+                    fixture_number(record.field("expected-y")),
+                ),
+                size: Size::new(
+                    fixture_number(record.field("expected-width")),
+                    fixture_number(record.field("expected-height")),
+                ),
+                content_size: Size::new(
+                    fixture_number(record.field("expected-content-width")),
+                    fixture_number(record.field("expected-content-height")),
+                ),
+            };
+            let builds = Cell::new(0);
+            let cache = RefCell::new(None);
+            let builder = |request: VirtualViewport| {
+                builds.set(builds.get() + 1);
+                VirtualFragment::new(request.offset, Node::<Message>::column(std::iter::empty()))
+            };
+
+            let first = virtual_fragment(declared, axis, &builder, &cache, viewport, requested);
+            assert_eq!(first.is_some(), expected_build, "case {}", record.id);
+            if let Some(first) = first {
+                assert_eq!(first.request, expected, "case {}", record.id);
+            }
+            let second = virtual_fragment(declared, axis, &builder, &cache, viewport, requested);
+            assert_eq!(second.is_some(), expected_build, "case {}", record.id);
+            if let Some(second) = second {
+                assert_eq!(second.request, expected, "case {}", record.id);
+            }
+            assert_eq!(
+                builds.get(),
+                usize::from(expected_build),
+                "case {} cache",
+                record.id
+            );
+        }
+    }
 
     #[test]
     fn primitive_tree_renders_graphemes_and_layout() {
@@ -1699,5 +2089,11 @@ mod tests {
         assert_eq!(surface.cell(0, 0).unwrap().content(), "A");
         assert_eq!(surface.cell(3, 0).unwrap().content(), "B");
         assert_eq!(surface.cell(0, 3).unwrap().content(), "C");
+    }
+
+    fn fixture_number(value: &str) -> u32 {
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid fixture number {value}: {error}"))
     }
 }

@@ -16,3 +16,7 @@ unsafe_code = "allow"
 nagi-surface = { path = "../nagi-surface", version = "0.2.0" }
 nagi-text = { path = "../nagi-text", version = "0.2.0" }
 nagi-vt = { path = "../nagi-vt", version = "0.2.0" }
+
+[[bench]]
+name = "scroll_viewport"
+harness = false

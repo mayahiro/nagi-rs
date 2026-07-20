@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use nagi_tui::{
-    EventResult, HorizontalAlignment, Length, Node, NodeId, ParagraphOptions, ScrollAxis,
-    ScrollViewportOptions, Style, TextSpan, WrapMode,
+    EventResult, HorizontalAlignment, Insets, Length, Node, NodeId, ParagraphOptions, ScrollAxis,
+    ScrollOffset, ScrollViewportOptions, Size, Style, TextSpan, VirtualFragment, WrapMode,
 };
 
 use crate::event::is_activation_event;
@@ -170,12 +170,13 @@ impl<Message: 'static> Table<Message> {
         self
     }
 
-    /// Keeps the header fixed and wraps data rows in a Core ScrollViewport
+    /// Keeps the header fixed and wraps data rows in a virtual Core ScrollViewport
     ///
     /// `viewport_id` must differ from the table root and row IDs. Applications
     /// may control its retained offset through `Runtime::set_scroll_offset`.
-    /// The viewport does not virtualize rows; pass a bounded row set for large
-    /// collections
+    /// Semantic row construction is bounded by the visible body height. Row
+    /// metadata collection remains eager. Virtualized body rows are one Cell
+    /// high and clip multiline content
     #[must_use]
     pub fn viewport(mut self, viewport_id: impl Into<NodeId>, body_height: Length) -> Self {
         self.viewport = Some((viewport_id.into(), body_height));
@@ -184,7 +185,7 @@ impl<Message: 'static> Table<Message> {
 
     /// Builds the public semantic node for this table
     #[must_use]
-    pub fn into_node(self) -> Node<Message> {
+    pub fn into_node(mut self) -> Node<Message> {
         let row_count = self.rows.len();
         let selected = navigate(row_count, self.selected, Navigation::Normalize);
         let headings: Vec<_> = self
@@ -199,8 +200,28 @@ impl<Message: 'static> Table<Message> {
             &self.column_alignments,
             self.style.header,
         );
-        let mut row_nodes = Vec::with_capacity(self.rows.len());
         let root_id = self.id;
+        if let Some((viewport_id, height)) = self.viewport.take() {
+            let body = virtual_table_body(
+                root_id.clone(),
+                self.columns,
+                self.column_alignments,
+                self.rows,
+                selected,
+                self.enabled,
+                self.style,
+                self.on_select,
+                viewport_id,
+                height,
+            );
+            let root = Node::column([header, body]);
+            return if self.enabled && selected.is_some() {
+                root
+            } else {
+                root.with_id(root_id)
+            };
+        }
+        let mut row_nodes = Vec::with_capacity(self.rows.len());
 
         for (index, row) in self.rows.into_iter().enumerate() {
             let is_selected = selected == Some(index);
@@ -256,31 +277,164 @@ impl<Message: 'static> Table<Message> {
             );
         }
 
-        let root = if let Some((id, height)) = self.viewport {
-            let body = Node::scroll_viewport_with_options(
-                id,
-                Node::column(row_nodes),
-                ScrollViewportOptions {
-                    axis: ScrollAxis::Vertical,
-                    ensure_focused_visible: true,
-                    ..ScrollViewportOptions::default()
-                },
-            )
-            .tab_stop(false)
-            .with_length(height);
-            Node::column([header, body])
-        } else {
-            let mut children = Vec::with_capacity(row_nodes.len().saturating_add(1));
-            children.push(header);
-            children.extend(row_nodes);
-            Node::column(children)
-        };
+        let mut children = Vec::with_capacity(row_nodes.len().saturating_add(1));
+        children.push(header);
+        children.extend(row_nodes);
+        let root = Node::column(children);
         if self.enabled && selected.is_some() {
             root
         } else {
             root.with_id(root_id)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn virtual_table_body<Message: 'static>(
+    root_id: NodeId,
+    columns: Vec<TableColumn>,
+    alignments: Vec<HorizontalAlignment>,
+    rows: Vec<TableRow>,
+    selected: Option<usize>,
+    enabled: bool,
+    style: TableStyle,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+    viewport_id: NodeId,
+    height: Length,
+) -> Node<Message> {
+    let content_height = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    let columns = Arc::new(columns);
+    let alignments = Arc::new(alignments);
+    let rows = Arc::new(rows);
+    Node::virtual_scroll_viewport_with_options(
+        viewport_id,
+        Size::new(0, content_height),
+        ScrollViewportOptions {
+            axis: ScrollAxis::Vertical,
+            ensure_focused_visible: true,
+            ..ScrollViewportOptions::default()
+        },
+        move |viewport| {
+            let start = usize::try_from(viewport.offset.y)
+                .unwrap_or(usize::MAX)
+                .min(rows.len());
+            let count = usize::try_from(viewport.size.height).unwrap_or(usize::MAX);
+            let end = start.saturating_add(count).min(rows.len());
+            let visible_rows = Node::padding(
+                Node::column((start..end).map(|index| {
+                    virtual_table_row(
+                        &rows,
+                        &columns,
+                        &alignments,
+                        selected,
+                        index,
+                        enabled,
+                        style,
+                        &root_id,
+                        &on_select,
+                    )
+                })),
+                Insets::new(u32::try_from(start).unwrap_or(u32::MAX), 0, 0, 0),
+            );
+            let mut layers = vec![visible_rows];
+            if enabled {
+                if let Some(index) = selected.filter(|index| *index < start || *index >= end) {
+                    let proxy = table_navigation_target(
+                        Node::spacer(0, 1),
+                        root_id.clone(),
+                        rows.len(),
+                        index,
+                        None,
+                        Arc::clone(&on_select),
+                    );
+                    layers.push(Node::padding(
+                        proxy,
+                        Insets::new(u32::try_from(index).unwrap_or(u32::MAX), 0, 0, 0),
+                    ));
+                }
+            }
+            VirtualFragment::new(ScrollOffset::default(), Node::stack(layers))
+        },
+    )
+    .tab_stop(false)
+    .with_length(height)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn virtual_table_row<Message: 'static>(
+    rows: &[TableRow],
+    columns: &[TableColumn],
+    alignments: &[HorizontalAlignment],
+    selected: Option<usize>,
+    index: usize,
+    enabled: bool,
+    style: TableStyle,
+    root_id: &NodeId,
+    on_select: &Arc<dyn Fn(usize) -> Message>,
+) -> Node<Message> {
+    let row = &rows[index];
+    let is_selected = selected == Some(index);
+    let row_style = if !enabled {
+        style.disabled
+    } else if is_selected {
+        style.selected
+    } else {
+        style.normal
+    };
+    let values: Vec<_> = row.cells.iter().map(String::as_str).collect();
+    let marker = if is_selected { "> " } else { "  " };
+    let node = table_row(marker, &values, columns, alignments, row_style);
+    if !enabled {
+        return node.with_id(row.id.clone()).with_length(Length::Fixed(1));
+    }
+    let row_id = row.id.clone();
+    let click_focus = root_id.clone();
+    let click_select = Arc::clone(on_select);
+    let row = node.with_id(row_id.clone()).on_event(row_id, move |event| {
+        if !is_activation_event(event) {
+            return EventResult::ignored();
+        }
+        EventResult::message(click_select(index)).focus(click_focus.clone())
+    });
+    if !is_selected {
+        return row.with_length(Length::Fixed(1));
+    }
+    table_navigation_target(
+        Node::column([row]),
+        root_id.clone(),
+        rows.len(),
+        index,
+        Some(style.focused),
+        Arc::clone(on_select),
+    )
+    .with_length(Length::Fixed(1))
+}
+
+fn table_navigation_target<Message: 'static>(
+    node: Node<Message>,
+    root_id: NodeId,
+    row_count: usize,
+    index: usize,
+    focused_style: Option<Style>,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+) -> Node<Message> {
+    let navigation_focus = root_id.clone();
+    let mut node = node
+        .focusable(root_id.clone())
+        .on_event(root_id, move |event| {
+            let Some(next) = navigate_event(event, row_count, index) else {
+                return EventResult::ignored();
+            };
+            let mut result = EventResult::consumed().focus(navigation_focus.clone());
+            if next != index {
+                result = result.emit(on_select(next));
+            }
+            result
+        });
+    if let Some(style) = focused_style {
+        node = node.with_focused_style(style);
+    }
+    node
 }
 
 fn table_row<Message>(
