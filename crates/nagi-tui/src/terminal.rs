@@ -20,8 +20,6 @@ pub struct TerminalOptions {
     pub focus_first: bool,
     /// Maximum time to disambiguate a lone ESC from an escape sequence
     pub escape_timeout: Duration,
-    /// Longest wait before checking resize and scheduler state
-    pub maximum_idle_wait: Duration,
     /// Maximum number of messages waiting in the runtime queue
     pub queue_capacity: usize,
     /// Maximum number of effect tasks executing concurrently
@@ -29,6 +27,9 @@ pub struct TerminalOptions {
     /// Maximum pending values retained by each subscription source
     pub subscription_capacity: usize,
     /// Smallest interval between non-urgent rendered frames
+    ///
+    /// The default limits rendering to 120 frames per second. Zero disables
+    /// the limit.
     pub minimum_frame_interval: Duration,
 }
 
@@ -39,11 +40,10 @@ impl Default for TerminalOptions {
             mouse_tracking: None,
             focus_first: false,
             escape_timeout: Duration::from_millis(25),
-            maximum_idle_wait: Duration::from_millis(50),
             queue_capacity: crate::DEFAULT_QUEUE_CAPACITY,
             task_limit: crate::DEFAULT_TASK_LIMIT,
             subscription_capacity: crate::DEFAULT_SUBSCRIPTION_CAPACITY,
-            minimum_frame_interval: Duration::ZERO,
+            minimum_frame_interval: Duration::from_nanos(8_333_334),
         }
     }
 }
@@ -146,41 +146,32 @@ where
     config.task_limit = options.task_limit;
     config.subscription_capacity = options.subscription_capacity;
     config.minimum_frame_interval = options.minimum_frame_interval;
-    let mut runtime = Runtime::with_clock(app, config, clock)?;
-    let mut focus_first = options.focus_first;
+    let mut runtime = Runtime::with_clock_and_wake(app, config, clock, session.wake_handle())?;
     let mut decoder = TimedInputDecoder::new(clock, options.escape_timeout);
     let mut input = [0_u8; 8_192];
 
-    loop {
+    if session.take_resize() {
+        let (columns, rows) = session.size().map_err(run_terminal_error)?;
+        runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
+    }
+    runtime.process_pending()?;
+    if options.focus_first {
+        runtime.focus_first()?;
+    }
+    write_pending_frame(session, &mut runtime, options.capabilities)?;
+
+    while !runtime.exit_requested() {
+        let timeout = nearest_terminal_deadline([
+            decoder.time_until_deadline(),
+            runtime.time_until_effect_deadline(),
+            runtime.time_until_subscription_deadline(),
+            runtime.time_until_frame_deadline(),
+        ]);
+        let readable = session.wait(timeout).map_err(run_terminal_error)?;
         if session.take_resize() {
             let (columns, rows) = session.size().map_err(run_terminal_error)?;
             runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
         }
-        runtime.process_pending()?;
-        if focus_first {
-            focus_first = false;
-            runtime.focus_first()?;
-        }
-        write_pending_frame(session, &mut runtime, options.capabilities)?;
-        if runtime.exit_requested() {
-            break;
-        }
-
-        let mut timeout = decoder
-            .time_until_deadline()
-            .map_or(options.maximum_idle_wait, |deadline| {
-                deadline.min(options.maximum_idle_wait)
-            });
-        if let Some(deadline) = runtime.time_until_effect_deadline() {
-            timeout = timeout.min(deadline);
-        }
-        if let Some(deadline) = runtime.time_until_subscription_deadline() {
-            timeout = timeout.min(deadline);
-        }
-        if let Some(deadline) = runtime.time_until_frame_deadline() {
-            timeout = timeout.min(deadline);
-        }
-        let readable = session.wait_readable(timeout).map_err(run_terminal_error)?;
         let mut events = if readable {
             let read = session.read(&mut input).map_err(run_terminal_error)?;
             if read == 0 {
@@ -215,6 +206,10 @@ where
     Ok(runtime.into_app())
 }
 
+fn nearest_terminal_deadline(deadlines: [Option<Duration>; 4]) -> Option<Duration> {
+    deadlines.into_iter().flatten().min()
+}
+
 fn write_pending_frame<Application: App>(
     session: &mut TerminalSession,
     runtime: &mut Runtime<Application, SystemClock>,
@@ -235,12 +230,32 @@ fn run_terminal_error(error: TerminalError) -> RunError {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalOptions;
+    use std::time::Duration;
+
+    use super::{TerminalOptions, nearest_terminal_deadline};
 
     #[test]
     fn defaults_preserve_unfocused_non_mouse_behavior() {
         let options = TerminalOptions::default();
         assert_eq!(options.mouse_tracking, None);
         assert!(!options.focus_first);
+        assert_eq!(
+            options.minimum_frame_interval,
+            std::time::Duration::from_nanos(8_333_334)
+        );
+    }
+
+    #[test]
+    fn terminal_wait_uses_no_timeout_without_a_deadline() {
+        assert_eq!(nearest_terminal_deadline([None, None, None, None]), None);
+        assert_eq!(
+            nearest_terminal_deadline([
+                Some(Duration::from_millis(25)),
+                None,
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_millis(8)),
+            ]),
+            Some(Duration::from_millis(8))
+        );
     }
 }

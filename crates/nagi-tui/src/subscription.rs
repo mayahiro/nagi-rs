@@ -7,6 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::CancelToken;
+use crate::wake::WakeHandle;
 
 /// A stable identity for one long-lived subscription source
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -337,6 +338,7 @@ pub(crate) struct SubscriptionInbox<Message> {
     policy: DeliveryPolicy,
     sequence: Arc<AtomicU64>,
     diagnostics: Arc<SubscriptionAtomicDiagnostics>,
+    wake: WakeHandle,
 }
 
 impl<Message> SubscriptionInbox<Message> {
@@ -345,6 +347,7 @@ impl<Message> SubscriptionInbox<Message> {
         policy: DeliveryPolicy,
         sequence: Arc<AtomicU64>,
         diagnostics: Arc<SubscriptionAtomicDiagnostics>,
+        wake: WakeHandle,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(SubscriptionInboxState {
@@ -356,6 +359,7 @@ impl<Message> SubscriptionInbox<Message> {
             policy,
             sequence,
             diagnostics,
+            wake,
         })
     }
 
@@ -390,6 +394,8 @@ impl<Message> SubscriptionInbox<Message> {
             message,
         });
         self.changed.notify_all();
+        drop(state);
+        self.wake.notify();
         Ok(())
     }
 

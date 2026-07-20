@@ -1,11 +1,20 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nagi_vt::{Capabilities, MouseTracking, TerminalOp, encode};
 
 use super::system::UnixBackend;
+use super::wake::WakePipe;
+use crate::wake::WakeHandle;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WaitReady {
+    pub(crate) input: bool,
+    pub(crate) wake: bool,
+}
 
 pub(crate) trait Backend {
     type State: Clone;
@@ -14,12 +23,17 @@ pub(crate) trait Backend {
     fn get_state(&mut self, fd: i32) -> io::Result<Self::State>;
     fn make_raw(&mut self, state: &mut Self::State);
     fn set_state(&mut self, fd: i32, state: &Self::State) -> io::Result<()>;
-    fn install_resize_handler(&mut self) -> io::Result<Self::SignalGuard>;
+    fn install_resize_handler(&mut self, wake_fd: i32) -> io::Result<Self::SignalGuard>;
     fn restore_resize_handler(&mut self, guard: Self::SignalGuard) -> io::Result<()>;
     fn resize_pending(&mut self) -> bool;
     fn read(&mut self, fd: i32, buffer: &mut [u8]) -> io::Result<usize>;
     fn write(&mut self, fd: i32, buffer: &[u8]) -> io::Result<usize>;
-    fn wait_readable(&mut self, fd: i32, timeout: Duration) -> io::Result<bool>;
+    fn wait(
+        &mut self,
+        input_fd: i32,
+        wake_fd: i32,
+        timeout: Option<Duration>,
+    ) -> io::Result<WaitReady>;
     fn size(&mut self, fd: i32) -> io::Result<(u16, u16)>;
 }
 
@@ -70,6 +84,7 @@ pub(crate) struct Session<B: Backend> {
     output_fd: i32,
     original_state: Option<B::State>,
     signal_guard: Option<B::SignalGuard>,
+    wake: Arc<WakePipe>,
     lifecycle_started: bool,
 }
 
@@ -93,8 +108,10 @@ impl<B: Backend> Session<B> {
             .get_state(output_fd)
             .map_err(|error| TerminalError::new("validate terminal output", error))?;
 
+        let wake = WakePipe::new()
+            .map_err(|error| TerminalError::new("create runtime wake pipe", error))?;
         let signal_guard = backend
-            .install_resize_handler()
+            .install_resize_handler(wake.write_fd())
             .map_err(|error| TerminalError::new("install SIGWINCH handler", error))?;
 
         let mut raw_state = original_state.clone();
@@ -110,6 +127,7 @@ impl<B: Backend> Session<B> {
             output_fd,
             original_state: Some(original_state),
             signal_guard: Some(signal_guard),
+            wake,
             lifecycle_started: true,
         };
         let mut operations = vec![
@@ -163,10 +181,21 @@ impl<B: Backend> Session<B> {
         self.write_all(&encode(operations, capabilities))
     }
 
-    pub(crate) fn wait_readable(&mut self, timeout: Duration) -> Result<bool> {
-        self.backend
-            .wait_readable(self.input_fd, timeout)
-            .map_err(|error| TerminalError::new("poll terminal input", error))
+    pub(crate) fn wait(&mut self, timeout: Option<Duration>) -> Result<bool> {
+        let ready = self
+            .backend
+            .wait(self.input_fd, self.wake.read_fd(), timeout)
+            .map_err(|error| TerminalError::new("poll terminal input", error))?;
+        if ready.wake {
+            self.wake
+                .acknowledge()
+                .map_err(|error| TerminalError::new("acknowledge runtime wake-up", error))?;
+        }
+        Ok(ready.input)
+    }
+
+    pub(crate) fn wake_handle(&self) -> WakeHandle {
+        WakeHandle::new(Arc::clone(&self.wake))
     }
 
     pub(crate) fn size(&mut self) -> Result<(u16, u16)> {
@@ -214,6 +243,8 @@ impl<B: Backend> Session<B> {
                     .get_or_insert_with(|| TerminalError::new("restore SIGWINCH handler", error));
             }
         }
+
+        self.wake.close();
 
         match first_error {
             Some(error) => Err(error),
@@ -270,7 +301,7 @@ mod tests {
             Ok(())
         }
 
-        fn install_resize_handler(&mut self) -> io::Result<Self::SignalGuard> {
+        fn install_resize_handler(&mut self, _wake_fd: i32) -> io::Result<Self::SignalGuard> {
             self.0.lock().unwrap().calls.push("signal:on".to_owned());
             Ok(())
         }
@@ -303,8 +334,16 @@ mod tests {
             Ok(buffer.len())
         }
 
-        fn wait_readable(&mut self, _fd: i32, _timeout: Duration) -> io::Result<bool> {
-            Ok(true)
+        fn wait(
+            &mut self,
+            _input_fd: i32,
+            _wake_fd: i32,
+            _timeout: Option<Duration>,
+        ) -> io::Result<WaitReady> {
+            Ok(WaitReady {
+                input: true,
+                wake: false,
+            })
         }
 
         fn size(&mut self, _fd: i32) -> io::Result<(u16, u16)> {
@@ -397,7 +436,7 @@ mod tests {
 
         assert_eq!(session.read(&mut buffer).unwrap(), 5);
         assert_eq!(&buffer[..5], b"input");
-        assert!(session.wait_readable(Duration::ZERO).unwrap());
+        assert!(session.wait(Some(Duration::ZERO)).unwrap());
         assert_eq!(session.size().unwrap(), (80, 24));
         assert!(session.take_resize());
         assert!(!session.take_resize());

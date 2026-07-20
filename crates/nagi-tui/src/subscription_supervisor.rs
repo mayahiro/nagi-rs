@@ -9,6 +9,7 @@ use crate::subscription::{
     BufferedSubscriptionMessage, DeliveryKind, DeliveryPolicy, SubscriptionAtomicDiagnostics,
     SubscriptionInbox, SubscriptionKind, SubscriptionProducer, SubscriptionSource,
 };
+use crate::wake::WakeHandle;
 use crate::{CancelToken, Subscription, SubscriptionKey, SubscriptionSink, Timestamp};
 
 /// Counters describing subscription lifecycle, backpressure, and failures
@@ -125,6 +126,7 @@ struct ActiveSubscription<Message> {
 
 pub(crate) struct SubscriptionSupervisor<Message> {
     inbox_capacity: usize,
+    wake: WakeHandle,
     active: HashMap<SubscriptionKey, ActiveSubscription<Message>>,
     order: Vec<SubscriptionKey>,
     generations: HashMap<SubscriptionKey, u64>,
@@ -140,6 +142,7 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
     pub(crate) fn new(inbox_capacity: usize) -> Self {
         Self {
             inbox_capacity,
+            wake: WakeHandle::default(),
             active: HashMap::new(),
             order: Vec::new(),
             generations: HashMap::new(),
@@ -150,6 +153,10 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             batch_flushes: 0,
             spawn_failures: 0,
         }
+    }
+
+    pub(crate) fn set_wake(&mut self, wake: WakeHandle) {
+        self.wake = wake;
     }
 
     pub(crate) fn reconcile(
@@ -345,6 +352,7 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             source.policy,
             Arc::clone(&self.sequence),
             Arc::clone(&self.atomic_diagnostics),
+            self.wake.clone(),
         );
         let producer = match source.producer {
             SubscriptionProducer::Every { interval, factory } => ActiveProducer::Every {
@@ -519,12 +527,22 @@ fn timestamp_after_now(due: Timestamp, interval: Duration, now: Timestamp) -> Op
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
     use std::sync::{Arc, Mutex};
 
     use crate::fixture_support;
+    use crate::wake::{RuntimeWake, WakeHandle};
 
     use super::*;
+
+    struct CountingWake(AtomicUsize);
+
+    impl RuntimeWake for CountingWake {
+        fn notify(&self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
 
     fn stream(
         key: &str,
@@ -549,6 +567,32 @@ mod tests {
             thread::yield_now();
         }
         panic!("subscription stream did not start")
+    }
+
+    #[test]
+    fn stream_send_notifies_runtime_wake() {
+        let started = Arc::new(Mutex::new(None));
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let mut supervisor = SubscriptionSupervisor::new(2);
+        supervisor.set_wake(WakeHandle::new(Arc::clone(&wake)));
+        supervisor
+            .reconcile(
+                stream(
+                    "logs",
+                    DeliveryPolicy::reliable(),
+                    Some(Arc::clone(&started)),
+                ),
+                Timestamp::default(),
+            )
+            .unwrap();
+        let sink = wait_sink(&started);
+        sink.send("line".to_owned()).unwrap();
+
+        assert_eq!(wake.0.load(Ordering::Acquire), 1);
+        supervisor.poll(Timestamp::default());
+        let messages = supervisor.take_ready(1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message, "line");
     }
 
     #[test]

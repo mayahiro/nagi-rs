@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::effect::{EffectKind, RuntimeCommand, Task};
+use crate::wake::WakeHandle;
 use crate::{CancelToken, Effect, ScopeId, TaskKey, Timestamp};
 
 /// Counters describing supervised task behavior
@@ -101,6 +102,7 @@ struct BarrierState {
 
 pub(crate) struct EffectSupervisor<Message> {
     task_limit: usize,
+    wake: WakeHandle,
     sender: SyncSender<TaskOutcome<Message>>,
     receiver: Receiver<TaskOutcome<Message>>,
     tasks: HashMap<u64, TaskState<Message>>,
@@ -124,6 +126,7 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
         let (sender, receiver) = sync_channel(task_limit);
         Self {
             task_limit,
+            wake: WakeHandle::default(),
             sender,
             receiver,
             tasks: HashMap::new(),
@@ -141,6 +144,10 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             next_order: 0,
             diagnostics: EffectDiagnostics::default(),
         }
+    }
+
+    pub(crate) fn set_wake(&mut self, wake: WakeHandle) {
+        self.wake = wake;
     }
 
     pub(crate) fn schedule(&mut self, effect: Effect<Message>, now: Timestamp) {
@@ -357,13 +364,16 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             };
             let token = state.token.clone();
             let sender = self.sender.clone();
+            let wake = self.wake.clone();
             self.running += 1;
             let spawned = thread::Builder::new()
                 .name(format!("nagi-tui-effect-{id}"))
                 .spawn(move || {
                     let result = catch_unwind(AssertUnwindSafe(|| task(token)))
                         .map_or(TaskResult::Panicked, TaskResult::Message);
-                    let _ = sender.send(TaskOutcome { id, result });
+                    if sender.send(TaskOutcome { id, result }).is_ok() {
+                        wake.notify();
+                    }
                 });
             if spawned.is_err() {
                 self.diagnostics.spawn_failures = self.diagnostics.spawn_failures.saturating_add(1);
@@ -574,8 +584,11 @@ impl<Message> Drop for EffectSupervisor<Message> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
+    use crate::wake::{RuntimeWake, WakeHandle};
     use crate::{Clock, VirtualClock, fixture_support};
 
     use super::*;
@@ -584,6 +597,14 @@ mod tests {
         started: Receiver<CancelToken>,
         complete: SyncSender<String>,
         returned: Receiver<()>,
+    }
+
+    struct CountingWake(AtomicUsize);
+
+    impl RuntimeWake for CountingWake {
+        fn notify(&self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
     }
 
     fn controlled_task() -> (Task<String>, TaskControl) {
@@ -620,6 +641,27 @@ mod tests {
     fn complete(control: &TaskControl, message: &str) {
         control.complete.send(message.to_owned()).unwrap();
         control.returned.recv().unwrap();
+    }
+
+    #[test]
+    fn task_completion_notifies_runtime_wake() {
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let mut supervisor = EffectSupervisor::new(1);
+        supervisor.set_wake(WakeHandle::new(Arc::clone(&wake)));
+        let (task, control) = controlled_task();
+        supervisor.schedule(Effect::run(task), Timestamp::default());
+        let _token = wait_started(&control);
+        complete(&control, "done");
+
+        for _ in 0..10_000 {
+            if wake.0.load(Ordering::Acquire) > 0 {
+                supervisor.poll(Timestamp::default());
+                assert_eq!(supervisor.take_ready(1), ["done"]);
+                return;
+            }
+            thread::yield_now();
+        }
+        panic!("effect completion did not notify runtime wake");
     }
 
     fn poll_until<Message: Send + 'static>(

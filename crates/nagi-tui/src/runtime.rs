@@ -15,6 +15,7 @@ use crate::subscription_supervisor::{
 };
 use crate::supervisor::{EffectDiagnostics, EffectSupervisor};
 use crate::text_edit::{TextEdit, apply_text_edit, normalize_cursor};
+use crate::wake::WakeHandle;
 use crate::{
     App, Clock, EventDispatch, EventResult, InteractionState, Node, NodeId, Point, ScrollOffset,
     Size, SubscriptionKey, Surface, SystemClock, TaskKey, Timestamp,
@@ -231,9 +232,18 @@ impl<Application: App> Runtime<Application, SystemClock> {
 impl<Application: App, C: Clock> Runtime<Application, C> {
     /// Creates a runtime using explicit settings and clock
     pub fn with_clock(
+        app: Application,
+        config: RuntimeConfig,
+        clock: C,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_clock_and_wake(app, config, clock, WakeHandle::default())
+    }
+
+    pub(crate) fn with_clock_and_wake(
         mut app: Application,
         config: RuntimeConfig,
         clock: C,
+        wake: WakeHandle,
     ) -> Result<Self, RuntimeError> {
         if config.queue_capacity == 0 {
             return Err(RuntimeError::ZeroQueueCapacity);
@@ -247,8 +257,10 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         let startup = app.init();
         let declared_subscriptions = app.subscriptions();
         let mut effects = EffectSupervisor::new(config.task_limit);
+        effects.set_wake(wake.clone());
         effects.schedule(startup, clock.now());
         let mut subscriptions = SubscriptionSupervisor::new(config.subscription_capacity);
+        subscriptions.set_wake(wake);
         subscriptions
             .reconcile(declared_subscriptions, clock.now())
             .map_err(RuntimeError::DuplicateSubscriptionKey)?;

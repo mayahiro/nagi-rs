@@ -24,6 +24,7 @@ mod terminal;
 #[allow(dead_code, unsafe_code)]
 mod terminal_unix;
 mod text_edit;
+mod wake;
 
 #[cfg(test)]
 mod fixture_support;

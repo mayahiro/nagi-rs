@@ -1,10 +1,10 @@
 use std::ffi::{c_int, c_short, c_ulong, c_void};
 use std::io;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use super::session::Backend;
+use super::session::{Backend, WaitReady};
 
 #[cfg(not(any(
     all(
@@ -95,9 +95,23 @@ unsafe extern "C" {
 
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 static RESIZE_HANDLER_OWNED: AtomicBool = AtomicBool::new(false);
+static RESIZE_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+static RESIZE_HANDLER_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" fn mark_resize_pending(_signal: c_int) {
+    RESIZE_HANDLER_ACTIVE.fetch_add(1, Ordering::AcqRel);
     RESIZE_PENDING.store(true, Ordering::Relaxed);
+    let fd = RESIZE_WAKE_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        let byte = [1_u8];
+        // SAFETY: write is async-signal-safe and byte remains valid for the
+        // call. Restoration waits for active handlers before closing the
+        // descriptor.
+        unsafe {
+            write(fd, byte.as_ptr().cast(), byte.len());
+        }
+    }
+    RESIZE_HANDLER_ACTIVE.fetch_sub(1, Ordering::Release);
 }
 
 pub(crate) struct UnixBackend;
@@ -136,7 +150,7 @@ impl Backend for UnixBackend {
         cvt(result).map(|_| ())
     }
 
-    fn install_resize_handler(&mut self) -> io::Result<Self::SignalGuard> {
+    fn install_resize_handler(&mut self, wake_fd: i32) -> io::Result<Self::SignalGuard> {
         if RESIZE_HANDLER_OWNED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -147,12 +161,14 @@ impl Backend for UnixBackend {
             ));
         }
         RESIZE_PENDING.store(true, Ordering::Release);
+        RESIZE_WAKE_FD.store(wake_fd, Ordering::Release);
         // SAFETY: signal uses the C ABI and mark_resize_pending has the
-        // required handler signature. The handler performs one lock-free
-        // atomic store and is restored before this guard releases ownership.
+        // required handler signature. The handler only performs lock-free
+        // atomic operations and an async-signal-safe write.
         let previous_handler =
             unsafe { signal(SIGWINCH, mark_resize_pending as *const () as usize) };
         if previous_handler == SIG_ERR {
+            RESIZE_WAKE_FD.store(-1, Ordering::Release);
             RESIZE_HANDLER_OWNED.store(false, Ordering::Release);
             return Err(io::Error::last_os_error());
         }
@@ -160,9 +176,13 @@ impl Backend for UnixBackend {
     }
 
     fn restore_resize_handler(&mut self, guard: Self::SignalGuard) -> io::Result<()> {
+        RESIZE_WAKE_FD.store(-1, Ordering::Release);
         // SAFETY: previous_handler is the value returned by the successful
         // signal call paired with this guard.
         let result = unsafe { signal(SIGWINCH, guard.previous_handler) };
+        while RESIZE_HANDLER_ACTIVE.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+        }
         RESIZE_HANDLER_OWNED.store(false, Ordering::Release);
         if result == SIG_ERR {
             Err(io::Error::last_os_error())
@@ -189,39 +209,55 @@ impl Backend for UnixBackend {
         cvt_size(result)
     }
 
-    fn wait_readable(&mut self, fd: i32, timeout: Duration) -> io::Result<bool> {
-        let mut descriptor = PollFd {
-            fd,
-            events: POLLIN,
-            revents: 0,
-        };
-        let timeout_ms = timeout
-            .as_millis()
-            .saturating_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0))
-            .min(i32::MAX as u128) as i32;
-        // SAFETY: descriptor points to one initialized pollfd value, count is
-        // exactly one, and timeout_ms is within the C int range.
-        let result = unsafe { poll(&mut descriptor, 1, timeout_ms) };
+    fn wait(
+        &mut self,
+        input_fd: i32,
+        wake_fd: i32,
+        timeout: Option<Duration>,
+    ) -> io::Result<WaitReady> {
+        let mut descriptors = [
+            PollFd {
+                fd: input_fd,
+                events: POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: wake_fd,
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout_ms = timeout.map_or(-1, timeout_milliseconds);
+        // SAFETY: descriptors points to two initialized pollfd values and
+        // timeout_ms is either the infinite sentinel or a nonnegative C int.
+        let result = unsafe { poll(descriptors.as_mut_ptr(), 2, timeout_ms) };
         if result == -1 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
-                return Ok(false);
+                return Ok(WaitReady::default());
             }
             return Err(error);
         }
         if result == 0 {
-            return Ok(false);
+            return Ok(WaitReady::default());
         }
-        if descriptor.revents & POLLNVAL != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "poll rejected the terminal input descriptor",
-            ));
+        for descriptor in &descriptors {
+            if descriptor.revents & POLLNVAL != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "poll rejected a terminal event descriptor",
+                ));
+            }
+            if descriptor.revents & POLLERR != 0 {
+                return Err(io::Error::other(
+                    "terminal event descriptor reported a poll error",
+                ));
+            }
         }
-        if descriptor.revents & POLLERR != 0 {
-            return Err(io::Error::other("terminal input reported a poll error"));
-        }
-        Ok(descriptor.revents & (POLLIN | POLLHUP) != 0)
+        Ok(WaitReady {
+            input: descriptors[0].revents & (POLLIN | POLLHUP) != 0,
+            wake: descriptors[1].revents & (POLLIN | POLLHUP) != 0,
+        })
     }
 
     fn size(&mut self, fd: i32) -> io::Result<(u16, u16)> {
@@ -245,6 +281,13 @@ impl Backend for UnixBackend {
     }
 }
 
+fn timeout_milliseconds(timeout: Duration) -> c_int {
+    timeout
+        .as_millis()
+        .saturating_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0))
+        .min(c_int::MAX as u128) as c_int
+}
+
 fn cvt(result: c_int) -> io::Result<c_int> {
     if result == -1 {
         Err(io::Error::last_os_error())
@@ -264,8 +307,12 @@ fn cvt_size(result: isize) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use std::mem::{align_of, size_of};
+    use std::sync::mpsc;
+    use std::thread;
 
     use super::*;
+    use crate::terminal_unix::wake::WakePipe;
+    use crate::wake::RuntimeWake;
 
     #[test]
     fn abi_layouts_match_supported_platform_headers() {
@@ -286,9 +333,37 @@ mod tests {
     #[test]
     fn timeout_rounding_contract_covers_sub_millisecond_waits() {
         let timeout = Duration::from_nanos(1);
-        let timeout_ms = timeout
-            .as_millis()
-            .saturating_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0));
-        assert_eq!(timeout_ms, 1);
+        assert_eq!(timeout_milliseconds(timeout), 1);
+    }
+
+    #[test]
+    fn wait_without_deadline_returns_for_runtime_wake() {
+        let input = WakePipe::new().unwrap();
+        let wake = WakePipe::new().unwrap();
+        let input_fd = input.read_fd();
+        let wake_fd = wake.read_fd();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let _ = started_sender.send(());
+            let result = UnixBackend.wait(input_fd, wake_fd, None);
+            let _ = result_sender.send(result);
+        });
+        started_receiver.recv().unwrap();
+        RuntimeWake::notify(wake.as_ref());
+
+        let ready = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait did not return for runtime wake-up")
+            .unwrap();
+        assert_eq!(
+            ready,
+            WaitReady {
+                input: false,
+                wake: true
+            }
+        );
+        worker.join().unwrap();
     }
 }
