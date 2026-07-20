@@ -2,7 +2,7 @@ use nagi_surface::Surface;
 use nagi_vt::{Color, SgrColor, SgrStyle, Style, TerminalOp};
 
 pub(crate) fn operations(previous: Option<&Surface>, current: &Surface) -> Vec<TerminalOp> {
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(8);
     output.push(TerminalOp::BeginSynchronizedUpdate);
     output.push(TerminalOp::HideCursor);
 

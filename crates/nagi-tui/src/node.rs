@@ -3,11 +3,12 @@ use std::marker::PhantomData;
 
 use nagi_surface::{Cursor, Surface};
 use nagi_text::{
-    WidthProfile, byte_at_cell, cell_at_byte, grapheme_width, graphemes, text_width, truncate, wrap,
+    WidthProfile, byte_at_cell, cell_at_byte, grapheme_width, graphemes, text_width, truncate,
+    wrapped_lines,
 };
 use nagi_vt::Style;
 
-use crate::layout::{Track, add_size, allocate, horizontal_rect, inset, vertical_rect};
+use crate::layout::{Track, add_size, allocate_into, horizontal_rect, inset, vertical_rect};
 use crate::panel::{BorderGlyphs, content_insets as panel_content_insets, glyphs as border_glyphs};
 use crate::rich_text::{ParagraphLine, layout as layout_rich_text};
 use crate::routing::{EventHandler, InteractiveKind, NodeRecord, TreeIndex};
@@ -159,8 +160,8 @@ enum NodeKind<Message> {
         placeholder_style: Style,
         on_change: Box<dyn Fn(String) -> Message>,
     },
-    Row(Vec<Node<Message>>),
-    Column(Vec<Node<Message>>),
+    Row(LinearNode<Message>),
+    Column(LinearNode<Message>),
     Stack(Vec<Node<Message>>),
     Padding {
         insets: Insets,
@@ -199,6 +200,20 @@ struct VirtualScrollViewportNode<Message> {
 struct VirtualCache<Message> {
     request: VirtualViewport,
     fragment: VirtualFragment<Message>,
+}
+
+struct LinearNode<Message> {
+    children: Vec<Node<Message>>,
+    cache: RefCell<Option<Box<CachedLinearLayout>>>,
+}
+
+impl<Message> LinearNode<Message> {
+    fn new(children: impl IntoIterator<Item = Node<Message>>) -> Self {
+        Self {
+            children: children.into_iter().collect(),
+            cache: RefCell::new(None),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -291,13 +306,13 @@ impl<Message> Node<Message> {
     /// Creates a horizontal container
     #[must_use]
     pub fn row(children: impl IntoIterator<Item = Self>) -> Self {
-        Self::new(NodeKind::Row(children.into_iter().collect()))
+        Self::new(NodeKind::Row(LinearNode::new(children)))
     }
 
     /// Creates a vertical container
     #[must_use]
     pub fn column(children: impl IntoIterator<Item = Self>) -> Self {
-        Self::new(NodeKind::Column(children.into_iter().collect()))
+        Self::new(NodeKind::Column(LinearNode::new(children)))
     }
 
     /// Creates a front-to-back overlay container
@@ -574,8 +589,8 @@ impl<Message> Node<Message> {
                     .min(u32::MAX as usize) as u32;
                 Size::new(width, 1)
             }
-            NodeKind::Row(children) => measure_linear(children, constraints, true),
-            NodeKind::Column(children) => measure_linear(children, constraints, false),
+            NodeKind::Row(linear) => measure_linear(&linear.children, constraints, true),
+            NodeKind::Column(linear) => measure_linear(&linear.children, constraints, false),
             NodeKind::Stack(children) => children.iter().fold(Size::default(), |size, child| {
                 let child = child.measure(constraints);
                 Size::new(size.width.max(child.width), size.height.max(child.height))
@@ -640,11 +655,9 @@ impl<Message> Node<Message> {
                 *placeholder_style,
                 interaction,
             ),
-            NodeKind::Row(children) => {
-                render_linear(surface, rect, clip, children, true, interaction)
-            }
-            NodeKind::Column(children) => {
-                render_linear(surface, rect, clip, children, false, interaction)
+            NodeKind::Row(linear) => render_linear(surface, rect, clip, linear, true, interaction),
+            NodeKind::Column(linear) => {
+                render_linear(surface, rect, clip, linear, false, interaction)
             }
             NodeKind::Stack(children) => {
                 for child in children {
@@ -726,15 +739,15 @@ impl<Message> Node<Message> {
 }
 
 impl<Message> Node<Message> {
-    pub(crate) fn build_tree_index(
+    pub(crate) fn build_tree_index_into(
         &self,
         size: Size,
         interaction: &InteractionState,
-    ) -> Result<TreeIndex, NodeId> {
+        index: &mut TreeIndex,
+    ) -> Result<(), NodeId> {
         let bounds = Rect::new(0, 0, size.width, size.height);
-        let mut index = TreeIndex::default();
-        self.build_index(bounds, bounds, None, true, interaction, &mut index)?;
-        Ok(index)
+        index.clear();
+        self.build_index(bounds, bounds, None, true, interaction, index)
     }
 
     pub(crate) fn prepare_interaction(&self, size: Size, interaction: &mut InteractionState) {
@@ -794,7 +807,11 @@ impl<Message> Node<Message> {
             return operation(self);
         }
         match &self.kind {
-            NodeKind::Row(children) | NodeKind::Column(children) | NodeKind::Stack(children) => {
+            NodeKind::Row(linear) | NodeKind::Column(linear) => linear
+                .children
+                .iter()
+                .find_map(|child| child.visit(id, operation)),
+            NodeKind::Stack(children) => {
                 children.iter().find_map(|child| child.visit(id, operation))
             }
             NodeKind::Padding { child, .. }
@@ -860,14 +877,15 @@ impl<Message> Node<Message> {
             | NodeKind::Spacer(_)
             | NodeKind::Gap(_)
             | NodeKind::TextInput { .. } => {}
-            NodeKind::Row(children) => {
-                for (child, child_rect) in children.iter().zip(linear_rects(children, rect, true)) {
+            NodeKind::Row(linear) => {
+                let layout = linear.layout(rect, true);
+                for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
                     child.build_index(child_rect, clip, parent, false, interaction, index)?;
                 }
             }
-            NodeKind::Column(children) => {
-                for (child, child_rect) in children.iter().zip(linear_rects(children, rect, false))
-                {
+            NodeKind::Column(linear) => {
+                let layout = linear.layout(rect, false);
+                for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
                     child.build_index(child_rect, clip, parent, false, interaction, index)?;
                 }
             }
@@ -1035,14 +1053,15 @@ impl<Message> Node<Message> {
             _ => {}
         }
         match &self.kind {
-            NodeKind::Row(children) => {
-                for (child, child_rect) in children.iter().zip(linear_rects(children, rect, true)) {
+            NodeKind::Row(linear) => {
+                let layout = linear.layout(rect, true);
+                for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
                     child.prepare_at(child_rect, interaction);
                 }
             }
-            NodeKind::Column(children) => {
-                for (child, child_rect) in children.iter().zip(linear_rects(children, rect, false))
-                {
+            NodeKind::Column(linear) => {
+                let layout = linear.layout(rect, false);
+                for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
                     child.prepare_at(child_rect, interaction);
                 }
             }
@@ -1088,17 +1107,20 @@ impl<Message> Node<Message> {
 }
 
 fn measure_text(content: &str, constraints: Constraints) -> Size {
-    let lines = match constraints.width {
-        Limit::Bounded(width) => wrap(content, width as usize, WidthProfile::MODERN),
-        Limit::Unbounded => natural_lines(content),
+    let max_width = match constraints.width {
+        Limit::Bounded(width) => width as usize,
+        Limit::Unbounded => usize::MAX,
     };
-    let width = lines
-        .iter()
-        .map(|line| text_width(line, WidthProfile::MODERN))
-        .max()
-        .unwrap_or(0)
-        .min(u32::MAX as usize) as u32;
-    Size::new(width, lines.len().min(u32::MAX as usize) as u32)
+    let mut width = 0_usize;
+    let mut height = 0_usize;
+    for line in wrapped_lines(content, max_width, WidthProfile::MODERN) {
+        width = width.max(line.width());
+        height = height.saturating_add(1);
+    }
+    Size::new(
+        width.min(u32::MAX as usize) as u32,
+        height.min(u32::MAX as usize) as u32,
+    )
 }
 
 fn measure_rich_text(
@@ -1115,22 +1137,6 @@ fn measure_rich_text(
         lines.iter().map(|line| line.width).max().unwrap_or(0),
         lines.len().min(u32::MAX as usize) as u32,
     )
-}
-
-fn natural_lines(content: &str) -> Vec<&str> {
-    if content.is_empty() {
-        return vec![""];
-    }
-    let mut lines = Vec::new();
-    let mut start = 0;
-    for grapheme in graphemes(content) {
-        if matches!(grapheme.text(), "\r" | "\n" | "\r\n") {
-            lines.push(&content[start..grapheme.start()]);
-            start = grapheme.end();
-        }
-    }
-    lines.push(&content[start..]);
-    lines
 }
 
 fn measure_linear<Message>(
@@ -1213,65 +1219,173 @@ fn render_linear<Message>(
     surface: &mut Surface,
     rect: Rect,
     clip: Rect,
-    children: &[Node<Message>],
+    linear: &LinearNode<Message>,
     horizontal: bool,
     interaction: &InteractionState,
 ) {
-    for (child, child_rect) in children
-        .iter()
-        .zip(linear_rects(children, rect, horizontal))
-    {
+    let layout = linear.layout(rect, horizontal);
+    for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
         child.render(surface, child_rect, clip, interaction);
     }
 }
 
-fn linear_rects<Message>(children: &[Node<Message>], rect: Rect, horizontal: bool) -> Vec<Rect> {
+const INLINE_LINEAR_CHILDREN: usize = 32;
+
+struct CachedLinearLayout {
+    rect: Rect,
+    layout: LinearLayout,
+}
+
+struct LinearLayout {
+    horizontal: bool,
+    inline: [u32; INLINE_LINEAR_CHILDREN],
+    overflow: Vec<u32>,
+    len: usize,
+}
+
+impl<Message> LinearNode<Message> {
+    fn layout(&self, rect: Rect, horizontal: bool) -> Ref<'_, LinearLayout> {
+        let rebuild = self
+            .cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|cached| cached.rect != rect || cached.layout.horizontal != horizontal);
+        if rebuild {
+            let layout = resolve_linear_layout(&self.children, rect, horizontal);
+            *self.cache.borrow_mut() = Some(Box::new(CachedLinearLayout { rect, layout }));
+        }
+        Ref::map(self.cache.borrow(), |cached| {
+            &cached
+                .as_ref()
+                .expect("linear layout cache is initialized")
+                .layout
+        })
+    }
+}
+
+impl LinearLayout {
+    fn rects(&self, rect: Rect) -> LinearRects<'_> {
+        LinearRects {
+            layout: self,
+            rect,
+            index: 0,
+            offset: 0,
+        }
+    }
+
+    fn allocation(&self, index: usize) -> u32 {
+        if self.overflow.is_empty() {
+            self.inline[index]
+        } else {
+            self.overflow[index]
+        }
+    }
+}
+
+struct LinearRects<'layout> {
+    layout: &'layout LinearLayout,
+    rect: Rect,
+    index: usize,
+    offset: u32,
+}
+
+impl Iterator for LinearRects<'_> {
+    type Item = Rect;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.layout.len {
+            return None;
+        }
+        let allocated = self.layout.allocation(self.index);
+        let child_rect = if self.layout.horizontal {
+            horizontal_rect(self.rect, self.offset, allocated)
+        } else {
+            vertical_rect(self.rect, self.offset, allocated)
+        };
+        self.index += 1;
+        self.offset = self.offset.saturating_add(allocated);
+        Some(child_rect)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.layout.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for LinearRects<'_> {}
+
+fn resolve_linear_layout<Message>(
+    children: &[Node<Message>],
+    rect: Rect,
+    horizontal: bool,
+) -> LinearLayout {
     let available = if horizontal { rect.width } else { rect.height };
-    let tracks: Vec<_> = children
-        .iter()
-        .map(|child| {
-            let measured = child.measure(Constraints::bounded(rect.size()));
-            let gap = match &child.kind {
-                NodeKind::Gap(cells) => Some(*cells),
-                _ => None,
-            };
-            Track {
-                length: child.length,
-                desired: gap.unwrap_or({
-                    if horizontal {
-                        measured.width
-                    } else {
-                        measured.height
-                    }
-                }),
-            }
-        })
-        .collect();
-    let allocations = allocate(available, &tracks);
-    let mut offset = 0_u32;
-    allocations
-        .into_iter()
-        .map(|allocated| {
-            let child_rect = if horizontal {
-                horizontal_rect(rect, offset, allocated)
-            } else {
-                vertical_rect(rect, offset, allocated)
-            };
-            offset = offset.saturating_add(allocated);
-            child_rect
-        })
-        .collect()
+    let mut layout = LinearLayout {
+        horizontal,
+        inline: [0; INLINE_LINEAR_CHILDREN],
+        overflow: Vec::new(),
+        len: children.len(),
+    };
+    if children.len() <= INLINE_LINEAR_CHILDREN {
+        let mut tracks = [Track {
+            length: Length::Auto,
+            desired: 0,
+        }; INLINE_LINEAR_CHILDREN];
+        let mut minimums = [0; INLINE_LINEAR_CHILDREN];
+        fill_linear_tracks(children, rect, horizontal, &mut tracks[..children.len()]);
+        allocate_into(
+            available,
+            &tracks[..children.len()],
+            &mut layout.inline[..children.len()],
+            &mut minimums[..children.len()],
+        );
+        return layout;
+    }
+
+    let mut tracks = vec![
+        Track {
+            length: Length::Auto,
+            desired: 0,
+        };
+        children.len()
+    ];
+    let mut minimums = vec![0; children.len()];
+    layout.overflow = vec![0; children.len()];
+    fill_linear_tracks(children, rect, horizontal, &mut tracks);
+    allocate_into(available, &tracks, &mut layout.overflow, &mut minimums);
+    layout
+}
+
+fn fill_linear_tracks<Message>(
+    children: &[Node<Message>],
+    rect: Rect,
+    horizontal: bool,
+    tracks: &mut [Track],
+) {
+    for (index, child) in children.iter().enumerate() {
+        let measured = child.measure(Constraints::bounded(rect.size()));
+        let desired = match &child.kind {
+            NodeKind::Gap(cells) => *cells,
+            _ if horizontal => measured.width,
+            _ => measured.height,
+        };
+        tracks[index] = Track {
+            length: child.length,
+            desired,
+        };
+    }
 }
 
 fn render_text(surface: &mut Surface, rect: Rect, clip: Rect, content: &str, style: Style) {
     if rect.is_empty() {
         return;
     }
-    let lines = wrap(content, rect.width as usize, WidthProfile::MODERN);
-    for (line_index, line) in lines.into_iter().take(rect.height as usize).enumerate() {
+    let lines = wrapped_lines(content, rect.width as usize, WidthProfile::MODERN);
+    for (line_index, line) in lines.take(rect.height as usize).enumerate() {
         let y = add_coordinate(rect.y, line_index as u32);
         let mut x = i64::from(rect.x);
-        for grapheme in graphemes(line) {
+        for grapheme in graphemes(line.text()) {
             let span = grapheme_width(grapheme.text(), WidthProfile::MODERN).max(1) as i64;
             let end = x.saturating_add(span);
             if contains_unit(clip, x, i64::from(y), end) {

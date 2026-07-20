@@ -1,5 +1,103 @@
-use crate::grapheme::graphemes;
+use crate::grapheme::{Graphemes, graphemes};
 use crate::width::{WidthProfile, cluster_width};
+
+/// One hard-wrapped line and its terminal cell width
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WrappedLine<'text> {
+    text: &'text str,
+    width: usize,
+}
+
+impl<'text> WrappedLine<'text> {
+    /// Returns the line content without a mandatory line-break grapheme
+    #[must_use]
+    pub const fn text(self) -> &'text str {
+        self.text
+    }
+
+    /// Returns the line width in terminal cells
+    #[must_use]
+    pub const fn width(self) -> usize {
+        self.width
+    }
+}
+
+/// An iterator over hard-wrapped lines
+#[derive(Clone, Debug)]
+pub struct WrappedLines<'text, 'profile> {
+    text: &'text str,
+    graphemes: Graphemes<'text>,
+    profile: WidthProfile<'profile>,
+    max_cells: usize,
+    start: usize,
+    cells: usize,
+    finished: bool,
+}
+
+impl<'text> Iterator for WrappedLines<'text, '_> {
+    type Item = WrappedLine<'text>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        for grapheme in self.graphemes.by_ref() {
+            if is_mandatory_break(grapheme.text()) {
+                let line = WrappedLine {
+                    text: &self.text[self.start..grapheme.start()],
+                    width: self.cells,
+                };
+                self.start = grapheme.end();
+                self.cells = 0;
+                return Some(line);
+            }
+
+            let width = cluster_width(grapheme.text(), self.profile);
+            let next = self.cells.saturating_add(width);
+            if width != 0 && grapheme.start() != self.start && next > self.max_cells {
+                let line = WrappedLine {
+                    text: &self.text[self.start..grapheme.start()],
+                    width: self.cells,
+                };
+                self.start = grapheme.start();
+                self.cells = width;
+                return Some(line);
+            }
+            self.cells = next;
+        }
+        self.finished = true;
+        Some(WrappedLine {
+            text: &self.text[self.start..],
+            width: self.cells,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.finished {
+            (0, Some(0))
+        } else {
+            (1, None)
+        }
+    }
+}
+
+/// Returns an iterator using the same hard-wrapping rules as [`wrap`]
+#[must_use]
+pub fn wrapped_lines<'text, 'profile>(
+    text: &'text str,
+    max_cells: usize,
+    profile: WidthProfile<'profile>,
+) -> WrappedLines<'text, 'profile> {
+    WrappedLines {
+        text,
+        graphemes: graphemes(text),
+        profile,
+        max_cells,
+        start: 0,
+        cells: 0,
+        finished: false,
+    }
+}
 
 /// Returns the total terminal cell width of `text`
 #[must_use]
@@ -40,33 +138,9 @@ pub fn wrap<'text>(
     max_cells: usize,
     profile: WidthProfile<'_>,
 ) -> Vec<&'text str> {
-    if text.is_empty() {
-        return vec![""];
-    }
-
-    let mut lines = Vec::new();
-    let mut start = 0_usize;
-    let mut cells = 0_usize;
-    for grapheme in graphemes(text) {
-        if is_mandatory_break(grapheme.text()) {
-            lines.push(&text[start..grapheme.start()]);
-            start = grapheme.end();
-            cells = 0;
-            continue;
-        }
-
-        let width = cluster_width(grapheme.text(), profile);
-        let next = cells.saturating_add(width);
-        if width != 0 && grapheme.start() != start && next > max_cells {
-            lines.push(&text[start..grapheme.start()]);
-            start = grapheme.start();
-            cells = width;
-        } else {
-            cells = next;
-        }
-    }
-    lines.push(&text[start..]);
-    lines
+    wrapped_lines(text, max_cells, profile)
+        .map(WrappedLine::text)
+        .collect()
 }
 
 /// Converts an exact grapheme byte boundary to its terminal cell position
@@ -121,7 +195,7 @@ fn is_mandatory_break(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{byte_at_cell, cell_at_byte, truncate, wrap};
+    use super::{byte_at_cell, cell_at_byte, truncate, wrap, wrapped_lines};
     use crate::width::WidthProfile;
 
     #[test]
@@ -130,5 +204,19 @@ mod tests {
         assert_eq!(wrap("A日B", 2, WidthProfile::MODERN), vec!["A", "日", "B"]);
         assert_eq!(cell_at_byte("A日B", 2, WidthProfile::MODERN), None);
         assert_eq!(byte_at_cell("A日B", 2, WidthProfile::MODERN), None);
+    }
+
+    #[test]
+    fn wrapped_line_iterator_reports_text_and_width() {
+        let lines: Vec<_> = wrapped_lines("A日\nB", 2, WidthProfile::MODERN).collect();
+
+        assert_eq!(
+            lines.iter().map(|line| line.text()).collect::<Vec<_>>(),
+            vec!["A", "日", "B"]
+        );
+        assert_eq!(
+            lines.iter().map(|line| line.width()).collect::<Vec<_>>(),
+            vec![1, 2, 1]
+        );
     }
 }

@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use crate::generated::{
     EAST_ASIAN_WIDTH_RANGES, EMOJI_PRESENTATION_RANGES, EMOJI_VARIATION_BASES,
     EXTENDED_PICTOGRAPHIC_RANGES, GRAPHEME_BREAK_RANGES, INDIC_CONJUNCT_BREAK_RANGES,
@@ -98,10 +100,26 @@ pub(crate) fn is_emoji_variation_base(character: char) -> bool {
         .is_ok()
 }
 
-pub(crate) fn is_rgi_emoji(sequence: &[u32]) -> bool {
+pub(crate) fn is_rgi_emoji(sequence: &str) -> bool {
     RGI_EMOJI_SEQUENCES
-        .binary_search_by(|candidate| (*candidate).cmp(sequence))
+        .binary_search_by(|candidate| compare_sequence(candidate, sequence))
         .is_ok()
+}
+
+fn compare_sequence(candidate: &[u32], sequence: &str) -> Ordering {
+    let mut candidate = candidate.iter().copied();
+    let mut sequence = sequence.chars().map(u32::from);
+    loop {
+        match (candidate.next(), sequence.next()) {
+            (Some(left), Some(right)) => match left.cmp(&right) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            },
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
+        }
+    }
 }
 
 fn value_at(ranges: &[(u32, u32, u8)], code_point: u32) -> u8 {

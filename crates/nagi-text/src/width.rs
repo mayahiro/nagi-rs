@@ -110,41 +110,39 @@ pub(crate) fn cluster_width(grapheme: &str, profile: WidthProfile<'_>) -> usize 
     if let Some(width) = profile.override_for(grapheme) {
         return width;
     }
-    let characters: Vec<_> = grapheme.chars().collect();
-    if characters.is_empty()
-        || characters
-            .iter()
-            .copied()
+    if grapheme.is_empty()
+        || grapheme
+            .chars()
             .any(|character| grapheme_break(character).is_control())
     {
         return 0;
     }
-    let sequence: Vec<_> = characters.iter().copied().map(u32::from).collect();
-    if is_rgi_emoji(&sequence) {
+    if is_rgi_emoji(grapheme) {
         return 2;
     }
 
     let mut text_presentation = false;
-    for pair in characters.windows(2) {
-        if !is_emoji_variation_base(pair[0]) {
-            continue;
+    let mut previous = None;
+    for character in grapheme.chars() {
+        if previous.is_some_and(is_emoji_variation_base) {
+            if character == '\u{FE0F}' {
+                return 2;
+            }
+            if character == '\u{FE0E}' {
+                text_presentation = true;
+            }
         }
-        if pair[1] == '\u{FE0F}' {
-            return 2;
-        }
-        if pair[1] == '\u{FE0E}' {
-            text_presentation = true;
-        }
+        previous = Some(character);
     }
     if text_presentation {
         return 1;
     }
-    if characters.iter().copied().any(is_emoji_presentation) {
+    if grapheme.chars().any(is_emoji_presentation) {
         return 2;
     }
 
     let mut width = 0;
-    for character in characters {
+    for character in grapheme.chars() {
         if matches!(
             grapheme_break(character),
             GraphemeBreak::Extend | GraphemeBreak::Zwj | GraphemeBreak::Prepend

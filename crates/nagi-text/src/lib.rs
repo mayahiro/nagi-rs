@@ -15,7 +15,10 @@ pub use grapheme::{
     Grapheme, Graphemes, grapheme_boundaries, graphemes, is_grapheme_boundary,
     next_grapheme_boundary, previous_grapheme_boundary,
 };
-pub use operations::{byte_at_cell, cell_at_byte, text_width, truncate, wrap};
+pub use operations::{
+    WrappedLine, WrappedLines, byte_at_cell, cell_at_byte, text_width, truncate, wrap,
+    wrapped_lines,
+};
 pub use utf8::normalize_utf8;
 pub use width::{CellCount, WidthOverride, WidthProfile, grapheme_width};
 

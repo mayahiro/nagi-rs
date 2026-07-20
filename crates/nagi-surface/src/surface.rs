@@ -304,8 +304,8 @@ impl Surface {
 
         let width = self.width_usize();
         let mut runs = Vec::new();
+        let mut changed = vec![false; width];
         for row in 0..self.height_usize() {
-            let mut changed = vec![false; width];
             for (column, changed_cell) in changed.iter_mut().enumerate() {
                 let index = self.index(column, row);
                 *changed_cell = self.cells[index] != previous.cells[index];

@@ -4,11 +4,13 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use nagi_tui::{
-    App, Effect, Node, Runtime, ScrollOffset, Size, Subscription, ViewContext, VirtualFragment,
+    App, Effect, Node, NodeId, Runtime, ScrollOffset, Size, Subscription, ViewContext,
+    VirtualFragment,
 };
 
 const ROWS: usize = 100_000;
@@ -134,6 +136,20 @@ struct EagerViewport;
 
 struct VirtualViewportApp;
 
+struct IdentifiedVirtualViewportApp {
+    row_ids: Arc<[NodeId]>,
+}
+
+impl IdentifiedVirtualViewportApp {
+    fn new() -> Self {
+        let row_ids = (0..ROWS)
+            .map(|index| NodeId::from(format!("row-{index}")))
+            .collect::<Vec<_>>()
+            .into();
+        Self { row_ids }
+    }
+}
+
 impl App for EagerViewport {
     type Message = ();
 
@@ -172,9 +188,43 @@ impl App for VirtualViewportApp {
     }
 }
 
+impl App for IdentifiedVirtualViewportApp {
+    type Message = ();
+
+    fn update(&mut self, (): ()) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: ViewContext) -> Node<Self::Message> {
+        let row_ids = Arc::clone(&self.row_ids);
+        Node::virtual_scroll_viewport("viewport", Size::new(80, ROWS as u32), move |viewport| {
+            let start = viewport.offset.y;
+            let end = start.saturating_add(viewport.size.height);
+            let rows = (start..end).map(|row| {
+                Node::text("row").with_id(row_ids[usize::try_from(row).expect("row index")].clone())
+            });
+            VirtualFragment::new(ScrollOffset::new(0, start), Node::column(rows))
+        })
+    }
+
+    fn subscriptions(&self) -> Subscription<Self::Message> {
+        Subscription::none()
+    }
+}
+
+fn warm_runtime<Application>(runtime: &mut Runtime<Application>)
+where
+    Application: App<Message = ()>,
+{
+    for _ in 0..2 {
+        runtime.request_frame();
+        runtime.render_if_dirty().expect("warm-up frame");
+    }
+}
+
 fn sample_eager() -> Vec<Sample> {
     let mut runtime = Runtime::new(EagerViewport, Size::new(80, 24)).expect("runtime");
-    runtime.render_if_dirty().expect("warm-up frame");
+    warm_runtime(&mut runtime);
     let mut samples = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
         runtime.request_frame();
@@ -188,7 +238,22 @@ fn sample_eager() -> Vec<Sample> {
 
 fn sample_virtual() -> Vec<Sample> {
     let mut runtime = Runtime::new(VirtualViewportApp, Size::new(80, 24)).expect("runtime");
-    runtime.render_if_dirty().expect("warm-up frame");
+    warm_runtime(&mut runtime);
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        runtime.request_frame();
+        let baseline = reset_metrics();
+        let started = Instant::now();
+        black_box(runtime.render_if_dirty().expect("benchmark frame"));
+        samples.push(read_metrics(started.elapsed(), baseline));
+    }
+    samples
+}
+
+fn sample_identified_virtual() -> Vec<Sample> {
+    let mut runtime =
+        Runtime::new(IdentifiedVirtualViewportApp::new(), Size::new(80, 24)).expect("runtime");
+    warm_runtime(&mut runtime);
     let mut samples = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
         runtime.request_frame();
@@ -232,4 +297,5 @@ fn report(label: &str, samples: Vec<Sample>) {
 fn main() {
     report("eager", sample_eager());
     report("virtual", sample_virtual());
+    report("virtual-identified", sample_identified_virtual());
 }

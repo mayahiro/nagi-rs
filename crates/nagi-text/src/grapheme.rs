@@ -123,98 +123,121 @@ fn next_boundary_from(text: &str, start: usize) -> usize {
     let Some((_, first)) = characters.next() else {
         return text.len();
     };
-    let mut prefix = vec![first];
+    let mut state = BoundaryState::new(first);
     for (relative, right) in characters {
-        if should_break(&prefix, right) {
+        if state.breaks_before(right) {
             return start + relative;
         }
-        prefix.push(right);
+        state.push(right);
     }
     text.len()
 }
 
-fn should_break(prefix: &[char], right: char) -> bool {
-    let left = prefix
-        .last()
-        .copied()
-        .map_or(GraphemeBreak::Other, grapheme_break);
-    let right_property = grapheme_break(right);
-
-    if left == GraphemeBreak::Cr && right_property == GraphemeBreak::Lf {
-        return false;
-    }
-    if left.is_control() || right_property.is_control() {
-        return true;
-    }
-    if left == GraphemeBreak::L
-        && matches!(
-            right_property,
-            GraphemeBreak::L | GraphemeBreak::V | GraphemeBreak::Lv | GraphemeBreak::Lvt
-        )
-    {
-        return false;
-    }
-    if matches!(left, GraphemeBreak::Lv | GraphemeBreak::V)
-        && matches!(right_property, GraphemeBreak::V | GraphemeBreak::T)
-    {
-        return false;
-    }
-    if matches!(left, GraphemeBreak::Lvt | GraphemeBreak::T) && right_property == GraphemeBreak::T {
-        return false;
-    }
-    if matches!(right_property, GraphemeBreak::Extend | GraphemeBreak::Zwj) {
-        return false;
-    }
-    if right_property == GraphemeBreak::SpacingMark || left == GraphemeBreak::Prepend {
-        return false;
-    }
-    if indic_linker_before(prefix, right) || emoji_zwj_before(prefix, right) {
-        return false;
-    }
-    if right_property == GraphemeBreak::RegionalIndicator
-        && trailing_regional_indicators(prefix) % 2 == 1
-    {
-        return false;
-    }
-    true
+struct BoundaryState {
+    left: GraphemeBreak,
+    trailing_regional_indicators: usize,
+    indic_consonant: bool,
+    indic_linker: bool,
+    emoji_base: bool,
+    emoji_zwj: bool,
 }
 
-fn indic_linker_before(prefix: &[char], right: char) -> bool {
-    if indic_conjunct_break(right) != IndicConjunctBreak::Consonant {
-        return false;
+impl BoundaryState {
+    fn new(first: char) -> Self {
+        let mut state = Self {
+            left: GraphemeBreak::Other,
+            trailing_regional_indicators: 0,
+            indic_consonant: false,
+            indic_linker: false,
+            emoji_base: false,
+            emoji_zwj: false,
+        };
+        state.push(first);
+        state
     }
-    let mut linker_seen = false;
-    for character in prefix.iter().rev().copied() {
-        match indic_conjunct_break(character) {
-            IndicConjunctBreak::Linker => linker_seen = true,
-            IndicConjunctBreak::Extend => {}
-            IndicConjunctBreak::Consonant => return linker_seen,
-            IndicConjunctBreak::None => return false,
+
+    fn breaks_before(&self, right: char) -> bool {
+        let left = self.left;
+        let right_property = grapheme_break(right);
+
+        if left == GraphemeBreak::Cr && right_property == GraphemeBreak::Lf {
+            return false;
         }
+        if left.is_control() || right_property.is_control() {
+            return true;
+        }
+        if left == GraphemeBreak::L
+            && matches!(
+                right_property,
+                GraphemeBreak::L | GraphemeBreak::V | GraphemeBreak::Lv | GraphemeBreak::Lvt
+            )
+        {
+            return false;
+        }
+        if matches!(left, GraphemeBreak::Lv | GraphemeBreak::V)
+            && matches!(right_property, GraphemeBreak::V | GraphemeBreak::T)
+        {
+            return false;
+        }
+        if matches!(left, GraphemeBreak::Lvt | GraphemeBreak::T)
+            && right_property == GraphemeBreak::T
+        {
+            return false;
+        }
+        if matches!(right_property, GraphemeBreak::Extend | GraphemeBreak::Zwj) {
+            return false;
+        }
+        if right_property == GraphemeBreak::SpacingMark || left == GraphemeBreak::Prepend {
+            return false;
+        }
+        if indic_conjunct_break(right) == IndicConjunctBreak::Consonant
+            && self.indic_consonant
+            && self.indic_linker
+        {
+            return false;
+        }
+        if is_extended_pictographic(right) && left == GraphemeBreak::Zwj && self.emoji_zwj {
+            return false;
+        }
+        if right_property == GraphemeBreak::RegionalIndicator
+            && self.trailing_regional_indicators % 2 == 1
+        {
+            return false;
+        }
+        true
     }
-    false
-}
 
-fn emoji_zwj_before(prefix: &[char], right: char) -> bool {
-    if !is_extended_pictographic(right)
-        || prefix.last().copied().map(grapheme_break) != Some(GraphemeBreak::Zwj)
-    {
-        return false;
+    fn push(&mut self, character: char) {
+        let property = grapheme_break(character);
+        if property == GraphemeBreak::RegionalIndicator {
+            self.trailing_regional_indicators += 1;
+        } else {
+            self.trailing_regional_indicators = 0;
+        }
+
+        match indic_conjunct_break(character) {
+            IndicConjunctBreak::Consonant => {
+                self.indic_consonant = true;
+                self.indic_linker = false;
+            }
+            IndicConjunctBreak::Linker => {
+                if self.indic_consonant {
+                    self.indic_linker = true;
+                }
+            }
+            IndicConjunctBreak::Extend => {}
+            IndicConjunctBreak::None => {
+                self.indic_consonant = false;
+                self.indic_linker = false;
+            }
+        }
+
+        self.emoji_zwj = property == GraphemeBreak::Zwj && self.emoji_base;
+        if property != GraphemeBreak::Extend {
+            self.emoji_base = is_extended_pictographic(character);
+        }
+        self.left = property;
     }
-    prefix[..prefix.len() - 1]
-        .iter()
-        .rev()
-        .copied()
-        .find(|character| grapheme_break(*character) != GraphemeBreak::Extend)
-        .is_some_and(is_extended_pictographic)
-}
-
-fn trailing_regional_indicators(prefix: &[char]) -> usize {
-    prefix
-        .iter()
-        .rev()
-        .take_while(|character| grapheme_break(**character) == GraphemeBreak::RegionalIndicator)
-        .count()
 }
 
 #[cfg(test)]

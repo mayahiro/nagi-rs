@@ -207,6 +207,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     interaction: InteractionState,
     view_tree: Option<Node<Application::Message>>,
     tree_index: TreeIndex,
+    next_tree_index: TreeIndex,
     effects: EffectSupervisor<Application::Message>,
     subscriptions: SubscriptionSupervisor<Application::Message>,
     subscriptions_dirty: bool,
@@ -265,6 +266,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             interaction: InteractionState::new(),
             view_tree: None,
             tree_index: TreeIndex::default(),
+            next_tree_index: TreeIndex::default(),
             effects,
             subscriptions,
             subscriptions_dirty: false,
@@ -550,7 +552,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
 
     pub(crate) fn focus_first(&mut self) -> Result<bool, RuntimeError> {
         self.ensure_tree()?;
-        let Some(first) = self.tree_index.focus_scope().into_iter().next() else {
+        let Some(first) = self.tree_index.focus_scope().first().cloned() else {
             return Ok(false);
         };
         self.request_focus(&first)
@@ -604,8 +606,9 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 && !key.modifiers.control
                 && !key.modifiers.meta
             {
+                let focus_scope = self.tree_index.focus_scope();
                 self.interaction.focused = crate::interaction::traverse_focus(
-                    &self.tree_index.focus_scope(),
+                    focus_scope.as_ref(),
                     self.interaction.focused.as_ref(),
                     !key.modifiers.shift,
                 );
@@ -845,10 +848,10 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     fn ensure_focused_visible(
         &mut self,
         view: &Node<Application::Message>,
-        mut index: TreeIndex,
-    ) -> Result<TreeIndex, RuntimeError> {
+        index: &mut TreeIndex,
+    ) -> Result<(), RuntimeError> {
         let Some(focused) = self.interaction.focused.clone() else {
-            return Ok(index);
+            return Ok(());
         };
         let scrolls: Vec<_> = index
             .route(Some(&focused))
@@ -895,11 +898,10 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
             self.interaction.request_scroll(&id, next);
             view.prepare_interaction(self.size, &mut self.interaction);
-            index = view
-                .build_tree_index(self.size, &self.interaction)
+            view.build_tree_index_into(self.size, &self.interaction, index)
                 .map_err(RuntimeError::DuplicateNodeId)?;
         }
-        Ok(index)
+        Ok(())
     }
 
     fn ensure_tree(&mut self) -> Result<(), RuntimeError> {
@@ -907,25 +909,33 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             return Ok(());
         }
         let view = self.app.view(crate::ViewContext::new(self.size));
-        let initial_index = view
-            .build_tree_index(self.size, &self.interaction)
-            .map_err(RuntimeError::DuplicateNodeId)?;
+        let mut tree_index = std::mem::take(&mut self.next_tree_index);
+        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
+            self.next_tree_index = tree_index;
+            return Err(RuntimeError::DuplicateNodeId(id));
+        }
         self.interaction
-            .reconcile(&initial_index.active, &[], &initial_index.focus_scope());
+            .reconcile(&tree_index.active, &[], tree_index.focus_scope().as_ref());
         if self
             .interaction
             .pointer_capture
             .as_ref()
-            .is_some_and(|id| !initial_index.allows_interaction(id))
+            .is_some_and(|id| !tree_index.allows_interaction(id))
         {
             self.interaction.pointer_capture = None;
         }
-        self.apply_pending_interaction(&initial_index);
+        self.apply_pending_interaction(&tree_index);
         view.prepare_interaction(self.size, &mut self.interaction);
-        let tree_index = view
-            .build_tree_index(self.size, &self.interaction)
-            .map_err(RuntimeError::DuplicateNodeId)?;
-        self.tree_index = self.ensure_focused_visible(&view, tree_index)?;
+        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
+            self.next_tree_index = tree_index;
+            return Err(RuntimeError::DuplicateNodeId(id));
+        }
+        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index) {
+            self.next_tree_index = tree_index;
+            return Err(error);
+        }
+        let previous = std::mem::replace(&mut self.tree_index, tree_index);
+        self.next_tree_index = previous;
         self.view_tree = Some(view);
         Ok(())
     }
@@ -945,36 +955,52 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
         }
         let view = self.app.view(crate::ViewContext::new(self.size));
-        let initial_index = view
-            .build_tree_index(self.size, &self.interaction)
-            .map_err(RuntimeError::DuplicateNodeId)?;
-        let previous_focus_order = self.tree_index.focus_scope();
-        self.interaction.reconcile(
-            &initial_index.active,
-            &previous_focus_order,
-            &initial_index.focus_scope(),
-        );
+        let mut tree_index = std::mem::take(&mut self.next_tree_index);
+        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
+            self.next_tree_index = tree_index;
+            return Err(RuntimeError::DuplicateNodeId(id));
+        }
+        {
+            let previous_focus_order = self.tree_index.focus_scope();
+            let current_focus_order = tree_index.focus_scope();
+            self.interaction.reconcile(
+                &tree_index.active,
+                previous_focus_order.as_ref(),
+                current_focus_order.as_ref(),
+            );
+        }
         if self
             .interaction
             .pointer_capture
             .as_ref()
-            .is_some_and(|id| !initial_index.allows_interaction(id))
+            .is_some_and(|id| !tree_index.allows_interaction(id))
         {
             self.interaction.pointer_capture = None;
         }
-        self.apply_pending_interaction(&initial_index);
+        self.apply_pending_interaction(&tree_index);
         view.prepare_interaction(self.size, &mut self.interaction);
-        let tree_index = view
-            .build_tree_index(self.size, &self.interaction)
-            .map_err(RuntimeError::DuplicateNodeId)?;
-        let tree_index = self.ensure_focused_visible(&view, tree_index)?;
-        let mut surface = Surface::new(self.size.width, self.size.height)?;
+        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
+            self.next_tree_index = tree_index;
+            return Err(RuntimeError::DuplicateNodeId(id));
+        }
+        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index) {
+            self.next_tree_index = tree_index;
+            return Err(error);
+        }
+        let mut surface = match Surface::new(self.size.width, self.size.height) {
+            Ok(surface) => surface,
+            Err(error) => {
+                self.next_tree_index = tree_index;
+                return Err(error.into());
+            }
+        };
         view.render_to(&mut surface, &self.interaction);
         let frame_operations = operations(self.previous_surface.as_deref(), &surface);
         let surface = Arc::new(surface);
         self.previous_surface = Some(Arc::clone(&surface));
         self.view_tree = Some(view);
-        self.tree_index = tree_index;
+        let previous = std::mem::replace(&mut self.tree_index, tree_index);
+        self.next_tree_index = previous;
         self.dirty = false;
         self.urgent_frame = false;
         self.last_frame = Some(now);

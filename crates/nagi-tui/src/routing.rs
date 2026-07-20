@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::{Event, NodeId, Point, Rect};
@@ -167,6 +168,15 @@ pub(crate) struct TreeIndex {
 }
 
 impl TreeIndex {
+    pub(crate) fn clear(&mut self) {
+        self.records.clear();
+        self.by_id.clear();
+        self.focus_order.clear();
+        self.active.clear();
+        self.root = None;
+        self.active_modal = None;
+    }
+
     pub(crate) fn register(&mut self, record: NodeRecord, is_root: bool) -> Result<(), NodeId> {
         if self.by_id.contains_key(&record.id) {
             return Err(record.id);
@@ -225,15 +235,16 @@ impl TreeIndex {
             .or_else(|| self.active_modal.clone())
     }
 
-    pub(crate) fn focus_scope(&self) -> Vec<NodeId> {
+    pub(crate) fn focus_scope(&self) -> Cow<'_, [NodeId]> {
         match &self.active_modal {
-            Some(modal) => self
-                .focus_order
-                .iter()
-                .filter(|id| self.is_within(id, modal))
-                .cloned()
-                .collect(),
-            None => self.focus_order.clone(),
+            Some(modal) => Cow::Owned(
+                self.focus_order
+                    .iter()
+                    .filter(|id| self.is_within(id, modal))
+                    .cloned()
+                    .collect(),
+            ),
+            None => Cow::Borrowed(&self.focus_order),
         }
     }
 

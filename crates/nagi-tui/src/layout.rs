@@ -32,26 +32,36 @@ pub(crate) struct Track {
     pub(crate) desired: u32,
 }
 
+#[cfg(test)]
 pub(crate) fn allocate(available: u32, tracks: &[Track]) -> Vec<u32> {
-    let mut allocations = Vec::with_capacity(tracks.len());
-    let mut minimums = Vec::with_capacity(tracks.len());
+    let mut allocations = vec![0; tracks.len()];
+    let mut minimums = vec![0; tracks.len()];
+    allocate_into(available, tracks, &mut allocations, &mut minimums);
+    allocations
+}
+
+pub(crate) fn allocate_into(
+    available: u32,
+    tracks: &[Track],
+    allocations: &mut [u32],
+    minimums: &mut [u32],
+) {
     let mut total = 0_u64;
 
-    for track in tracks {
+    for (index, track) in tracks.iter().enumerate() {
         let (base, minimum) = base_and_minimum(available, *track);
-        allocations.push(base);
-        minimums.push(minimum.min(base));
+        allocations[index] = base;
+        minimums[index] = minimum.min(base);
         total = total.saturating_add(u64::from(base));
     }
 
     if total > u64::from(available) {
-        shrink_from_end(&mut allocations, &minimums, total - u64::from(available));
+        shrink_from_end(allocations, minimums, total - u64::from(available));
     }
 
     let used: u64 = allocations.iter().map(|value| u64::from(*value)).sum();
     let remaining = u64::from(available).saturating_sub(used);
-    distribute_flex(&mut allocations, tracks, remaining);
-    allocations
+    distribute_flex(allocations, tracks, remaining);
 }
 
 fn base_and_minimum(available: u32, track: Track) -> (u32, u32) {
