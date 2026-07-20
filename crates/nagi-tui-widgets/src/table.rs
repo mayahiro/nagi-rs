@@ -173,7 +173,9 @@ impl<Message: 'static> Table<Message> {
     /// Keeps the header fixed and wraps data rows in a Core ScrollViewport
     ///
     /// `viewport_id` must differ from the table root and row IDs. Applications
-    /// may control its retained offset through `Runtime::set_scroll_offset`
+    /// may control its retained offset through `Runtime::set_scroll_offset`.
+    /// The viewport does not virtualize rows; pass a bounded row set for large
+    /// collections
     #[must_use]
     pub fn viewport(mut self, viewport_id: impl Into<NodeId>, body_height: Length) -> Self {
         self.viewport = Some((viewport_id.into(), body_height));

@@ -1,4 +1,4 @@
-//! Interactive gallery for the initial standard Nagi TUI widgets
+//! Interactive gallery for standard Nagi TUI widgets
 
 use std::time::Duration;
 

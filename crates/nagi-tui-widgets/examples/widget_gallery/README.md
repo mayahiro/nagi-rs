@@ -1,6 +1,6 @@
 # Standard widget gallery
 
-This example demonstrates the initial standard widgets: `List`, `Button`,
+This example demonstrates standard widgets: `List`, `Button`,
 `Modal`, `Progress`, and `Spinner`. It also shows application-owned state and a
 clock-driven spinner subscription
 

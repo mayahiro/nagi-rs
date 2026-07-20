@@ -1,6 +1,6 @@
 # Filtered list
 
-This example follows the controlled-model style used by Bubble Tea and Bubbles
+This example keeps filtering, selection, and pagination in application state
 while using Nagi TUI's semantic nodes and retained focus routing
 
 It combines a Core `TextInput` with `List::filter`, `List::paginate`, a list

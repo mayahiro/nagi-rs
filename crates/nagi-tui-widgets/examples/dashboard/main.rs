@@ -1,4 +1,4 @@
-//! Ratatui-style operations dashboard composed from public Nagi TUI APIs
+//! Operations dashboard composed from public Nagi TUI APIs
 
 use nagi_tui::{
     App, Effect, Event, EventAction, HorizontalAlignment, Length, Node, Style, TerminalOptions,

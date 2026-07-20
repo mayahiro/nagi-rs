@@ -1,4 +1,4 @@
-//! Pure VT input decoder and output encoder primitives for Nagi TUI
+//! Pure VT input decoder and output encoder primitives for Nagi terminal applications
 //!
 //! The codec owns no I/O, file descriptors, timers, threads, or terminal
 //! session state

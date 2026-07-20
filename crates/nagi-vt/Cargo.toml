@@ -1,6 +1,6 @@
 [package]
 name = "nagi-vt"
-description = "Pure VT input decoder and output encoder primitives for Nagi TUI"
+description = "Pure VT input decoder and output encoder primitives for Nagi terminal applications"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

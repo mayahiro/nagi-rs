@@ -1,4 +1,4 @@
-//! Bubbles-style filtered and paginated controlled list
+//! Filtered and paginated list with application-owned state
 
 use nagi_tui::{
     App, Effect, Event, EventAction, KeyCode, Length, Node, Style, TerminalOptions, run_terminal,

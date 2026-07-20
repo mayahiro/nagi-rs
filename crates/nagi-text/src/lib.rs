@@ -1,4 +1,4 @@
-//! Unicode grapheme and terminal cell text primitives for Nagi TUI
+//! Unicode grapheme and terminal cell text primitives for Nagi terminal applications
 //!
 //! Segmentation follows Unicode Standard Annex #29 extended grapheme clusters
 //! using the committed Unicode data version. Width is an explicit terminal

@@ -1,6 +1,6 @@
 [package]
 name = "nagi-text"
-description = "Unicode grapheme and terminal cell text primitives for Nagi TUI"
+description = "Unicode grapheme and terminal cell text primitives for Nagi terminal applications"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

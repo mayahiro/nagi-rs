@@ -353,12 +353,18 @@ impl<Message> Node<Message> {
     }
 
     /// Creates a clipped viewport with runtime-owned two-dimensional offset
+    ///
+    /// The supplied child tree is fully constructed and measured, and render
+    /// traversal is not virtualized
     #[must_use]
     pub fn scroll_viewport(id: impl Into<NodeId>, child: Self) -> Self {
         Self::scroll_viewport_with_options(id, child, ScrollViewportOptions::default())
     }
 
     /// Creates a clipped viewport with configured scrolling behavior
+    ///
+    /// The supplied child tree is fully constructed and measured, and render
+    /// traversal is not virtualized
     #[must_use]
     pub fn scroll_viewport_with_options(
         id: impl Into<NodeId>,

@@ -146,7 +146,9 @@ impl<Message: 'static> List<Message> {
     /// Wraps the list in a Core ScrollViewport using a sizing rule
     ///
     /// `viewport_id` must differ from the list root and item IDs. Applications
-    /// may control its retained offset through `Runtime::set_scroll_offset`
+    /// may control its retained offset through `Runtime::set_scroll_offset`.
+    /// This does not limit item construction; use [`Self::window`] or
+    /// [`Self::paginate`] before the viewport for large collections
     #[must_use]
     pub fn viewport(mut self, viewport_id: impl Into<NodeId>, height: Length) -> Self {
         self.viewport = Some((viewport_id.into(), height));
