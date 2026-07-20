@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/nagi-tui",
+    "crates/nagi-surface",
+    "crates/nagi-tui-test",
+    "crates/nagi-text",
+    "crates/nagi-vt",
+    "crates/nagi-tui-widgets",
+    "tools/nagi-unicode-gen",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/mayahiro/nagi-rs"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"

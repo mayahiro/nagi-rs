@@ -1,0 +1,12 @@
+[package]
+name = "nagi-vt"
+description = "Pure VT input decoder and output encoder primitives for Nagi TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

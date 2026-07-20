@@ -1,0 +1,16 @@
+[package]
+name = "nagi-tui-widgets"
+description = "Standard widgets built on the public Nagi TUI API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nagi-tui = { path = "../nagi-tui", version = "0.1.0" }
+nagi-text = { path = "../nagi-text", version = "0.1.0" }

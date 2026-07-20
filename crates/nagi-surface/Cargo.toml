@@ -1,0 +1,16 @@
+[package]
+name = "nagi-surface"
+description = "Cell surface composition and diff primitives for Nagi TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nagi-text = { path = "../nagi-text", version = "0.1.0" }
+nagi-vt = { path = "../nagi-vt", version = "0.1.0" }

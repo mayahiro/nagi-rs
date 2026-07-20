@@ -1,0 +1,16 @@
+[package]
+name = "nagi-tui-test"
+description = "Virtual terminal and conformance test support for Nagi TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nagi-tui = { path = "../nagi-tui", version = "0.1.0" }
+nagi-surface = { path = "../nagi-surface", version = "0.1.0" }
