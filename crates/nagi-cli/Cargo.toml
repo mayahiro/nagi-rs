@@ -1,6 +1,6 @@
 [package]
-name = "nagi-tui"
-description = "Application and runtime facade for Nagi TUI"
+name = "nagi-cli"
+description = "Command graph, parser, and runtime primitives for Nagi CLI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,4 @@ missing_docs = "deny"
 unsafe_code = "allow"
 
 [dependencies]
-nagi-surface = { path = "../nagi-surface", version = "0.2.0" }
 nagi-text = { path = "../nagi-text", version = "0.2.0" }
-nagi-vt = { path = "../nagi-vt", version = "0.2.0" }

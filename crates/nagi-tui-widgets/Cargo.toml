@@ -12,5 +12,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-nagi-tui = { path = "../nagi-tui", version = "0.1.0" }
-nagi-text = { path = "../nagi-text", version = "0.1.0" }
+nagi-tui = { path = "../nagi-tui", version = "0.2.0" }
+nagi-text = { path = "../nagi-text", version = "0.2.0" }

@@ -3,8 +3,22 @@
 version = 4
 
 [[package]]
+name = "nagi-cli"
+version = "0.2.0"
+dependencies = [
+ "nagi-text",
+]
+
+[[package]]
+name = "nagi-cli-test"
+version = "0.2.0"
+dependencies = [
+ "nagi-cli",
+]
+
+[[package]]
 name = "nagi-surface"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nagi-text",
  "nagi-vt",
@@ -12,11 +26,11 @@ dependencies = [
 
 [[package]]
 name = "nagi-text"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nagi-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nagi-surface",
  "nagi-text",
@@ -25,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "nagi-tui-test"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nagi-surface",
  "nagi-tui",
@@ -33,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "nagi-tui-widgets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nagi-text",
  "nagi-tui",
@@ -41,8 +55,8 @@ dependencies = [
 
 [[package]]
 name = "nagi-unicode-gen"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nagi-vt"
-version = "0.1.0"
+version = "0.2.0"
