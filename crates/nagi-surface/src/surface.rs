@@ -304,7 +304,14 @@ impl Surface {
 
         let width = self.width_usize();
         let mut runs = Vec::new();
-        let mut changed = vec![false; width];
+        let mut inline_changed = [false; 256];
+        let mut allocated_changed = Vec::new();
+        let changed = if width <= inline_changed.len() {
+            &mut inline_changed[..width]
+        } else {
+            allocated_changed.resize(width, false);
+            allocated_changed.as_mut_slice()
+        };
         for row in 0..self.height_usize() {
             for (column, changed_cell) in changed.iter_mut().enumerate() {
                 let index = self.index(column, row);
@@ -317,8 +324,8 @@ impl Surface {
                     if !changed[column] {
                         continue;
                     }
-                    expanded |= self.mark_cluster(row, column, &mut changed);
-                    expanded |= previous.mark_cluster(row, column, &mut changed);
+                    expanded |= self.mark_cluster(row, column, &mut *changed);
+                    expanded |= previous.mark_cluster(row, column, &mut *changed);
                 }
                 if !expanded {
                     break;

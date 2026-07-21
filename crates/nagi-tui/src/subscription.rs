@@ -328,6 +328,7 @@ pub(crate) struct SubscriptionAtomicDiagnostics {
 
 struct SubscriptionInboxState<Message> {
     stopped: bool,
+    batch_threshold_notified: bool,
     messages: VecDeque<BufferedSubscriptionMessage<Message>>,
 }
 
@@ -352,6 +353,7 @@ impl<Message> SubscriptionInbox<Message> {
         Arc::new(Self {
             state: Mutex::new(SubscriptionInboxState {
                 stopped: false,
+                batch_threshold_notified: false,
                 messages: VecDeque::with_capacity(capacity.min(64)),
             }),
             changed: Condvar::new(),
@@ -389,13 +391,29 @@ impl<Message> SubscriptionInbox<Message> {
                 return Err(SubscriptionClosed { message });
             }
         }
+        let was_empty = state.messages.is_empty();
         state.messages.push_back(BufferedSubscriptionMessage {
             sequence: next_sequence(&self.sequence),
             message,
         });
+        let notify_runtime = match self.policy.kind {
+            DeliveryKind::Batch {
+                maximum_messages, ..
+            } => {
+                let reached_threshold = state.messages.len() >= maximum_messages;
+                let notify = was_empty || reached_threshold && !state.batch_threshold_notified;
+                if reached_threshold {
+                    state.batch_threshold_notified = true;
+                }
+                notify
+            }
+            DeliveryKind::Reliable | DeliveryKind::Latest => true,
+        };
         self.changed.notify_all();
         drop(state);
-        self.wake.notify();
+        if notify_runtime {
+            self.wake.notify();
+        }
         Ok(())
     }
 
@@ -440,6 +458,9 @@ impl<Message> SubscriptionInbox<Message> {
             return None;
         }
         let message = state.messages.pop_front();
+        if state.messages.is_empty() {
+            state.batch_threshold_notified = false;
+        }
         self.changed.notify_all();
         message
     }
@@ -460,6 +481,7 @@ impl<Message> SubscriptionInbox<Message> {
         state.stopped = true;
         let discarded = state.messages.len();
         state.messages.clear();
+        state.batch_threshold_notified = false;
         self.diagnostics
             .discarded_messages
             .fetch_add(discarded as u64, Ordering::Relaxed);

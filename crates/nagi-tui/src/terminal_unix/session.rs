@@ -4,7 +4,9 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nagi_vt::{Capabilities, MouseTracking, TerminalOp, encode};
+#[cfg(test)]
+use nagi_vt::encode;
+use nagi_vt::{Capabilities, MouseTracking, TerminalOp, append_encoded};
 
 use super::system::UnixBackend;
 use super::wake::WakePipe;
@@ -86,6 +88,7 @@ pub(crate) struct Session<B: Backend> {
     signal_guard: Option<B::SignalGuard>,
     wake: Arc<WakePipe>,
     lifecycle_started: bool,
+    output_buffer: Vec<u8>,
 }
 
 impl Session<UnixBackend> {
@@ -129,6 +132,7 @@ impl<B: Backend> Session<B> {
             signal_guard: Some(signal_guard),
             wake,
             lifecycle_started: true,
+            output_buffer: Vec::new(),
         };
         let mut operations = vec![
             TerminalOp::EnterAlternateScreen,
@@ -139,7 +143,7 @@ impl<B: Backend> Session<B> {
             operations.push(TerminalOp::EnableMouse(tracking));
         }
         operations.push(TerminalOp::EnableFocus);
-        if let Err(error) = session.write_all(&encode(&operations, Capabilities::BASELINE)) {
+        if let Err(error) = session.write_operations(&operations, Capabilities::BASELINE) {
             let _ = session.restore();
             return Err(error);
         }
@@ -178,7 +182,12 @@ impl<B: Backend> Session<B> {
         operations: &[TerminalOp],
         capabilities: Capabilities,
     ) -> Result<()> {
-        self.write_all(&encode(operations, capabilities))
+        let mut output = std::mem::take(&mut self.output_buffer);
+        output.clear();
+        append_encoded(&mut output, operations, capabilities);
+        let result = self.write_all(&output);
+        self.output_buffer = output;
+        result
     }
 
     pub(crate) fn wait(&mut self, timeout: Option<Duration>) -> Result<bool> {
@@ -225,7 +234,7 @@ impl<B: Backend> Session<B> {
                 TerminalOp::ShowCursor,
                 TerminalOp::LeaveAlternateScreen,
             ];
-            if let Err(error) = self.write_all(&encode(&operations, Capabilities::BASELINE)) {
+            if let Err(error) = self.write_operations(&operations, Capabilities::BASELINE) {
                 first_error = Some(error);
             }
         }

@@ -1,5 +1,3 @@
-use std::fmt::Write;
-
 /// A color used by the SGR output encoder
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum SgrColor {
@@ -182,18 +180,30 @@ pub enum TerminalOp {
 /// Encodes terminal operations deterministically for `capabilities`
 #[must_use]
 pub fn encode(operations: &[TerminalOp], capabilities: Capabilities) -> Vec<u8> {
-    let mut output = String::new();
-    for operation in operations {
-        encode_operation(&mut output, operation, capabilities);
-    }
-    output.into_bytes()
+    let mut output = Vec::new();
+    append_encoded(&mut output, operations, capabilities);
+    output
 }
 
-fn encode_operation(output: &mut String, operation: &TerminalOp, capabilities: Capabilities) {
+/// Appends deterministic terminal encoding to `destination`
+pub fn append_encoded(
+    destination: &mut Vec<u8>,
+    operations: &[TerminalOp],
+    capabilities: Capabilities,
+) {
+    for operation in operations {
+        encode_operation(destination, operation, capabilities);
+    }
+}
+
+fn encode_operation(output: &mut Vec<u8>, operation: &TerminalOp, capabilities: Capabilities) {
     match operation {
         TerminalOp::MoveTo { x, y } => {
-            write!(output, "\x1B[{};{}H", u64::from(*y) + 1, u64::from(*x) + 1)
-                .expect("writing to a String cannot fail");
+            output.extend_from_slice(b"\x1B[");
+            push_decimal(output, u64::from(*y) + 1);
+            output.push(b';');
+            push_decimal(output, u64::from(*x) + 1);
+            output.push(b'H');
         }
         TerminalOp::MoveRelative { dx, dy } => {
             if *dy < 0 {
@@ -208,55 +218,62 @@ fn encode_operation(output: &mut String, operation: &TerminalOp, capabilities: C
             }
         }
         TerminalOp::SetStyle(style) => write_style(output, *style, capabilities),
-        TerminalOp::ResetStyle => output.push_str("\x1B[0m"),
+        TerminalOp::ResetStyle => output.extend_from_slice(b"\x1B[0m"),
         TerminalOp::WriteText(text) => write_safe_text(output, text),
         TerminalOp::EraseLine(mode) => write_erase(output, *mode, 'K'),
         TerminalOp::EraseDisplay(mode) => write_erase(output, *mode, 'J'),
-        TerminalOp::ShowCursor => output.push_str("\x1B[?25h"),
-        TerminalOp::HideCursor => output.push_str("\x1B[?25l"),
+        TerminalOp::ShowCursor => output.extend_from_slice(b"\x1B[?25h"),
+        TerminalOp::HideCursor => output.extend_from_slice(b"\x1B[?25l"),
         TerminalOp::SetCursorShape(shape) if capabilities.cursor_shape => {
-            write!(output, "\x1B[{} q", cursor_shape_code(*shape))
-                .expect("writing to a String cannot fail");
+            output.extend_from_slice(b"\x1B[");
+            push_decimal(output, u64::from(cursor_shape_code(*shape)));
+            output.extend_from_slice(b" q");
         }
         TerminalOp::SetCursorShape(_) => {}
-        TerminalOp::EnterAlternateScreen => output.push_str("\x1B[?1049h"),
-        TerminalOp::LeaveAlternateScreen => output.push_str("\x1B[?1049l"),
-        TerminalOp::EnableBracketedPaste => output.push_str("\x1B[?2004h"),
-        TerminalOp::DisableBracketedPaste => output.push_str("\x1B[?2004l"),
+        TerminalOp::EnterAlternateScreen => output.extend_from_slice(b"\x1B[?1049h"),
+        TerminalOp::LeaveAlternateScreen => output.extend_from_slice(b"\x1B[?1049l"),
+        TerminalOp::EnableBracketedPaste => output.extend_from_slice(b"\x1B[?2004h"),
+        TerminalOp::DisableBracketedPaste => output.extend_from_slice(b"\x1B[?2004l"),
         TerminalOp::EnableMouse(tracking) => {
             let mode = match tracking {
                 MouseTracking::Press => 1000,
                 MouseTracking::Button => 1002,
                 MouseTracking::Any => 1003,
             };
-            write!(output, "\x1B[?{mode}h\x1B[?1006h").expect("writing to a String cannot fail");
+            output.extend_from_slice(b"\x1B[?");
+            push_decimal(output, mode);
+            output.extend_from_slice(b"h\x1B[?1006h");
         }
         TerminalOp::DisableMouse => {
-            output.push_str("\x1B[?1000l\x1B[?1002l\x1B[?1003l\x1B[?1006l");
+            output.extend_from_slice(b"\x1B[?1000l\x1B[?1002l\x1B[?1003l\x1B[?1006l");
         }
-        TerminalOp::EnableFocus => output.push_str("\x1B[?1004h"),
-        TerminalOp::DisableFocus => output.push_str("\x1B[?1004l"),
+        TerminalOp::EnableFocus => output.extend_from_slice(b"\x1B[?1004h"),
+        TerminalOp::DisableFocus => output.extend_from_slice(b"\x1B[?1004l"),
         TerminalOp::BeginSynchronizedUpdate if capabilities.synchronized_updates => {
-            output.push_str("\x1B[?2026h");
+            output.extend_from_slice(b"\x1B[?2026h");
         }
         TerminalOp::EndSynchronizedUpdate if capabilities.synchronized_updates => {
-            output.push_str("\x1B[?2026l");
+            output.extend_from_slice(b"\x1B[?2026l");
         }
         TerminalOp::BeginSynchronizedUpdate | TerminalOp::EndSynchronizedUpdate => {}
     }
 }
 
-fn write_csi_count(output: &mut String, count: u32, final_character: char) {
-    write!(output, "\x1B[{count}{final_character}").expect("writing to a String cannot fail");
+fn write_csi_count(output: &mut Vec<u8>, count: u32, final_character: char) {
+    output.extend_from_slice(b"\x1B[");
+    push_decimal(output, u64::from(count));
+    output.push(final_character as u8);
 }
 
-fn write_erase(output: &mut String, mode: EraseMode, final_character: char) {
+fn write_erase(output: &mut Vec<u8>, mode: EraseMode, final_character: char) {
     let parameter = match mode {
         EraseMode::After => 0,
         EraseMode::Before => 1,
         EraseMode::All => 2,
     };
-    write!(output, "\x1B[{parameter}{final_character}").expect("writing to a String cannot fail");
+    output.extend_from_slice(b"\x1B[");
+    output.push(b'0' + parameter);
+    output.push(final_character as u8);
 }
 
 fn cursor_shape_code(shape: CursorShape) -> u8 {
@@ -271,13 +288,13 @@ fn cursor_shape_code(shape: CursorShape) -> u8 {
     }
 }
 
-fn write_style(output: &mut String, style: SgrStyle, capabilities: Capabilities) {
-    let mut parameters = vec!["0".to_owned()];
-    push_color(&mut parameters, style.foreground, true, capabilities);
-    push_color(&mut parameters, style.background, false, capabilities);
+fn write_style(output: &mut Vec<u8>, style: SgrStyle, capabilities: Capabilities) {
+    output.extend_from_slice(b"\x1B[0");
+    push_color(output, style.foreground, true, capabilities);
+    push_color(output, style.background, false, capabilities);
     if capabilities.underline_color {
         if let Some(color) = style.underline_color {
-            push_extended_color(&mut parameters, color, 58, capabilities);
+            push_extended_color(output, color, 58, capabilities);
         }
     }
     let attributes = [
@@ -292,25 +309,18 @@ fn write_style(output: &mut String, style: SgrStyle, capabilities: Capabilities)
     ];
     for (enabled, code) in attributes {
         if enabled {
-            parameters.push(code.to_string());
+            push_parameter(output, code);
         }
     }
-    output.push_str("\x1B[");
-    output.push_str(&parameters.join(";"));
-    output.push('m');
+    output.push(b'm');
 }
 
-fn push_color(
-    parameters: &mut Vec<String>,
-    color: SgrColor,
-    foreground: bool,
-    capabilities: Capabilities,
-) {
+fn push_color(output: &mut Vec<u8>, color: SgrColor, foreground: bool, capabilities: Capabilities) {
     if color == SgrColor::Default {
         return;
     }
     push_extended_color(
-        parameters,
+        output,
         color,
         if foreground { 38 } else { 48 },
         capabilities,
@@ -318,38 +328,36 @@ fn push_color(
 }
 
 fn push_extended_color(
-    parameters: &mut Vec<String>,
+    output: &mut Vec<u8>,
     color: SgrColor,
     prefix: u8,
     capabilities: Capabilities,
 ) {
     match color {
-        SgrColor::Default => parameters.push(
+        SgrColor::Default => push_parameter(
+            output,
             match prefix {
-                48 => "49",
-                58 => "59",
-                _ => "39",
-            }
-            .to_owned(),
+                48 => 49,
+                58 => 59,
+                _ => 39,
+            },
         ),
         SgrColor::Indexed(index) => {
-            parameters.extend([prefix.to_string(), "5".to_owned(), index.to_string()]);
+            push_parameter(output, u64::from(prefix));
+            push_parameter(output, 5);
+            push_parameter(output, u64::from(index));
         }
         SgrColor::Rgb { red, green, blue } if capabilities.true_color => {
-            parameters.extend([
-                prefix.to_string(),
-                "2".to_owned(),
-                red.to_string(),
-                green.to_string(),
-                blue.to_string(),
-            ]);
+            push_parameter(output, u64::from(prefix));
+            push_parameter(output, 2);
+            push_parameter(output, u64::from(red));
+            push_parameter(output, u64::from(green));
+            push_parameter(output, u64::from(blue));
         }
         SgrColor::Rgb { red, green, blue } => {
-            parameters.extend([
-                prefix.to_string(),
-                "5".to_owned(),
-                indexed_rgb(red, green, blue).to_string(),
-            ]);
+            push_parameter(output, u64::from(prefix));
+            push_parameter(output, 5);
+            push_parameter(output, u64::from(indexed_rgb(red, green, blue)));
         }
     }
 }
@@ -359,19 +367,40 @@ fn indexed_rgb(red: u8, green: u8, blue: u8) -> u8 {
     16 + 36 * level(red) + 6 * level(green) + level(blue)
 }
 
-fn write_safe_text(output: &mut String, text: &str) {
+fn write_safe_text(output: &mut Vec<u8>, text: &str) {
     for character in text.chars() {
-        if matches!(u32::from(character), 0x00..=0x1F | 0x7F..=0x9F) {
-            output.push('\u{FFFD}');
+        let character = if matches!(u32::from(character), 0x00..=0x1F | 0x7F..=0x9F) {
+            '\u{FFFD}'
         } else {
-            output.push(character);
+            character
+        };
+        let mut buffer = [0; 4];
+        output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+    }
+}
+
+fn push_parameter(output: &mut Vec<u8>, value: u64) {
+    output.push(b';');
+    push_decimal(output, value);
+}
+
+fn push_decimal(output: &mut Vec<u8>, mut value: u64) {
+    let mut buffer = [0_u8; 20];
+    let mut start = buffer.len();
+    loop {
+        start -= 1;
+        buffer[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
         }
     }
+    output.extend_from_slice(&buffer[start..]);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Capabilities, TerminalOp, encode};
+    use super::{Capabilities, TerminalOp, append_encoded, encode};
 
     #[test]
     fn text_cannot_inject_terminal_controls() {
@@ -396,5 +425,19 @@ mod tests {
             ),
             b"\x1B[2147483648A\x1B[2147483648D"
         );
+    }
+
+    #[test]
+    fn append_encoded_preserves_destination_prefix() {
+        let mut output = b"prefix:".to_vec();
+        append_encoded(
+            &mut output,
+            &[
+                TerminalOp::MoveTo { x: 2, y: 3 },
+                TerminalOp::WriteText("ok".to_owned()),
+            ],
+            Capabilities::BASELINE,
+        );
+        assert_eq!(output, b"prefix:\x1B[4;3Hok");
     }
 }

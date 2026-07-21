@@ -10,7 +10,7 @@ use nagi_vt::Style;
 
 use crate::layout::{Track, add_size, allocate_into, horizontal_rect, inset, vertical_rect};
 use crate::panel::{BorderGlyphs, content_insets as panel_content_insets, glyphs as border_glyphs};
-use crate::rich_text::{ParagraphLine, layout as layout_rich_text};
+use crate::rich_text::ParagraphLayoutCache;
 use crate::routing::{EventHandler, InteractiveKind, NodeRecord, TreeIndex};
 use crate::{
     BorderKind, Event, EventResult, InteractionState, Length, NodeId, PanelOptions,
@@ -149,6 +149,7 @@ enum NodeKind<Message> {
     RichText {
         spans: Vec<TextSpan>,
         options: ParagraphOptions,
+        cache: RefCell<ParagraphLayoutCache>,
     },
     Surface(Surface),
     Spacer(Size),
@@ -268,6 +269,7 @@ impl<Message> Node<Message> {
                 wrap: WrapMode::Hard,
                 ..ParagraphOptions::default()
             },
+            cache: RefCell::new(ParagraphLayoutCache::default()),
         })
     }
 
@@ -277,6 +279,7 @@ impl<Message> Node<Message> {
         Self::new(NodeKind::RichText {
             spans: spans.into_iter().collect(),
             options,
+            cache: RefCell::new(ParagraphLayoutCache::default()),
         })
     }
 
@@ -575,9 +578,11 @@ impl<Message> Node<Message> {
     fn measure(&self, constraints: Constraints) -> Size {
         let measured = match &self.kind {
             NodeKind::Text { content, .. } => measure_text(content, constraints),
-            NodeKind::RichText { spans, options } => {
-                measure_rich_text(spans, *options, constraints)
-            }
+            NodeKind::RichText {
+                spans,
+                options,
+                cache,
+            } => measure_rich_text(spans, *options, cache, constraints),
             NodeKind::Surface(surface) => Size::new(surface.width(), surface.height()),
             NodeKind::Spacer(size) => *size,
             NodeKind::Gap(_) => Size::default(),
@@ -633,8 +638,12 @@ impl<Message> Node<Message> {
             NodeKind::Text { content, style } => {
                 render_text(surface, rect, clip, content, *style);
             }
-            NodeKind::RichText { spans, options } => {
-                render_rich_text(surface, rect, clip, spans, *options);
+            NodeKind::RichText {
+                spans,
+                options,
+                cache,
+            } => {
+                render_rich_text(surface, rect, clip, spans, *options, cache);
             }
             NodeKind::Surface(source) => render_surface_node(surface, rect, clip, source),
             NodeKind::Spacer(_) | NodeKind::Gap(_) => {}
@@ -750,9 +759,13 @@ impl<Message> Node<Message> {
         self.build_index(bounds, bounds, None, true, interaction, index)
     }
 
-    pub(crate) fn prepare_interaction(&self, size: Size, interaction: &mut InteractionState) {
+    pub(crate) fn prepare_interaction(
+        &self,
+        size: Size,
+        interaction: &mut InteractionState,
+    ) -> bool {
         let bounds = Rect::new(0, 0, size.width, size.height);
-        self.prepare_at(bounds, interaction);
+        self.prepare_at(bounds, interaction)
     }
 
     pub(crate) fn handle_event(&self, id: &NodeId, event: &Event) -> Option<EventResult<Message>> {
@@ -995,19 +1008,21 @@ impl<Message> Node<Message> {
         Ok(())
     }
 
-    fn prepare_at(&self, rect: Rect, interaction: &mut InteractionState) {
+    fn prepare_at(&self, rect: Rect, interaction: &mut InteractionState) -> bool {
         match &self.kind {
             NodeKind::TextInput { value, .. } => {
                 interaction.ensure_text_input(
                     self.id.as_ref().expect("TextInput always has a NodeId"),
                     value,
                 );
+                return false;
             }
             NodeKind::ScrollViewport { child, options } => {
                 let id = self
                     .id
                     .as_ref()
                     .expect("ScrollViewport always has a NodeId");
+                let previous_offset = interaction.scroll_offset(id);
                 let content = child.measure(scroll_constraints(rect, options.axis));
                 let width = content.width.max(rect.width);
                 let height = content.height.max(rect.height);
@@ -1020,17 +1035,22 @@ impl<Message> Node<Message> {
                     options.axis,
                     options.stick_to_end,
                 );
-                child.prepare_at(
+                let child_changed = child.prepare_at(
                     scroll_child_rect(rect, child, state.offset, options.axis),
                     interaction,
                 );
-                return;
+                return state.offset != previous_offset || child_changed;
             }
             NodeKind::VirtualScrollViewport(virtual_node) => {
                 let id = self
                     .id
                     .as_ref()
                     .expect("VirtualScrollViewport always has a NodeId");
+                let previous_request = virtual_node
+                    .cache
+                    .borrow()
+                    .as_ref()
+                    .map(|cached| cached.request);
                 let state = interaction.prepare_scroll(
                     id,
                     virtual_scroll_maximum(
@@ -1049,32 +1069,40 @@ impl<Message> Node<Message> {
                     rect,
                     state.offset,
                 ) {
-                    fragment
+                    let request_changed = previous_request != Some(fragment.request);
+                    let child_changed = fragment
                         .fragment
                         .node
                         .prepare_at(virtual_fragment_rect(rect, &fragment), interaction);
+                    return request_changed || child_changed;
                 }
-                return;
+                return previous_request.is_some();
             }
             _ => {}
         }
         match &self.kind {
             NodeKind::Row(linear) => {
                 let layout = linear.layout(rect, true);
+                let mut changed = false;
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-                    child.prepare_at(child_rect, interaction);
+                    changed |= child.prepare_at(child_rect, interaction);
                 }
+                changed
             }
             NodeKind::Column(linear) => {
                 let layout = linear.layout(rect, false);
+                let mut changed = false;
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-                    child.prepare_at(child_rect, interaction);
+                    changed |= child.prepare_at(child_rect, interaction);
                 }
+                changed
             }
             NodeKind::Stack(children) => {
+                let mut changed = false;
                 for child in children {
-                    child.prepare_at(rect, interaction);
+                    changed |= child.prepare_at(rect, interaction);
                 }
+                changed
             }
             NodeKind::Padding { insets, child } => child.prepare_at(
                 inset(rect, insets.left, insets.top, insets.right, insets.bottom),
@@ -1098,7 +1126,7 @@ impl<Message> Node<Message> {
                 child.prepare_at(
                     inset(rect, insets.left, insets.top, insets.right, insets.bottom),
                     interaction,
-                );
+                )
             }
             NodeKind::Text { .. }
             | NodeKind::RichText { .. }
@@ -1107,7 +1135,7 @@ impl<Message> Node<Message> {
             | NodeKind::Gap(_)
             | NodeKind::TextInput { .. }
             | NodeKind::ScrollViewport { .. }
-            | NodeKind::VirtualScrollViewport(_) => {}
+            | NodeKind::VirtualScrollViewport(_) => false,
         }
     }
 }
@@ -1132,17 +1160,17 @@ fn measure_text(content: &str, constraints: Constraints) -> Size {
 fn measure_rich_text(
     spans: &[TextSpan],
     options: ParagraphOptions,
+    cache: &RefCell<ParagraphLayoutCache>,
     constraints: Constraints,
 ) -> Size {
     let (max_width, bounded) = match constraints.width {
         Limit::Bounded(width) => (width, true),
         Limit::Unbounded => (0, false),
     };
-    let lines = layout_rich_text(spans, max_width, bounded, options.wrap);
-    Size::new(
-        lines.iter().map(|line| line.width).max().unwrap_or(0),
-        lines.len().min(u32::MAX as usize) as u32,
-    )
+    cache
+        .borrow_mut()
+        .resolve(spans, max_width, bounded, options.wrap)
+        .size
 }
 
 fn measure_linear<Message>(
@@ -1414,13 +1442,23 @@ fn render_rich_text(
     clip: Rect,
     spans: &[TextSpan],
     options: ParagraphOptions,
+    cache: &RefCell<ParagraphLayoutCache>,
 ) {
     if rect.is_empty() {
         return;
     }
-    let lines = layout_rich_text(spans, rect.width, true, options.wrap);
-    for (line_index, line) in lines.into_iter().take(rect.height as usize).enumerate() {
-        render_rich_text_line(surface, rect, clip, line_index as u32, &line, options);
+    let mut cache = cache.borrow_mut();
+    let layout = cache.resolve(spans, rect.width, true, options.wrap);
+    for line_index in 0..layout.lines.len().min(rect.height as usize) {
+        render_rich_text_line(
+            surface,
+            rect,
+            clip,
+            line_index as u32,
+            &layout,
+            spans,
+            options,
+        );
     }
 }
 
@@ -1429,9 +1467,11 @@ fn render_rich_text_line(
     rect: Rect,
     clip: Rect,
     line_index: u32,
-    line: &ParagraphLine,
+    layout: &crate::rich_text::ParagraphLayout<'_>,
+    spans: &[TextSpan],
     options: ParagraphOptions,
 ) {
+    let line = &layout.lines[line_index as usize];
     let desired = line.width.min(rect.width);
     let mut x = i64::from(add_coordinate(
         rect.x,
@@ -1439,7 +1479,7 @@ fn render_rich_text_line(
     ));
     let right = i64::from(rect.x) + i64::from(rect.width);
     let y = add_coordinate(rect.y, line_index);
-    for unit in &line.units {
+    for unit in &layout.units[line.start..line.end] {
         let end = x.saturating_add(i64::from(unit.width));
         if end > right {
             break;
@@ -1448,8 +1488,8 @@ fn render_rich_text_line(
             surface.write(
                 clamp_i64_to_i32(x),
                 y,
-                &unit.text,
-                unit.style,
+                unit.text(spans),
+                unit.style(spans),
                 WidthProfile::MODERN,
             );
         }

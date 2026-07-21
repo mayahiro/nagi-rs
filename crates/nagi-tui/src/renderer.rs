@@ -2,10 +2,6 @@ use nagi_surface::Surface;
 use nagi_vt::{Color, SgrColor, SgrStyle, Style, TerminalOp};
 
 pub(crate) fn operations(previous: Option<&Surface>, current: &Surface) -> Vec<TerminalOp> {
-    let mut output = Vec::with_capacity(8);
-    output.push(TerminalOp::BeginSynchronizedUpdate);
-    output.push(TerminalOp::HideCursor);
-
     let runs = match previous {
         Some(previous) => current.changed_runs(previous),
         None => (0..current.height())
@@ -17,6 +13,14 @@ pub(crate) fn operations(previous: Option<&Surface>, current: &Surface) -> Vec<T
             })
             .collect(),
     };
+
+    if runs.is_empty() && previous.is_some_and(|previous| previous.cursor() == current.cursor()) {
+        return Vec::new();
+    }
+
+    let mut output = Vec::with_capacity(8);
+    output.push(TerminalOp::BeginSynchronizedUpdate);
+    output.push(TerminalOp::HideCursor);
 
     for run in runs {
         output.push(TerminalOp::MoveTo {
@@ -121,17 +125,11 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_second_frame_emits_only_frame_and_cursor_state() {
+    fn unchanged_second_frame_emits_no_operations() {
         let current = Surface::new(2, 1).unwrap();
 
         let actual = operations(Some(&current), &current);
 
-        assert!(
-            !actual
-                .iter()
-                .any(|operation| matches!(operation, TerminalOp::WriteText(_)))
-        );
-        assert_eq!(actual.first(), Some(&TerminalOp::BeginSynchronizedUpdate));
-        assert_eq!(actual.last(), Some(&TerminalOp::EndSynchronizedUpdate));
+        assert!(actual.is_empty());
     }
 }

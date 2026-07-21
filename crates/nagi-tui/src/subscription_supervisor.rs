@@ -314,6 +314,9 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
     }
 
     pub(crate) fn time_until_deadline(&self, now: Timestamp) -> Option<Duration> {
+        if self.active.values().any(source_ready) {
+            return Some(Duration::ZERO);
+        }
         self.active
             .values()
             .flat_map(|active| {
@@ -593,6 +596,49 @@ mod tests {
         let messages = supervisor.take_ready(1);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message, "line");
+    }
+
+    #[test]
+    fn batch_stream_coalesces_runtime_wake_until_delivery_boundary() {
+        let started = Arc::new(Mutex::new(None));
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let mut supervisor = SubscriptionSupervisor::new(8);
+        supervisor.set_wake(WakeHandle::new(Arc::clone(&wake)));
+        supervisor
+            .reconcile(
+                stream(
+                    "logs",
+                    DeliveryPolicy::batch(4, Duration::from_secs(1)),
+                    Some(Arc::clone(&started)),
+                ),
+                Timestamp::default(),
+            )
+            .unwrap();
+        let sink = wait_sink(&started);
+        for message in ["one", "two", "three"] {
+            sink.send(message.to_owned()).unwrap();
+        }
+        assert_eq!(wake.0.load(Ordering::Acquire), 1);
+        supervisor.poll(Timestamp::default());
+        assert!(supervisor.take_ready(8).is_empty());
+        assert_eq!(
+            supervisor.time_until_deadline(Timestamp::default()),
+            Some(Duration::from_secs(1))
+        );
+
+        sink.send("four".to_owned()).unwrap();
+        sink.send("five".to_owned()).unwrap();
+        assert_eq!(wake.0.load(Ordering::Acquire), 2);
+        supervisor.poll(Timestamp::default());
+        assert_eq!(join_messages(supervisor.take_ready(2)), "one,two");
+        assert_eq!(
+            supervisor.time_until_deadline(Timestamp::default()),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(join_messages(supervisor.take_ready(8)), "three,four,five");
+
+        sink.send("next".to_owned()).unwrap();
+        assert_eq!(wake.0.load(Ordering::Acquire), 3);
     }
 
     #[test]

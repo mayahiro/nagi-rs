@@ -205,6 +205,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     minimum_frame_interval: Duration,
     last_frame: Option<Timestamp>,
     previous_surface: Option<Arc<Surface>>,
+    spare_surface: Option<Surface>,
     interaction: InteractionState,
     view_tree: Option<Node<Application::Message>>,
     tree_index: TreeIndex,
@@ -275,6 +276,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             minimum_frame_interval: config.minimum_frame_interval,
             last_frame: None,
             previous_surface: None,
+            spare_surface: None,
             interaction: InteractionState::new(),
             view_tree: None,
             tree_index: TreeIndex::default(),
@@ -501,9 +503,12 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         while let Some(queued) = self.queue.pop_front() {
             observe(&queued.message);
             let effect = self.app.update(queued.message);
+            let without_redraw = effect.without_redraw;
             self.effects.schedule(effect, self.clock.now());
             self.apply_effect_commands();
-            self.dirty = true;
+            if !without_redraw {
+                self.dirty = true;
+            }
             self.subscriptions_dirty = true;
             self.reconcile_subscriptions()?;
             processed += 1;
@@ -937,10 +942,13 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.interaction.pointer_capture = None;
         }
         self.apply_pending_interaction(&tree_index);
-        view.prepare_interaction(self.size, &mut self.interaction);
-        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
-            self.next_tree_index = tree_index;
-            return Err(RuntimeError::DuplicateNodeId(id));
+        if view.prepare_interaction(self.size, &mut self.interaction) {
+            if let Err(id) =
+                view.build_tree_index_into(self.size, &self.interaction, &mut tree_index)
+            {
+                self.next_tree_index = tree_index;
+                return Err(RuntimeError::DuplicateNodeId(id));
+            }
         }
         if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index) {
             self.next_tree_index = tree_index;
@@ -990,24 +998,41 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.interaction.pointer_capture = None;
         }
         self.apply_pending_interaction(&tree_index);
-        view.prepare_interaction(self.size, &mut self.interaction);
-        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
-            self.next_tree_index = tree_index;
-            return Err(RuntimeError::DuplicateNodeId(id));
+        if view.prepare_interaction(self.size, &mut self.interaction) {
+            if let Err(id) =
+                view.build_tree_index_into(self.size, &self.interaction, &mut tree_index)
+            {
+                self.next_tree_index = tree_index;
+                return Err(RuntimeError::DuplicateNodeId(id));
+            }
         }
         if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index) {
             self.next_tree_index = tree_index;
             return Err(error);
         }
-        let mut surface = match Surface::new(self.size.width, self.size.height) {
-            Ok(surface) => surface,
-            Err(error) => {
-                self.next_tree_index = tree_index;
-                return Err(error.into());
+        let mut surface = match self.spare_surface.take() {
+            Some(mut surface)
+                if surface.width() == self.size.width && surface.height() == self.size.height =>
+            {
+                surface.clear();
+                surface
             }
+            _ => match Surface::new(self.size.width, self.size.height) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    self.next_tree_index = tree_index;
+                    return Err(error.into());
+                }
+            },
         };
         view.render_to(&mut surface, &self.interaction);
-        let frame_operations = operations(self.previous_surface.as_deref(), &surface);
+        let previous_surface = self.previous_surface.take();
+        let frame_operations = operations(previous_surface.as_deref(), &surface);
+        if let Some(previous_surface) = previous_surface {
+            if let Ok(surface) = Arc::try_unwrap(previous_surface) {
+                self.spare_surface = Some(surface);
+            }
+        }
         let surface = Arc::new(surface);
         self.previous_surface = Some(Arc::clone(&surface));
         self.view_tree = Some(view);
@@ -1071,6 +1096,8 @@ mod tests {
 
     enum Message {
         Add(u32),
+        WithoutRedraw,
+        ExitWithoutRedraw,
     }
 
     struct Counter {
@@ -1092,6 +1119,8 @@ mod tests {
                     self.value += value;
                     self.updates.push(value);
                 }
+                Message::WithoutRedraw => return Effect::none().without_redraw(),
+                Message::ExitWithoutRedraw => return Effect::exit().without_redraw(),
             }
             Effect::none()
         }
@@ -1123,6 +1152,59 @@ mod tests {
         assert_eq!(frame.surface().cell(0, 0).unwrap().content(), "6");
         assert_eq!(frame.timestamp().as_nanos(), 7_000_000);
         assert!(runtime.render_if_dirty().unwrap().is_none());
+    }
+
+    #[test]
+    fn effect_without_redraw_skips_unchanged_frame() {
+        let mut runtime = Runtime::new(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            Size::new(3, 1),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap().unwrap();
+        runtime.enqueue(Message::WithoutRedraw).unwrap();
+
+        assert_eq!(runtime.process_pending().unwrap(), 1);
+        assert!(runtime.render_if_dirty().unwrap().is_none());
+    }
+
+    #[test]
+    fn effect_without_redraw_does_not_suppress_synchronous_command_frame() {
+        let mut runtime = Runtime::new(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            Size::new(3, 1),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap().unwrap();
+        runtime.enqueue(Message::ExitWithoutRedraw).unwrap();
+
+        runtime.process_pending().unwrap();
+        assert!(runtime.render_if_dirty().unwrap().is_some());
+    }
+
+    #[test]
+    fn rendering_reclaims_unretained_surface_storage() {
+        let mut runtime = Runtime::new(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            Size::new(3, 1),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap().unwrap();
+        runtime.request_frame();
+        runtime.render_if_dirty().unwrap().unwrap();
+
+        let spare = runtime.spare_surface.as_ref().expect("reclaimed surface");
+        assert_eq!(spare.width(), 3);
+        assert_eq!(spare.height(), 1);
     }
 
     #[test]
@@ -1212,7 +1294,10 @@ mod tests {
 
         fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
             match message {
-                SubscriptionMessage::Toggle => self.running = !self.running,
+                SubscriptionMessage::Toggle => {
+                    self.running = !self.running;
+                    return Effect::none().without_redraw();
+                }
                 SubscriptionMessage::Tick(value) => self.values.push(value),
             }
             Effect::none()

@@ -101,6 +101,7 @@ pub type Task<Message> = Box<dyn FnOnce(CancelToken) -> Message + Send + 'static
 /// Declarative follow-up work produced by application initialization or update
 pub struct Effect<Message> {
     pub(crate) kind: EffectKind<Message>,
+    pub(crate) without_redraw: bool,
 }
 
 pub(crate) enum EffectKind<Message> {
@@ -142,6 +143,7 @@ impl<Message> Effect<Message> {
     pub const fn none() -> Self {
         Self {
             kind: EffectKind::None,
+            without_redraw: false,
         }
     }
 
@@ -150,6 +152,7 @@ impl<Message> Effect<Message> {
     pub const fn exit() -> Self {
         Self {
             kind: EffectKind::Exit,
+            without_redraw: false,
         }
     }
 
@@ -158,6 +161,7 @@ impl<Message> Effect<Message> {
     pub fn focus(id: impl Into<NodeId>) -> Self {
         Self {
             kind: EffectKind::Focus(id.into()),
+            without_redraw: false,
         }
     }
 
@@ -169,6 +173,7 @@ impl<Message> Effect<Message> {
                 id: id.into(),
                 offset,
             },
+            without_redraw: false,
         }
     }
 
@@ -177,6 +182,7 @@ impl<Message> Effect<Message> {
     pub fn run(task: impl FnOnce(CancelToken) -> Message + Send + 'static) -> Self {
         Self {
             kind: EffectKind::Run(Box::new(task)),
+            without_redraw: false,
         }
     }
 
@@ -191,6 +197,7 @@ impl<Message> Effect<Message> {
                 key: key.into(),
                 task: Box::new(task),
             },
+            without_redraw: false,
         }
     }
 
@@ -199,6 +206,7 @@ impl<Message> Effect<Message> {
     pub fn cancel(key: impl Into<TaskKey>) -> Self {
         Self {
             kind: EffectKind::Cancel(key.into()),
+            without_redraw: false,
         }
     }
 
@@ -210,6 +218,7 @@ impl<Message> Effect<Message> {
                 scope: scope.into(),
                 effect: Box::new(effect),
             },
+            without_redraw: false,
         }
     }
 
@@ -218,6 +227,7 @@ impl<Message> Effect<Message> {
     pub fn cancel_scope(scope: impl Into<ScopeId>) -> Self {
         Self {
             kind: EffectKind::CancelScope(scope.into()),
+            without_redraw: false,
         }
     }
 
@@ -226,6 +236,7 @@ impl<Message> Effect<Message> {
     pub fn after(delay: Duration, message: Message) -> Self {
         Self {
             kind: EffectKind::After { delay, message },
+            without_redraw: false,
         }
     }
 
@@ -234,6 +245,7 @@ impl<Message> Effect<Message> {
     pub fn batch(effects: impl IntoIterator<Item = Self>) -> Self {
         Self {
             kind: EffectKind::Batch(effects.into_iter().collect()),
+            without_redraw: false,
         }
     }
 
@@ -242,7 +254,20 @@ impl<Message> Effect<Message> {
     pub fn sequence(effects: impl IntoIterator<Item = Self>) -> Self {
         Self {
             kind: EffectKind::Sequence(effects.into_iter().collect()),
+            without_redraw: false,
         }
+    }
+
+    /// Declares that the update returning this effect did not change state
+    /// observed by [`crate::App::view`]
+    ///
+    /// Follow-up work is still scheduled and subscriptions are still
+    /// reconciled. Synchronous UI commands and an already-dirty runtime still
+    /// produce a frame
+    #[must_use]
+    pub const fn without_redraw(mut self) -> Self {
+        self.without_redraw = true;
+        self
     }
 
     /// Reports whether this effect performs no work
