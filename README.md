@@ -17,9 +17,9 @@ Add only the application framework and optional components that you use
 
 ```toml
 [dependencies]
-nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" }
-nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" } # Optional
-nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" } # CLI applications
+nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" }
+nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" } # Optional
+nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" } # CLI applications
 ```
 
 Commit an application's `Cargo.lock` to preserve its complete dependency
@@ -51,7 +51,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-tui` | App lifecycle, semantic nodes, layout, events, Effects, Subscriptions, and terminal loop |
 | `nagi-tui-widgets` | 21 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
-| `nagi-cli` | Command Graph, typed Invocation, Context, diagnostics, help, and process integration |
+| `nagi-cli` | Command Graph, typed Invocation validation, structured Help and Diagnostics, Runtime Policy, and process integration |
 | `nagi-cli-test` | Process-free CLI input injection and output capture |
 
 The [Nagi semantic specifications](https://github.com/mayahiro/nagi/tree/main/spec)
@@ -63,8 +63,8 @@ Add only the matching test support crate
 
 ```toml
 [dev-dependencies]
-nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" }
-nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" }
+nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" }
+nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" }
 ```
 
 `nagi-tui-test` drives messages, terminal input, resize, virtual time, Effects,
@@ -111,7 +111,7 @@ constructs only the current visible or bounded-overscan `VirtualFragment`
 CLI process integration supports Linux and macOS, preserves Unix argument
 values, and converts SIGINT into cooperative cancellation. Shell completion,
 configuration-file loading, interactive prompts, and TUI integration are not
-provided
+provided. The portable graph does not model arbitrary invocation grammars
 
 ## License
 

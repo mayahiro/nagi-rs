@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
-use nagi_text::{WidthProfile, text_width};
-
 use crate::diagnostic::{Diagnostic, DiagnosticCode, display_os};
+use crate::help::{HelpBlock, HelpExample, HelpLink, HelpSection};
+use crate::parser::Invocation;
 use crate::runtime::Handler;
 use crate::value::{ValueParser, raw_parser};
 
@@ -17,6 +17,34 @@ pub enum OptionKind {
     Count,
     /// One or more parser-produced values
     Value,
+}
+
+/// Resolved or command-line presence used by validation
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresenceBasis {
+    /// Values from command line, environment, or default
+    Resolved,
+    /// Values supplied in argv only
+    CommandLine,
+}
+
+/// The cardinality rule for one option group
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionGroupKind {
+    /// Accepts zero or one present option
+    AtMostOne,
+    /// Accepts exactly one present option
+    ExactlyOne,
+    /// Accepts one or more present options
+    AtLeastOne,
+    /// Accepts zero options or every option
+    AllOrNone,
+}
+
+#[derive(Clone)]
+pub(crate) struct OptionRelation {
+    pub(crate) id: String,
+    pub(crate) presence: PresenceBasis,
 }
 
 /// One named option in a command definition
@@ -32,8 +60,8 @@ pub struct OptionSpec {
     pub(crate) repeated: bool,
     pub(crate) environment: Option<String>,
     pub(crate) default: Option<OsString>,
-    pub(crate) requires: Vec<String>,
-    pub(crate) conflicts: Vec<String>,
+    pub(crate) requires: Vec<OptionRelation>,
+    pub(crate) conflicts: Vec<OptionRelation>,
 }
 
 impl OptionSpec {
@@ -119,13 +147,37 @@ impl OptionSpec {
 
     /// Requires another option when this option is present
     pub fn requires(mut self, id: impl Into<String>) -> Self {
-        self.requires.push(id.into());
+        self.requires.push(OptionRelation {
+            id: id.into(),
+            presence: PresenceBasis::Resolved,
+        });
+        self
+    }
+
+    /// Requires another command-line-supplied option
+    pub fn requires_supplied(mut self, id: impl Into<String>) -> Self {
+        self.requires.push(OptionRelation {
+            id: id.into(),
+            presence: PresenceBasis::CommandLine,
+        });
         self
     }
 
     /// Conflicts with another option when both are present
     pub fn conflicts(mut self, id: impl Into<String>) -> Self {
-        self.conflicts.push(id.into());
+        self.conflicts.push(OptionRelation {
+            id: id.into(),
+            presence: PresenceBasis::Resolved,
+        });
+        self
+    }
+
+    /// Conflicts with another command-line-supplied option
+    pub fn conflicts_supplied(mut self, id: impl Into<String>) -> Self {
+        self.conflicts.push(OptionRelation {
+            id: id.into(),
+            presence: PresenceBasis::CommandLine,
+        });
         self
     }
 
@@ -192,6 +244,107 @@ impl Argument {
     }
 }
 
+/// One portable cardinality rule over local command options
+#[derive(Clone)]
+pub struct OptionGroup {
+    pub(crate) id: String,
+    pub(crate) kind: OptionGroupKind,
+    pub(crate) presence: PresenceBasis,
+    pub(crate) options: Vec<String>,
+}
+
+impl OptionGroup {
+    /// Constructs an optional mutually exclusive option group
+    pub fn at_most_one<I, S>(id: impl Into<String>, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(id, OptionGroupKind::AtMostOne, options)
+    }
+
+    /// Constructs a required mutually exclusive option group
+    pub fn exactly_one<I, S>(id: impl Into<String>, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(id, OptionGroupKind::ExactlyOne, options)
+    }
+
+    /// Constructs a group requiring one or more options
+    pub fn at_least_one<I, S>(id: impl Into<String>, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(id, OptionGroupKind::AtLeastOne, options)
+    }
+
+    /// Constructs a group whose options must occur together
+    pub fn all_or_none<I, S>(id: impl Into<String>, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(id, OptionGroupKind::AllOrNone, options)
+    }
+
+    fn new<I, S>(id: impl Into<String>, kind: OptionGroupKind, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            id: id.into(),
+            kind,
+            presence: PresenceBasis::CommandLine,
+            options: options.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Changes how this group determines whether an option is present
+    pub const fn presence(mut self, presence: PresenceBasis) -> Self {
+        self.presence = presence;
+        self
+    }
+
+    /// Returns the stable group identifier
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the group cardinality rule
+    pub const fn kind(&self) -> OptionGroupKind {
+        self.kind
+    }
+
+    /// Returns the group's presence basis
+    pub const fn presence_basis(&self) -> PresenceBasis {
+        self.presence
+    }
+
+    /// Returns group members in definition order
+    pub fn option_ids(&self) -> &[String] {
+        &self.options
+    }
+}
+
+/// Performs application-specific validation over a typed Invocation
+pub trait InvocationValidator: Send + Sync {
+    /// Returns a structured Diagnostic when validation fails
+    fn validate(&self, invocation: &Invocation) -> Result<(), Diagnostic>;
+}
+
+impl<F> InvocationValidator for F
+where
+    F: Fn(&Invocation) -> Result<(), Diagnostic> + Send + Sync,
+{
+    fn validate(&self, invocation: &Invocation) -> Result<(), Diagnostic> {
+        self(invocation)
+    }
+}
+
 /// A validated node in the command graph
 #[derive(Clone)]
 pub struct Command {
@@ -202,8 +355,14 @@ pub struct Command {
     pub(crate) version: Option<String>,
     pub(crate) options: Vec<OptionSpec>,
     pub(crate) arguments: Vec<Argument>,
+    pub(crate) option_groups: Vec<OptionGroup>,
     pub(crate) subcommands: Vec<Command>,
     pub(crate) subcommand_required: bool,
+    pub(crate) examples: Vec<HelpExample>,
+    pub(crate) notes: Vec<String>,
+    pub(crate) links: Vec<HelpLink>,
+    pub(crate) help_sections: Vec<HelpSection>,
+    pub(crate) validators: Vec<Arc<dyn InvocationValidator>>,
     pub(crate) handler: Option<Arc<dyn Handler>>,
 }
 
@@ -219,8 +378,14 @@ impl Command {
             version: None,
             options: Vec::new(),
             arguments: Vec::new(),
+            option_groups: Vec::new(),
             subcommands: Vec::new(),
             subcommand_required: false,
+            examples: Vec::new(),
+            notes: Vec::new(),
+            links: Vec::new(),
+            help_sections: Vec::new(),
+            validators: Vec::new(),
             handler: None,
         }
     }
@@ -261,6 +426,12 @@ impl Command {
         self
     }
 
+    /// Appends one portable option-group constraint
+    pub fn option_group(mut self, group: OptionGroup) -> Self {
+        self.option_groups.push(group);
+        self
+    }
+
     /// Appends a child command in help-definition order
     pub fn subcommand(mut self, command: Command) -> Self {
         self.subcommands.push(command);
@@ -270,6 +441,39 @@ impl Command {
     /// Requires one child command to be selected
     pub fn require_subcommand(mut self) -> Self {
         self.subcommand_required = true;
+        self
+    }
+
+    /// Appends one named command-line example
+    pub fn example(mut self, name: impl Into<String>, invocation: impl Into<String>) -> Self {
+        self.examples.push(HelpExample::new(name, invocation));
+        self
+    }
+
+    /// Appends one structured Help note
+    pub fn note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+
+    /// Appends one labeled documentation link
+    pub fn link(mut self, label: impl Into<String>, url: impl Into<String>) -> Self {
+        self.links.push(HelpLink::new(label, url));
+        self
+    }
+
+    /// Appends one application-defined structured Help section
+    pub fn help_section(mut self, section: HelpSection) -> Self {
+        self.help_sections.push(section);
+        self
+    }
+
+    /// Appends one language-native typed Invocation validator
+    pub fn validator<V>(mut self, validator: V) -> Self
+    where
+        V: InvocationValidator + 'static,
+    {
+        self.validators.push(Arc::new(validator));
         self
     }
 
@@ -303,18 +507,6 @@ impl Command {
         validate_command(self, true, &mut path_ids)
     }
 
-    /// Renders deterministic help for a canonical path
-    pub fn render_help(&self, path: &[String]) -> Result<String, Diagnostic> {
-        self.validate()?;
-        let command = self.command_at_path(path).ok_or_else(|| {
-            Diagnostic::new(
-                DiagnosticCode::InvalidSpecification,
-                "help path does not identify a command",
-            )
-        })?;
-        Ok(self.render_command_help(command, path))
-    }
-
     pub(crate) fn command_at_path(&self, path: &[String]) -> Option<&Command> {
         if path.first().map(String::as_str) != Some(self.name.as_str()) {
             return None;
@@ -336,54 +528,8 @@ impl Command {
         usage_line(command, path)
     }
 
-    fn render_command_help(&self, command: &Command, path: &[String]) -> String {
-        let mut output = String::new();
-        if !command.about.is_empty() {
-            output.push_str(&command.about);
-            output.push_str("\n\n");
-        }
-
-        output.push_str("Usage:\n  ");
-        output.push_str(&usage_line(command, path));
-        output.push('\n');
-        if !command.subcommands.is_empty() && !command.subcommand_required {
-            output.push_str("  ");
-            output.push_str(&path.join(" "));
-            output.push_str(" [OPTIONS] <COMMAND>\n");
-        }
-
-        if !command.subcommands.is_empty() {
-            output.push_str("\nCommands:\n");
-            let entries = command
-                .subcommands
-                .iter()
-                .map(|child| (child.name.clone(), child.about.clone()))
-                .collect();
-            render_entries(&mut output, entries);
-        }
-
-        if !command.arguments.is_empty() {
-            output.push_str("\nArguments:\n");
-            let entries = command
-                .arguments
-                .iter()
-                .map(|argument| (argument_label(argument), argument.help.clone()))
-                .collect();
-            render_entries(&mut output, entries);
-        }
-
-        output.push_str("\nOptions:\n");
-        let mut entries: Vec<(String, String)> = command
-            .options
-            .iter()
-            .map(|option| (option_label(option), option_description(option)))
-            .collect();
-        entries.push(("-h, --help".to_owned(), "Print help".to_owned()));
-        if self.version.is_some() {
-            entries.push(("-V, --version".to_owned(), "Print version".to_owned()));
-        }
-        render_entries(&mut output, entries);
-        output
+    pub(crate) fn option_by_id(&self, id: &str) -> Option<&OptionSpec> {
+        self.options.iter().find(|option| option.id == id)
     }
 }
 
@@ -466,17 +612,49 @@ fn validate_command(
     }
     for option in &command.options {
         for relation in option.requires.iter().chain(&option.conflicts) {
-            if !local_ids.contains(relation) {
+            if !local_ids.contains(&relation.id) {
                 return invalid(format!(
-                    "option '{}' references unknown option '{relation}'",
-                    option.id
+                    "option '{}' references unknown option '{}'",
+                    option.id, relation.id
                 ));
             }
         }
     }
+    let mut group_ids = BTreeSet::new();
+    for group in &command.option_groups {
+        if !valid_id(&group.id) || !group_ids.insert(group.id.clone()) {
+            return invalid(format!(
+                "duplicate or invalid option group ID '{}'",
+                group.id
+            ));
+        }
+        if group.options.len() < 2 {
+            return invalid(format!(
+                "option group '{}' has fewer than two options",
+                group.id
+            ));
+        }
+        let mut members = BTreeSet::new();
+        for id in &group.options {
+            if !local_ids.contains(id) || !members.insert(id) {
+                return invalid(format!(
+                    "option group '{}' references duplicate or unknown option '{id}'",
+                    group.id
+                ));
+            }
+        }
+    }
+    validate_help(command)?;
 
     let mut child_spellings = BTreeSet::new();
+    let mut child_ids = BTreeSet::new();
     for child in &command.subcommands {
+        if !child_ids.insert(child.id.clone()) {
+            return invalid(format!(
+                "command '{}' has duplicate child ID '{}'",
+                command.name, child.id
+            ));
+        }
         for spelling in std::iter::once(&child.name).chain(&child.aliases) {
             if !child_spellings.insert(spelling.clone()) {
                 return invalid(format!(
@@ -488,6 +666,59 @@ fn validate_command(
         validate_command(child, false, &mut ids.clone())?;
     }
     *path_ids = ids;
+    Ok(())
+}
+
+fn validate_help(command: &Command) -> Result<(), Diagnostic> {
+    if command
+        .examples
+        .iter()
+        .any(|example| example.name().is_empty() || example.invocation().is_empty())
+    {
+        return invalid(format!(
+            "command '{}' has an invalid Help example",
+            command.name
+        ));
+    }
+    if command.notes.iter().any(String::is_empty) {
+        return invalid(format!(
+            "command '{}' has an invalid Help note",
+            command.name
+        ));
+    }
+    if command
+        .links
+        .iter()
+        .any(|link| link.label().is_empty() || link.url().is_empty())
+    {
+        return invalid(format!(
+            "command '{}' has an invalid Help link",
+            command.name
+        ));
+    }
+    let mut section_ids = BTreeSet::new();
+    for section in &command.help_sections {
+        if !valid_id(section.id())
+            || !section_ids.insert(section.id())
+            || section.heading().is_empty()
+            || section.blocks().is_empty()
+        {
+            return invalid(format!(
+                "command '{}' has an invalid Help section '{}'",
+                command.name,
+                section.id()
+            ));
+        }
+        if section.blocks().iter().any(|block| match block {
+            HelpBlock::Paragraph(text) => text.is_empty(),
+            HelpBlock::Entry { label, description } => label.is_empty() || description.is_empty(),
+        }) {
+            return invalid(format!(
+                "Help section '{}' has an invalid block",
+                section.id()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -518,7 +749,7 @@ fn reserved_short(value: char) -> bool {
     matches!(value, 'h' | 'V')
 }
 
-fn usage_line(command: &Command, path: &[String]) -> String {
+pub(crate) fn usage_line(command: &Command, path: &[String]) -> String {
     let mut usage = format!("{} [OPTIONS]", path.join(" "));
     for argument in &command.arguments {
         usage.push(' ');
@@ -530,7 +761,7 @@ fn usage_line(command: &Command, path: &[String]) -> String {
     usage
 }
 
-fn argument_label(argument: &Argument) -> String {
+pub(crate) fn argument_label(argument: &Argument) -> String {
     let name = argument.id.replace('_', "-").to_ascii_uppercase();
     let mut label = if argument.required {
         format!("<{name}>")
@@ -543,7 +774,7 @@ fn argument_label(argument: &Argument) -> String {
     label
 }
 
-fn option_label(option: &OptionSpec) -> String {
+pub(crate) fn option_label(option: &OptionSpec) -> String {
     let mut label = match (option.short, &option.long) {
         (Some(short), Some(long)) => format!("-{short}, --{long}"),
         (Some(short), None) => format!("-{short}"),
@@ -562,7 +793,7 @@ fn option_label(option: &OptionSpec) -> String {
     label
 }
 
-fn option_description(option: &OptionSpec) -> String {
+pub(crate) fn option_description(option: &OptionSpec) -> String {
     let mut description = option.help.clone();
     if option.required {
         append_note(&mut description, "required");
@@ -592,24 +823,6 @@ fn append_note(description: &mut String, note: &str) {
     description.push('[');
     description.push_str(note);
     description.push(']');
-}
-
-fn render_entries(output: &mut String, entries: Vec<(String, String)>) {
-    let width = entries
-        .iter()
-        .map(|(label, _)| text_width(label, WidthProfile::MODERN))
-        .max()
-        .unwrap_or(0);
-    for (label, description) in entries {
-        output.push_str("  ");
-        output.push_str(&label);
-        let label_width = text_width(&label, WidthProfile::MODERN);
-        for _ in 0..width.saturating_sub(label_width).saturating_add(2) {
-            output.push(' ');
-        }
-        output.push_str(&description);
-        output.push('\n');
-    }
 }
 
 pub(crate) fn option_display(option: &OptionSpec) -> String {

@@ -16,9 +16,9 @@ Nagi Rust実装はterminal application向けのnative Text、VT、Surface、TUI�
 
 ```toml
 [dependencies]
-nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" }
-nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" } # Optional
-nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" } # CLI application
+nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" }
+nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" } # Optional
+nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" } # CLI application
 ```
 
 依存関係全体の解決結果を維持するため、applicationの`Cargo.lock`をcommitしてください
@@ -49,7 +49,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-tui` | App lifecycle、semantic Node、layout、event、Effect、Subscription、terminal loop |
 | `nagi-tui-widgets` | Public TUI APIから構築した21個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
-| `nagi-cli` | Command Graph、typed Invocation、Context、Diagnostic、Help、process統合 |
+| `nagi-cli` | Command Graph、typed Invocation validation、structured HelpとDiagnostic、Runtime Policy、process統合 |
 | `nagi-cli-test` | ProcessなしのCLI input注入とoutput取得 |
 
 [Nagi semantic specification](https://github.com/mayahiro/nagi/tree/main/spec)がGo実装と共有する挙動を定義します
@@ -60,8 +60,8 @@ cargo run -p nagi-cli --example basic -- Nagi
 
 ```toml
 [dev-dependencies]
-nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" }
-nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.0" }
+nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" }
+nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.5" }
 ```
 
 `nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、frameを操作できます
@@ -97,7 +97,7 @@ TUIのterminal inputとoutputはterminalへ接続されている必要があり�
 
 `ScrollViewport`はeagerなchild treeをclipしてscrollします。大規模dataでは`Node::virtual_scroll_viewport`を使用し、content全体のCell extentを宣言して現在表示する範囲または上限付きoverscanの`VirtualFragment`だけを構築できます
 
-CLI process統合はLinuxとmacOSへ対応し、Unix argument valueを保持してSIGINTを協調的cancellationへ変換します。Shell completion、設定file読み込み、interactive prompt、TUI統合は提供しません
+CLI process統合はLinuxとmacOSへ対応し、Unix argument valueを保持してSIGINTを協調的cancellationへ変換します。Shell completion、設定file読み込み、interactive prompt、TUI統合は提供しません。Portable graphは任意のinvocation grammarを表現しません
 
 ## License
 

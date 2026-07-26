@@ -13,9 +13,9 @@ missing_docs = "deny"
 unsafe_code = "allow"
 
 [dependencies]
-nagi-surface = { path = "../nagi-surface", version = "0.2.0" }
-nagi-text = { path = "../nagi-text", version = "0.2.0" }
-nagi-vt = { path = "../nagi-vt", version = "0.2.0" }
+nagi-surface = { path = "../nagi-surface", version = "0.2.5" }
+nagi-text = { path = "../nagi-text", version = "0.2.5" }
+nagi-vt = { path = "../nagi-vt", version = "0.2.5" }
 
 [[bench]]
 name = "scroll_viewport"

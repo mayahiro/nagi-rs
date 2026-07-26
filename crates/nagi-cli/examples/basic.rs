@@ -9,8 +9,14 @@ use nagi_cli::{Argument, Command, Context, Diagnostic, DiagnosticCode, Invocatio
 fn application() -> Command {
     Command::new("greet")
         .about("Print a greeting")
-        .version("0.2.0")
+        .version("0.2.5")
         .argument(Argument::new("name").required().help("Name to greet"))
+        .example("named greeting", "greet Nagi")
+        .note("Help and diagnostics are written separately from command output")
+        .link(
+            "guide",
+            "https://github.com/mayahiro/nagi/blob/main/docs/CLI_API.md",
+        )
         .handler(|context: &mut Context, invocation: &Invocation| {
             let name = invocation
                 .raw_value("name")

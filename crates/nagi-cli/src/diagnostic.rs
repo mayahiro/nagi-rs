@@ -3,7 +3,7 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
-/// A stable machine-readable diagnostic category
+/// A stable machine-readable diagnostic code
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticCode {
     /// The command definition is internally inconsistent
@@ -30,6 +30,10 @@ pub enum DiagnosticCode {
     Requires,
     /// Conflicting options are both present
     Conflicts,
+    /// An option-group cardinality rule is not satisfied
+    OptionGroup,
+    /// A language-native Invocation validator rejected a value combination
+    Validation,
     /// The selected command has no handler
     MissingHandler,
     /// A handler reported an application failure
@@ -56,10 +60,40 @@ impl DiagnosticCode {
             Self::InvalidValue => "invalid-value",
             Self::Requires => "requires",
             Self::Conflicts => "conflicts",
+            Self::OptionGroup => "option-group",
+            Self::Validation => "validation",
             Self::MissingHandler => "missing-handler",
             Self::HandlerError => "handler-error",
             Self::Cancelled => "cancelled",
             Self::IoError => "io-error",
+        }
+    }
+}
+
+/// A stable semantic failure category
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticCategory {
+    /// An invalid Command Graph
+    Specification,
+    /// Invalid command-line usage
+    Usage,
+    /// Application execution failure
+    Execution,
+    /// Cooperative cancellation
+    Cancellation,
+    /// Injected I/O failure
+    Io,
+}
+
+impl DiagnosticCategory {
+    /// Returns the stable lowercase category
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Specification => "specification",
+            Self::Usage => "usage",
+            Self::Execution => "execution",
+            Self::Cancellation => "cancellation",
+            Self::Io => "io",
         }
     }
 }
@@ -99,18 +133,18 @@ impl From<ExitStatus> for ExitCode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Diagnostic {
     code: DiagnosticCode,
+    category: DiagnosticCategory,
     message: String,
     command_path: Vec<String>,
     usage: Option<String>,
-    status: ExitStatus,
 }
 
 impl Diagnostic {
-    /// Constructs a diagnostic with the default status for its code
+    /// Constructs a diagnostic with the semantic category for its code
     pub fn new(code: DiagnosticCode, message: impl Into<String>) -> Self {
-        let status = match code {
-            DiagnosticCode::InvalidSpecification
-            | DiagnosticCode::UnknownOption
+        let category = match code {
+            DiagnosticCode::InvalidSpecification => DiagnosticCategory::Specification,
+            DiagnosticCode::UnknownOption
             | DiagnosticCode::UnexpectedOptionValue
             | DiagnosticCode::MissingOptionValue
             | DiagnosticCode::DuplicateOption
@@ -120,16 +154,21 @@ impl Diagnostic {
             | DiagnosticCode::MissingRequired
             | DiagnosticCode::InvalidValue
             | DiagnosticCode::Requires
-            | DiagnosticCode::Conflicts => ExitStatus::USAGE,
-            DiagnosticCode::Cancelled => ExitStatus::CANCELLED,
-            _ => ExitStatus::FAILURE,
+            | DiagnosticCode::Conflicts
+            | DiagnosticCode::OptionGroup
+            | DiagnosticCode::Validation => DiagnosticCategory::Usage,
+            DiagnosticCode::Cancelled => DiagnosticCategory::Cancellation,
+            DiagnosticCode::IoError => DiagnosticCategory::Io,
+            DiagnosticCode::MissingHandler | DiagnosticCode::HandlerError => {
+                DiagnosticCategory::Execution
+            }
         };
         Self {
             code,
+            category,
             message: message.into(),
             command_path: Vec::new(),
             usage: None,
-            status,
         }
     }
 
@@ -145,15 +184,20 @@ impl Diagnostic {
         self
     }
 
-    /// Overrides the exit status
-    pub fn with_status(mut self, status: ExitStatus) -> Self {
-        self.status = status;
+    /// Overrides the semantic category
+    pub const fn with_category(mut self, category: DiagnosticCategory) -> Self {
+        self.category = category;
         self
     }
 
     /// Returns the stable diagnostic code
     pub fn code(&self) -> DiagnosticCode {
         self.code
+    }
+
+    /// Returns the semantic failure category
+    pub const fn category(&self) -> DiagnosticCategory {
+        self.category
     }
 
     /// Returns the human-readable message
@@ -171,20 +215,12 @@ impl Diagnostic {
         self.usage.as_deref()
     }
 
-    /// Returns the outcome status associated with this diagnostic
-    pub fn status(&self) -> ExitStatus {
-        self.status
-    }
-
     /// Renders deterministic plain text with one final newline
     pub fn render(&self) -> String {
-        let mut output = format!("error[{}]: {}\n", self.code.as_str(), self.message);
-        if let Some(usage) = &self.usage {
-            output.push_str("usage: ");
-            output.push_str(usage);
-            output.push('\n');
-        }
-        output
+        crate::policy::DiagnosticRenderer::render_diagnostic(
+            &crate::policy::PlainDiagnosticRenderer::default(),
+            self,
+        )
     }
 }
 

@@ -10,4 +10,5 @@ Run it from the Rust repository root:
 cargo run -p nagi-cli --example basic -- Nagi
 ```
 
-It prints `Hello, Nagi!`. Pass `--help` to inspect the generated help output
+It prints `Hello, Nagi!`. Pass `--help` to inspect the structured example,
+note, and link rendered with the generated command help

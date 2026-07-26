@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::command::Command;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, ExitStatus};
 use crate::parser::{Invocation, ParseResult};
+use crate::policy::RuntimePolicy;
 use crate::signal_unix::SignalGuard;
 
 /// A cooperative cancellation source passed to handlers
@@ -226,13 +227,28 @@ impl Command {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
+        self.run_with_policy(context, arguments, &RuntimePolicy::default())
+    }
+
+    /// Parses and executes arguments through an explicit Runtime Policy
+    pub fn run_with_policy<I, S>(
+        &self,
+        context: &mut Context,
+        arguments: I,
+        policy: &RuntimePolicy,
+    ) -> io::Result<Outcome>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
         let environment: Vec<(OsString, OsString)> = context
             .environment_values()
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
         match self.parse_with_environment(arguments, environment) {
             Ok(ParseResult::Help { command_path }) => {
-                let help = self.render_help(&command_path).map_err(diagnostic_io)?;
+                let document = self.help_document(&command_path).map_err(diagnostic_io)?;
+                let help = policy.render_help(&document);
                 context.stdout().write_all(help.as_bytes())?;
                 Ok(Outcome::success())
             }
@@ -242,7 +258,11 @@ impl Command {
             }
             Ok(ParseResult::Invocation(invocation)) => {
                 if context.cancellation().is_cancelled() {
-                    return Ok(Outcome::new(ExitStatus::CANCELLED));
+                    return Ok(Outcome::new(
+                        policy
+                            .exit_code_policy()
+                            .status_for(crate::diagnostic::DiagnosticCategory::Cancellation),
+                    ));
                 }
                 let command = self
                     .command_at_path(invocation.command_path())
@@ -253,26 +273,40 @@ impl Command {
                         format!("command '{}' has no handler", command.name),
                     )
                     .with_command_path(invocation.command_path().to_vec());
-                    context.stderr().write_all(diagnostic.render().as_bytes())?;
-                    return Ok(Outcome::new(diagnostic.status()));
+                    context
+                        .stderr()
+                        .write_all(policy.render_diagnostic(&diagnostic).as_bytes())?;
+                    return Ok(Outcome::new(
+                        policy.exit_code_policy().status_for(diagnostic.category()),
+                    ));
                 };
                 match handler.handle(context, &invocation) {
                     Ok(outcome)
                         if context.cancellation().is_cancelled()
                             && outcome.status() == ExitStatus::SUCCESS =>
                     {
-                        Ok(Outcome::new(ExitStatus::CANCELLED))
+                        Ok(Outcome::new(policy.exit_code_policy().status_for(
+                            crate::diagnostic::DiagnosticCategory::Cancellation,
+                        )))
                     }
                     Ok(outcome) => Ok(outcome),
                     Err(diagnostic) => {
-                        context.stderr().write_all(diagnostic.render().as_bytes())?;
-                        Ok(Outcome::new(diagnostic.status()))
+                        context
+                            .stderr()
+                            .write_all(policy.render_diagnostic(&diagnostic).as_bytes())?;
+                        Ok(Outcome::new(
+                            policy.exit_code_policy().status_for(diagnostic.category()),
+                        ))
                     }
                 }
             }
             Err(diagnostic) => {
-                context.stderr().write_all(diagnostic.render().as_bytes())?;
-                Ok(Outcome::new(diagnostic.status()))
+                context
+                    .stderr()
+                    .write_all(policy.render_diagnostic(&diagnostic).as_bytes())?;
+                Ok(Outcome::new(
+                    policy.exit_code_policy().status_for(diagnostic.category()),
+                ))
             }
         }
     }
@@ -282,6 +316,14 @@ impl Command {
     /// The helper installs a temporary SIGINT handler and returns an Exit
     /// Status instead of terminating the process
     pub fn run_process(&self) -> io::Result<ExitStatus> {
+        self.run_process_with_policy(&RuntimePolicy::default())
+    }
+
+    /// Executes this command with an explicit Runtime Policy
+    ///
+    /// The helper installs a temporary SIGINT handler and returns an Exit
+    /// Status instead of terminating the process
+    pub fn run_process_with_policy(&self, policy: &RuntimePolicy) -> io::Result<ExitStatus> {
         let _signal_guard = SignalGuard::install()?;
         let current_directory = env::current_dir()?;
         let environment: Vec<(OsString, OsString)> = env::vars_os().collect();
@@ -294,7 +336,8 @@ impl Command {
             current_directory,
             CancellationToken::process(),
         );
-        self.run(&mut context, arguments).map(Outcome::status)
+        self.run_with_policy(&mut context, arguments, policy)
+            .map(Outcome::status)
     }
 }
 

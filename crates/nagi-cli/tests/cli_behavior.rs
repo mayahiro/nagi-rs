@@ -4,8 +4,9 @@ use std::ffi::OsStr;
 use std::io::{Cursor, sink};
 
 use nagi_cli::{
-    Argument, Command, Context, DiagnosticCode, ExitStatus, Invocation, OptionSpec, Outcome,
-    ParseResult, cancellation_pair,
+    Argument, Command, Context, Diagnostic, DiagnosticCategory, DiagnosticCode, ExitCodePolicy,
+    ExitStatus, HelpSection, Invocation, OptionGroup, OptionSpec, Outcome, ParseResult,
+    RuntimePolicy, cancellation_pair,
 };
 
 #[test]
@@ -61,6 +62,9 @@ fn graph_validation_rejects_path_and_sibling_collisions() {
             .subcommand(Command::new("first").alias("shared"))
             .subcommand(Command::new("shared")),
         Command::new("root")
+            .subcommand(Command::new("first").id("shared"))
+            .subcommand(Command::new("second").id("shared")),
+        Command::new("root")
             .argument(Argument::new("many").repeated())
             .argument(Argument::new("last")),
         Command::new("root")
@@ -72,6 +76,12 @@ fn graph_validation_rejects_path_and_sibling_collisions() {
                         .requires("parent"),
                 ),
             ),
+        Command::new("root")
+            .option(OptionSpec::flag("known").long("known"))
+            .option_group(OptionGroup::exactly_one("source", ["known", "missing"])),
+        Command::new("root")
+            .option(OptionSpec::flag("known").long("known"))
+            .option_group(OptionGroup::at_most_one("source", ["known", "known"])),
     ];
     for command in invalid {
         assert_eq!(
@@ -79,6 +89,166 @@ fn graph_validation_rejects_path_and_sibling_collisions() {
             DiagnosticCode::InvalidSpecification
         );
     }
+}
+
+#[test]
+fn supplied_distinguishes_command_line_from_fallbacks() {
+    let command = Command::new("root")
+        .option(OptionSpec::value("mode").long("mode").default_value("auto"))
+        .option(
+            OptionSpec::flag("strict")
+                .long("strict")
+                .requires_supplied("mode"),
+        )
+        .option(
+            OptionSpec::flag("all")
+                .long("all")
+                .conflicts_supplied("mode"),
+        );
+
+    let ParseResult::Invocation(invocation) = command.parse::<_, &str>([]).unwrap() else {
+        panic!("expected invocation");
+    };
+    assert!(invocation.contains("mode"));
+    assert!(!invocation.supplied("mode"));
+
+    assert_eq!(
+        command.parse(["--strict"]).unwrap_err().code(),
+        DiagnosticCode::Requires
+    );
+
+    command.parse(["--all"]).unwrap();
+    assert_eq!(
+        command
+            .parse(["--all", "--mode", "manual"])
+            .unwrap_err()
+            .code(),
+        DiagnosticCode::Conflicts
+    );
+
+    let ParseResult::Invocation(invocation) =
+        command.parse(["--strict", "--mode", "manual"]).unwrap()
+    else {
+        panic!("expected invocation");
+    };
+    assert!(invocation.supplied("strict"));
+    assert!(invocation.supplied("mode"));
+}
+
+#[test]
+fn option_groups_use_command_line_presence_by_default() {
+    let command = |group| {
+        Command::new("root")
+            .option(
+                OptionSpec::value("session")
+                    .long("session")
+                    .default_value("default"),
+            )
+            .option(OptionSpec::flag("all").long("all"))
+            .option_group(group)
+    };
+    command(OptionGroup::at_most_one("target", ["session", "all"]))
+        .parse(["--all"])
+        .unwrap();
+    assert_eq!(
+        command(
+            OptionGroup::at_most_one("target", ["session", "all"])
+                .presence(nagi_cli::PresenceBasis::Resolved),
+        )
+        .parse(["--all"])
+        .unwrap_err()
+        .code(),
+        DiagnosticCode::OptionGroup
+    );
+}
+
+#[test]
+fn option_group_kinds_are_enforced() {
+    let cases = [
+        (
+            OptionGroup::at_most_one("group", ["a", "b"]),
+            vec!["--a"],
+            false,
+        ),
+        (
+            OptionGroup::at_most_one("group", ["a", "b"]),
+            vec!["--a", "--b"],
+            true,
+        ),
+        (
+            OptionGroup::exactly_one("group", ["a", "b"]),
+            vec!["--b"],
+            false,
+        ),
+        (OptionGroup::exactly_one("group", ["a", "b"]), vec![], true),
+        (
+            OptionGroup::at_least_one("group", ["a", "b"]),
+            vec!["--a", "--b"],
+            false,
+        ),
+        (OptionGroup::at_least_one("group", ["a", "b"]), vec![], true),
+        (OptionGroup::all_or_none("group", ["a", "b"]), vec![], false),
+        (
+            OptionGroup::all_or_none("group", ["a", "b"]),
+            vec!["--a", "--b"],
+            false,
+        ),
+        (
+            OptionGroup::all_or_none("group", ["a", "b"]),
+            vec!["--a"],
+            true,
+        ),
+    ];
+    for (group, arguments, should_fail) in cases {
+        let command = Command::new("root")
+            .option(OptionSpec::flag("a").long("a"))
+            .option(OptionSpec::flag("b").long("b"))
+            .option_group(group);
+        let result = command.parse(arguments);
+        if should_fail {
+            assert_eq!(result.unwrap_err().code(), DiagnosticCode::OptionGroup);
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
+#[test]
+fn help_document_exposes_structured_additions() {
+    let command = Command::new("root")
+        .option(OptionSpec::flag("a").long("a").conflicts("b"))
+        .option(OptionSpec::flag("b").long("b"))
+        .option_group(OptionGroup::at_most_one("selection", ["a", "b"]))
+        .example("basic", "root --a")
+        .note("Choose one source")
+        .link("guide", "https://example.com/guide")
+        .help_section(HelpSection::new("details", "Details").paragraph("Additional text"));
+    let document = command.help_document(&["root".to_owned()]).unwrap();
+    assert_eq!(document.examples().len(), 1);
+    assert_eq!(document.notes().len(), 1);
+    assert_eq!(document.links().len(), 1);
+    assert_eq!(document.sections().len(), 1);
+    assert_eq!(document.option_relations().len(), 1);
+    assert_eq!(document.option_groups().len(), 1);
+    assert_eq!(document.options()[0].id(), "a");
+    assert_eq!(document.option_groups()[0].option_ids()[0], "a");
+    assert_eq!(document.option_groups()[0].option_labels()[0], "--a");
+    assert_eq!(document.option_relations()[0].source_id(), "a");
+    assert_eq!(document.option_relations()[0].target_id(), "b");
+    assert_eq!(
+        document.option_relations()[0].kind(),
+        nagi_cli::HelpOptionRelationKind::Conflicts
+    );
+}
+
+#[test]
+fn validator_returns_a_usage_diagnostic() {
+    let command = Command::new("root").validator(|_invocation: &Invocation| {
+        Err(Diagnostic::new(DiagnosticCode::Validation, "rejected"))
+    });
+    let diagnostic = command.parse::<_, &str>([]).unwrap_err();
+    assert_eq!(diagnostic.code(), DiagnosticCode::Validation);
+    assert_eq!(diagnostic.category(), DiagnosticCategory::Usage);
 }
 
 #[test]
@@ -106,6 +276,33 @@ fn cancellation_after_handler_overrides_only_success() {
         run_with_cancellation(ExitStatus::new(7)),
         ExitStatus::new(7)
     );
+}
+
+#[test]
+fn runtime_policy_maps_cancellation() {
+    let (token, handle) = cancellation_pair();
+    handle.cancel();
+    let command = Command::new("root").handler(
+        |_context: &mut Context, _invocation: &Invocation| -> Result<Outcome, Diagnostic> {
+            panic!("handler ran after cancellation")
+        },
+    );
+    let policy = RuntimePolicy::default().with_exit_code_policy(
+        ExitCodePolicy::default()
+            .with_status(DiagnosticCategory::Cancellation, ExitStatus::new(75)),
+    );
+    let mut context = Context::with_cancellation(
+        Cursor::new(Vec::<u8>::new()),
+        sink(),
+        sink(),
+        std::iter::empty::<(&str, &str)>(),
+        "/",
+        token,
+    );
+    let outcome = command
+        .run_with_policy(&mut context, std::iter::empty::<&str>(), &policy)
+        .unwrap();
+    assert_eq!(outcome.status(), ExitStatus::new(75));
 }
 
 fn run_with_cancellation(handler_status: ExitStatus) -> ExitStatus {

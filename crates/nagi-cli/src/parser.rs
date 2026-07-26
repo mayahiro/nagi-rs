@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-use crate::command::{Argument, Command, OptionKind, OptionSpec, option_display, quote_value};
+use crate::command::{
+    Argument, Command, OptionGroupKind, OptionKind, OptionSpec, PresenceBasis, option_display,
+    quote_value,
+};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::value::{ParsedValue, ValueSource};
 
@@ -14,6 +17,7 @@ enum InvocationValue {
     Values {
         values: Vec<ParsedValue>,
         repeated: bool,
+        supplied: bool,
     },
 }
 
@@ -33,6 +37,15 @@ impl Invocation {
     /// Reports whether any value is present for an ID
     pub fn contains(&self, id: &str) -> bool {
         self.values.contains_key(id)
+    }
+
+    /// Reports whether an ID was present in argv
+    pub fn supplied(&self, id: &str) -> bool {
+        match self.values.get(id) {
+            Some(InvocationValue::Flag | InvocationValue::Count(_)) => true,
+            Some(InvocationValue::Values { supplied, .. }) => *supplied,
+            None => false,
+        }
     }
 
     /// Returns Boolean flag presence when the ID denotes a flag
@@ -175,6 +188,9 @@ impl<'command> Parser<'command> {
     }
 
     fn parse(mut self) -> Result<ParseResult, Diagnostic> {
+        if let Some(result) = self.parse_help_command()? {
+            return Ok(result);
+        }
         while self.index < self.arguments.len() {
             let argument = self.arguments[self.index].clone();
             let bytes = argument.as_bytes();
@@ -210,10 +226,12 @@ impl<'command> Parser<'command> {
 
         self.resolve_fallbacks()?;
         self.validate_values()?;
-        Ok(ParseResult::Invocation(Invocation {
-            command_path: self.command_path,
-            values: self.values,
-        }))
+        let invocation = Invocation {
+            command_path: self.command_path.clone(),
+            values: std::mem::take(&mut self.values),
+        };
+        self.run_validators(&invocation)?;
+        Ok(ParseResult::Invocation(invocation))
     }
 
     fn active(&self) -> &'command Command {
@@ -221,6 +239,40 @@ impl<'command> Parser<'command> {
             .last()
             .copied()
             .expect("parser always has a root command")
+    }
+
+    fn parse_help_command(&mut self) -> Result<Option<ParseResult>, Diagnostic> {
+        if self
+            .arguments
+            .first()
+            .map(|argument| argument.as_os_str().as_bytes())
+            != Some(b"help")
+        {
+            return Ok(None);
+        }
+        let mut command = self.root;
+        let mut path = vec![self.root.name.clone()];
+        for target in &self.arguments[1..] {
+            let Some(name) = target.to_str() else {
+                self.command_path = path;
+                return Err(self.error(
+                    DiagnosticCode::UnknownCommand,
+                    format!("unknown command {}", quote_value(target)),
+                ));
+            };
+            let Some(selected) = command.subcommands.iter().find(|child| {
+                child.name == name || child.aliases.iter().any(|alias| alias == name)
+            }) else {
+                self.command_path = path;
+                return Err(self.error(
+                    DiagnosticCode::UnknownCommand,
+                    format!("unknown command {}", quote_value(target)),
+                ));
+            };
+            command = selected;
+            path.push(command.name.clone());
+        }
+        Ok(Some(ParseResult::Help { command_path: path }))
     }
 
     fn parse_long(&mut self, argument: &OsStr) -> Result<Option<ParseResult>, Diagnostic> {
@@ -503,20 +555,29 @@ impl<'command> Parser<'command> {
                     continue;
                 }
                 for required in &option.requires {
-                    if !self.values.contains_key(required) {
+                    if self.present(&option.id, required.presence)
+                        && !self.present(&required.id, required.presence)
+                    {
                         return Err(self.error(
                             DiagnosticCode::Requires,
-                            format!("option '{}' requires '{required}'", option_display(option)),
+                            format!(
+                                "option '{}' requires '{}'",
+                                option_display(option),
+                                required.id
+                            ),
                         ));
                     }
                 }
                 for conflict in &option.conflicts {
-                    if self.values.contains_key(conflict) {
+                    if self.present(&option.id, conflict.presence)
+                        && self.present(&conflict.id, conflict.presence)
+                    {
                         return Err(self.error(
                             DiagnosticCode::Conflicts,
                             format!(
-                                "option '{}' conflicts with '{conflict}'",
-                                option_display(option)
+                                "option '{}' conflicts with '{}'",
+                                option_display(option),
+                                conflict.id
                             ),
                         ));
                     }
@@ -528,6 +589,49 @@ impl<'command> Parser<'command> {
                         DiagnosticCode::MissingRequired,
                         format!("required argument '{}' is missing", argument.id),
                     ));
+                }
+            }
+            for group in &command.option_groups {
+                let count = group
+                    .options
+                    .iter()
+                    .filter(|id| self.present(id, group.presence))
+                    .count();
+                let valid = match group.kind {
+                    OptionGroupKind::AtMostOne => count <= 1,
+                    OptionGroupKind::ExactlyOne => count == 1,
+                    OptionGroupKind::AtLeastOne => count >= 1,
+                    OptionGroupKind::AllOrNone => count == 0 || count == group.options.len(),
+                };
+                if !valid {
+                    return Err(self.error(
+                        DiagnosticCode::OptionGroup,
+                        format!("option group '{}' is not satisfied", group.id),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn present(&self, id: &str, basis: PresenceBasis) -> bool {
+        let Some(value) = self.values.get(id) else {
+            return false;
+        };
+        basis == PresenceBasis::Resolved
+            || match value {
+                InvocationValue::Flag | InvocationValue::Count(_) => true,
+                InvocationValue::Values { supplied, .. } => *supplied,
+            }
+    }
+
+    fn run_validators(&self, invocation: &Invocation) -> Result<(), Diagnostic> {
+        for command in &self.commands {
+            for validator in &command.validators {
+                if let Err(diagnostic) = validator.validate(invocation) {
+                    return Err(diagnostic
+                        .with_command_path(self.command_path.clone())
+                        .with_usage(self.root.usage_for_path(&self.command_path)));
                 }
             }
         }
@@ -552,11 +656,13 @@ impl<'command> Parser<'command> {
     }
 
     fn push_value(&mut self, id: &str, value: ParsedValue, repeated: bool) {
+        let supplied = value.source() == ValueSource::CommandLine;
         match self.values.entry(id.to_owned()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(InvocationValue::Values {
                     values: vec![value],
                     repeated,
+                    supplied,
                 });
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {

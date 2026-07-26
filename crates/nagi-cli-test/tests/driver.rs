@@ -1,6 +1,9 @@
 //! Process-free CLI Test driver behavior
 
-use nagi_cli::{Argument, Command, Context, Diagnostic, Invocation, Outcome};
+use nagi_cli::{
+    Argument, Command, Context, Diagnostic, HelpDocument, HelpRenderer, Invocation, Outcome,
+    RuntimePolicy,
+};
 use nagi_cli_test::TestDriver;
 use std::ffi::OsStr;
 
@@ -36,4 +39,24 @@ fn driver_can_cancel_before_handler_execution() {
         .handler(|_context: &mut Context, _invocation: &Invocation| Ok(Outcome::success()));
     let result = TestDriver::new(command).cancelled(true).run().unwrap();
     assert_eq!(result.status(), nagi_cli::ExitStatus::CANCELLED);
+}
+
+#[test]
+fn driver_uses_runtime_policy() {
+    let command = Command::new("sample").subcommand(Command::new("child"));
+    let policy = RuntimePolicy::default().with_help_renderer(CommandPathRenderer);
+    let result = TestDriver::new(command)
+        .arguments(["help", "child"])
+        .policy(policy)
+        .run()
+        .unwrap();
+    assert_eq!(result.stdout(), b"custom help: sample/child\n");
+}
+
+struct CommandPathRenderer;
+
+impl HelpRenderer for CommandPathRenderer {
+    fn render_help(&self, document: &HelpDocument) -> String {
+        format!("custom help: {}\n", document.command_path().join("/"))
+    }
 }

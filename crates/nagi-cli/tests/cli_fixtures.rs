@@ -8,8 +8,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::{Arc, Mutex};
 
 use nagi_cli::{
-    Argument, Command, Context, Diagnostic, DiagnosticCode, Invocation, OptionSpec, Outcome,
-    ParseResult, ValueSource, integer_parser, possible_values_parser, value_parser,
+    Argument, Command, Context, Diagnostic, DiagnosticCategory, DiagnosticCode, ExitCodePolicy,
+    ExitStatus, HelpSection, Invocation, OptionGroup, OptionSpec, Outcome, ParseResult,
+    PlainDiagnosticRenderer, RuntimePolicy, ValueSource, integer_parser, possible_values_parser,
+    value_parser,
 };
 
 #[test]
@@ -38,7 +40,11 @@ fn parsing_matches_shared_fixtures() {
 #[test]
 fn errors_match_shared_fixtures() {
     let command = fixture_command();
-    for record in support::load("cli/errors.txt", "cli-errors", &["argv", "env", "expected"]) {
+    for record in support::load(
+        "cli/errors.txt",
+        "cli-errors",
+        &["argv", "env", "expected", "category"],
+    ) {
         let error = command
             .parse_with_environment(
                 arguments(&record.bytes("argv")),
@@ -49,6 +55,12 @@ fn errors_match_shared_fixtures() {
             error.code().as_str(),
             record.field("expected"),
             "case {}",
+            record.id
+        );
+        assert_eq!(
+            error.category().as_str(),
+            record.field("category"),
+            "case {} category",
             record.id
         );
     }
@@ -82,6 +94,9 @@ fn runtime_matches_shared_fixtures() {
             "stdin",
             "cwd",
             "cancelled",
+            "usage-status",
+            "error-prefix",
+            "show-usage",
             "status",
             "stdout",
             "stderr",
@@ -101,8 +116,22 @@ fn runtime_matches_shared_fixtures() {
             record.field("cwd"),
             token,
         );
+        let usage_status = record
+            .field("usage-status")
+            .parse::<u8>()
+            .expect("fixture usage status is one byte");
+        let policy = RuntimePolicy::default()
+            .with_exit_code_policy(
+                ExitCodePolicy::default()
+                    .with_status(DiagnosticCategory::Usage, ExitStatus::new(usage_status)),
+            )
+            .with_diagnostic_renderer(
+                PlainDiagnosticRenderer::default()
+                    .with_prefix(record.field("error-prefix"))
+                    .with_usage(record.field("show-usage") == "true"),
+            );
         let outcome = runtime_command()
-            .run(&mut context, arguments(&record.bytes("argv")))
+            .run_with_policy(&mut context, arguments(&record.bytes("argv")), &policy)
             .unwrap_or_else(|error| panic!("case {} failed: {error}", record.id));
         assert_eq!(
             outcome.status().code().to_string(),
@@ -130,10 +159,9 @@ fn definition_validation_and_typed_values_are_public() {
     let invalid = Command::new("root")
         .option(OptionSpec::flag("first").long("same"))
         .option(OptionSpec::flag("second").long("same"));
-    assert_eq!(
-        invalid.validate().unwrap_err().code(),
-        DiagnosticCode::InvalidSpecification
-    );
+    let error = invalid.validate().unwrap_err();
+    assert_eq!(error.code(), DiagnosticCode::InvalidSpecification);
+    assert_eq!(error.category(), DiagnosticCategory::Specification);
 
     let invocation = fixture_command()
         .parse(["serve", "--mode", "http", "--port", "42", "host"])
@@ -201,8 +229,29 @@ fn fixture_command() -> Command {
                 .requires("config")
                 .help("Token value"),
         )
+        .option_group(OptionGroup::at_most_one("output-mode", ["color", "output"]))
         .argument(Argument::new("input").help("Input value"))
         .argument(Argument::new("extra").repeated().help("Extra values"))
+        .example("basic", "nagi file")
+        .note("Values use command line, environment, then default precedence")
+        .link(
+            "guide",
+            "https://github.com/mayahiro/nagi/blob/main/docs/CLI_API.md",
+        )
+        .help_section(
+            HelpSection::new("output-formats", "Output formats")
+                .entry("plain", "Default deterministic text")
+                .paragraph("Custom renderers consume the same Help Document"),
+        )
+        .validator(|invocation: &Invocation| {
+            if invocation.raw_value("input") == Some(OsStr::new("blocked")) {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::Validation,
+                    "input 'blocked' is not allowed",
+                ));
+            }
+            Ok(())
+        })
         .subcommand(
             Command::new("serve")
                 .alias("s")

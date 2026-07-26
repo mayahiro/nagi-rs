@@ -6,7 +6,7 @@ use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use nagi_cli::{Command, Context, ExitStatus, cancellation_pair};
+use nagi_cli::{Command, Context, ExitStatus, RuntimePolicy, cancellation_pair};
 
 /// A configurable process-free command application driver
 pub struct TestDriver {
@@ -16,6 +16,7 @@ pub struct TestDriver {
     environment: BTreeMap<OsString, OsString>,
     current_directory: PathBuf,
     cancelled: bool,
+    policy: RuntimePolicy,
 }
 
 impl TestDriver {
@@ -28,6 +29,7 @@ impl TestDriver {
             environment: BTreeMap::new(),
             current_directory: PathBuf::from("/"),
             cancelled: false,
+            policy: RuntimePolicy::default(),
         }
     }
 
@@ -65,6 +67,12 @@ impl TestDriver {
         self
     }
 
+    /// Sets Help, Diagnostic, and exit-code runtime behavior
+    pub fn policy(mut self, policy: RuntimePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// Runs the application without a child process or signal handler
     pub fn run(self) -> io::Result<TestResult> {
         let stdout = SharedWriter::default();
@@ -83,7 +91,9 @@ impl TestDriver {
             self.current_directory,
             token,
         );
-        let outcome = self.command.run(&mut context, self.arguments)?;
+        let outcome = self
+            .command
+            .run_with_policy(&mut context, self.arguments, &self.policy)?;
         Ok(TestResult {
             status: outcome.status(),
             stdout: stdout_capture.bytes(),
