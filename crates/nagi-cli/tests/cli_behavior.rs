@@ -1,12 +1,12 @@
 //! CLI behavior outside the canonical shared fixture graph
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Cursor, sink};
 
 use nagi_cli::{
     Argument, Command, Context, Diagnostic, DiagnosticCategory, DiagnosticCode, ExitCodePolicy,
     ExitStatus, HelpSection, Invocation, OptionGroup, OptionSpec, Outcome, ParseResult,
-    RuntimePolicy, cancellation_pair,
+    RuntimePolicy, SubcommandUsageMode, ValueAccessErrorKind, cancellation_pair,
 };
 
 #[test]
@@ -53,11 +53,64 @@ fn parent_options_are_not_recognized_after_child_selection() {
 }
 
 #[test]
-fn graph_validation_rejects_path_and_sibling_collisions() {
+fn command_local_value_scopes_are_explicit_and_shadow_ancestors() {
+    let command = Command::new("root")
+        .id("root-id")
+        .option(
+            OptionSpec::value("session")
+                .long("session")
+                .default_value("root"),
+        )
+        .validator(|invocation: &Invocation| {
+            assert_eq!(invocation.raw_value("session"), Some(OsStr::new("parent")));
+            Ok(())
+        })
+        .subcommand(
+            Command::new("run")
+                .id("run-id")
+                .option(OptionSpec::value("session").long("session"))
+                .validator(|invocation: &Invocation| {
+                    if invocation.contains("session") {
+                        assert_eq!(invocation.raw_value("session"), Some(OsStr::new("child")));
+                    }
+                    Ok(())
+                }),
+        );
+    let ParseResult::Invocation(invocation) = command
+        .parse(["--session", "parent", "run", "--session", "child"])
+        .unwrap()
+    else {
+        panic!("expected invocation");
+    };
+    assert_eq!(invocation.raw_value("session"), Some(OsStr::new("child")));
+    let root = invocation.scope(["root-id"]).unwrap();
+    assert_eq!(root.raw_value("session"), Some(OsStr::new("parent")));
+    let child = invocation.scope(["root-id", "run-id"]).unwrap();
+    assert_eq!(child.command_path(), ["root", "run"]);
+    assert_eq!(
+        child.require_value::<OsString>("session").unwrap(),
+        OsStr::new("child")
+    );
+    assert_eq!(
+        child.require_value::<i64>("session").unwrap_err().kind(),
+        ValueAccessErrorKind::TypeMismatch
+    );
+
+    let ParseResult::Invocation(invocation) =
+        command.parse(["--session", "parent", "run"]).unwrap()
+    else {
+        panic!("expected invocation");
+    };
+    assert_eq!(invocation.raw_value("session"), None);
+    assert_eq!(invocation.scopes().count(), 2);
+}
+
+#[test]
+fn graph_validation_rejects_local_and_sibling_collisions() {
     let invalid = [
         Command::new("root")
             .option(OptionSpec::flag("same").long("root-option"))
-            .subcommand(Command::new("child").argument(Argument::new("same"))),
+            .argument(Argument::new("same")),
         Command::new("root")
             .subcommand(Command::new("first").alias("shared"))
             .subcommand(Command::new("shared")),
@@ -269,6 +322,56 @@ fn help_document_exposes_structured_additions() {
 }
 
 #[test]
+fn subcommand_usage_presentation_is_configurable() {
+    let child = || {
+        Command::new("validate")
+            .id("validate-id")
+            .usage_variant("file", "--file <FILE>")
+            .usage_variant("stdin", "--stdin")
+    };
+    let hidden = Command::new("root")
+        .usage_variant("direct", "<OLD> <NEW>")
+        .subcommand_usage(SubcommandUsageMode::Hidden)
+        .subcommand(child());
+    let document = hidden.help_document(&["root".to_owned()]).unwrap();
+    assert_eq!(document.usage_variants().len(), 1);
+    assert_eq!(document.usage_variants()[0].id(), "direct");
+
+    let hidden_reserved_id = Command::new("root")
+        .usage_variant("subcommand", "<VALUE>")
+        .subcommand_usage(SubcommandUsageMode::Hidden)
+        .subcommand(child());
+    hidden_reserved_id.validate().unwrap();
+
+    let expanded = Command::new("root")
+        .id("root-id")
+        .usage_variant("direct", "<OLD> <NEW>")
+        .subcommand_usage(SubcommandUsageMode::Expanded)
+        .subcommand(child());
+    let document = expanded.help_document(&["root".to_owned()]).unwrap();
+    assert_eq!(document.usage_variants().len(), 3);
+    assert_eq!(
+        document.usage_variants()[1].command_line(),
+        "root validate --file <FILE>"
+    );
+    assert_eq!(
+        document.usage_variants()[2].command_line(),
+        "root validate --stdin"
+    );
+    assert_eq!(
+        document.usage_variants()[1].command_id_path(),
+        ["root-id", "validate-id"]
+    );
+
+    let required = Command::new("root")
+        .require_subcommand()
+        .subcommand_usage(SubcommandUsageMode::Expanded)
+        .subcommand(child());
+    let document = required.help_document(&["root".to_owned()]).unwrap();
+    assert_eq!(document.usage_variants().len(), 2);
+}
+
+#[test]
 fn usage_variants_remain_help_only() {
     let generated = Command::new("root")
         .help_document(&["root".to_owned()])
@@ -291,11 +394,84 @@ fn usage_variants_remain_help_only() {
 #[test]
 fn validator_returns_a_usage_diagnostic() {
     let command = Command::new("root").validator(|_invocation: &Invocation| {
-        Err(Diagnostic::new(DiagnosticCode::Validation, "rejected"))
+        Err(Diagnostic::new(
+            DiagnosticCode::application("selection-required"),
+            "rejected",
+        )
+        .with_category(DiagnosticCategory::Usage)
+        .with_target(nagi_cli::DiagnosticTarget::option("selection"))
+        .with_hint("choose one selection"))
     });
     let diagnostic = command.parse::<_, &str>([]).unwrap_err();
-    assert_eq!(diagnostic.code(), DiagnosticCode::Validation);
+    assert_eq!(diagnostic.code().as_str(), "selection-required");
     assert_eq!(diagnostic.category(), DiagnosticCategory::Usage);
+    assert_eq!(diagnostic.targets().len(), 1);
+    assert_eq!(diagnostic.targets()[0].command_id_path(), ["root"]);
+    assert_eq!(diagnostic.hints(), ["choose one selection"]);
+    assert!(diagnostic.render().contains("hint: choose one selection\n"));
+}
+
+#[test]
+fn parser_and_runtime_can_be_adopted_in_stages() {
+    let command =
+        Command::new("root").handler(|_context: &mut Context, _invocation: &Invocation| {
+            Ok(Outcome::new(ExitStatus::new(7)))
+        });
+    let result = command.parse::<_, &str>([]).unwrap();
+    assert_eq!(result.command_path(), ["root"]);
+    assert_eq!(result.command_id_path(), ["root"]);
+    let mut context = Context::new(
+        Cursor::new(Vec::<u8>::new()),
+        sink(),
+        sink(),
+        std::iter::empty::<(&str, &str)>(),
+        "/",
+    );
+    assert_eq!(
+        command.run_parsed(&mut context, result).unwrap().status(),
+        ExitStatus::new(7)
+    );
+
+    let diagnostic = Diagnostic::new(
+        DiagnosticCode::application("selection-required"),
+        "rejected",
+    )
+    .with_category(DiagnosticCategory::Usage)
+    .with_hint("choose one");
+    let policy = RuntimePolicy::default().with_exit_code_policy(
+        ExitCodePolicy::default().with_status(DiagnosticCategory::Usage, ExitStatus::FAILURE),
+    );
+    assert_eq!(
+        policy.status_for_diagnostic(&diagnostic),
+        ExitStatus::FAILURE
+    );
+    assert!(
+        policy
+            .render_diagnostic(&diagnostic)
+            .contains("hint: choose one\n")
+    );
+
+    let foreign_result = Command::new("root")
+        .id("foreign-root")
+        .parse::<_, &str>([])
+        .unwrap();
+    assert_eq!(
+        command
+            .run_parsed(&mut context, foreign_result.clone())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let ParseResult::Invocation(foreign) = foreign_result else {
+        panic!("expected invocation");
+    };
+    assert_eq!(
+        command
+            .run_invocation(&mut context, &foreign)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
 }
 
 #[test]

@@ -94,6 +94,11 @@ impl DiagnosticRenderer for PlainDiagnosticRenderer {
             diagnostic.code().as_str(),
             diagnostic.message()
         );
+        for hint in diagnostic.hints() {
+            output.push_str("hint: ");
+            output.push_str(hint);
+            output.push('\n');
+        }
         if self.show_usage {
             if let Some(usage) = diagnostic.usage() {
                 output.push_str("usage: ");
@@ -143,12 +148,19 @@ impl RuntimePolicy {
         self.exit_codes
     }
 
-    pub(crate) fn render_help(&self, document: &HelpDocument) -> String {
+    /// Renders one Help Document without writing to process output
+    pub fn render_help(&self, document: &HelpDocument) -> String {
         self.help_renderer.render_help(document)
     }
 
-    pub(crate) fn render_diagnostic(&self, diagnostic: &Diagnostic) -> String {
+    /// Renders one Diagnostic without writing to process output
+    pub fn render_diagnostic(&self, diagnostic: &Diagnostic) -> String {
         self.diagnostic_renderer.render_diagnostic(diagnostic)
+    }
+
+    /// Returns the configured process status for one Diagnostic
+    pub fn status_for_diagnostic(&self, diagnostic: &Diagnostic) -> ExitStatus {
+        self.exit_codes.status_for(diagnostic.category())
     }
 }
 

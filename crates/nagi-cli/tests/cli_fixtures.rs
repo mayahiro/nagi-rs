@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use nagi_cli::{
     Argument, Command, Context, Diagnostic, DiagnosticCategory, DiagnosticCode, ExitCodePolicy,
     ExitStatus, HelpSection, Invocation, OptionGroup, OptionSpec, Outcome, ParseResult,
-    PlainDiagnosticRenderer, RuntimePolicy, ValueSource, integer_parser, possible_values_parser,
-    value_parser,
+    PlainDiagnosticRenderer, RuntimePolicy, SubcommandUsageMode, ValueSource, integer_parser,
+    possible_values_parser, value_parser,
 };
 
 #[test]
@@ -34,6 +34,49 @@ fn parsing_matches_shared_fixtures() {
             "case {}",
             record.id
         );
+    }
+}
+
+#[test]
+fn command_local_scopes_match_shared_fixtures() {
+    let command = Command::new("root")
+        .id("root-id")
+        .option(
+            OptionSpec::value("session")
+                .long("session")
+                .default_value("root"),
+        )
+        .subcommand(
+            Command::new("run")
+                .id("run-id")
+                .option(OptionSpec::value("session").long("session")),
+        );
+    for record in support::load("cli/scopes.txt", "cli-scopes", &["argv", "expected"]) {
+        let result = command
+            .parse(arguments(&record.bytes("argv")))
+            .unwrap_or_else(|error| panic!("case {} failed: {error}", record.id));
+        let ParseResult::Invocation(invocation) = result else {
+            panic!("case {} did not produce an Invocation", record.id);
+        };
+        let root = invocation
+            .scope(["root-id"])
+            .expect("root scope must be present");
+        let current = invocation
+            .raw_value("session")
+            .and_then(OsStr::to_str)
+            .unwrap_or("none");
+        let root_value = root
+            .raw_value("session")
+            .and_then(OsStr::to_str)
+            .unwrap_or("none");
+        let snapshot = format!(
+            "command={};ids={};current={current};root={root_value};current-supplied={};root-supplied={}",
+            invocation.command_path().join("/"),
+            invocation.command_id_path().join("/"),
+            invocation.supplied("session"),
+            root.supplied("session"),
+        );
+        assert_eq!(snapshot, record.field("expected"), "case {}", record.id);
     }
 }
 
@@ -67,6 +110,43 @@ fn errors_match_shared_fixtures() {
 }
 
 #[test]
+fn diagnostic_metadata_matches_shared_fixtures() {
+    let command = fixture_command();
+    for record in support::load(
+        "cli/diagnostics.txt",
+        "cli-diagnostics",
+        &["argv", "expected"],
+    ) {
+        let error = command
+            .parse(arguments(&record.bytes("argv")))
+            .expect_err("fixture case must fail");
+        let targets = error
+            .targets()
+            .iter()
+            .map(|target| {
+                let kind = match target.kind() {
+                    nagi_cli::DiagnosticTargetKind::Option => "option",
+                    nagi_cli::DiagnosticTargetKind::Argument => "argument",
+                };
+                format!(
+                    "{kind}@{}:{}",
+                    target.command_id_path().join("/"),
+                    target.value_id()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("+");
+        let snapshot = format!(
+            "code={};category={};targets={targets};hints={}",
+            error.code().as_str(),
+            error.category().as_str(),
+            error.hints().join("+"),
+        );
+        assert_eq!(snapshot, record.field("expected"), "case {}", record.id);
+    }
+}
+
+#[test]
 fn help_matches_shared_fixtures() {
     let command = fixture_command();
     for record in support::load("cli/help.txt", "cli-help", &["path", "expected"]) {
@@ -80,6 +160,55 @@ fn help_matches_shared_fixtures() {
             "case {}",
             record.id
         );
+    }
+}
+
+#[test]
+fn help_presentation_matches_shared_fixtures() {
+    for record in support::load(
+        "cli/help-presentation.txt",
+        "cli-help-presentation",
+        &["mode", "required", "expected"],
+    ) {
+        let mode = match record.field("mode") {
+            "auto" => SubcommandUsageMode::Auto,
+            "hidden" => SubcommandUsageMode::Hidden,
+            "expanded" => SubcommandUsageMode::Expanded,
+            value => panic!("case {} has invalid mode {value}", record.id),
+        };
+        let required = record.field("required") == "true";
+        let mut command = Command::new("root")
+            .id("root-id")
+            .subcommand_usage(mode)
+            .subcommand(
+                Command::new("compare")
+                    .id("compare-id")
+                    .usage_variant("file", "--file <FILE>")
+                    .usage_variant("stdin", "--stdin"),
+            )
+            .subcommand(Command::new("status").id("status-id"));
+        if required {
+            command = command.require_subcommand();
+        } else {
+            command = command.usage_variant("direct", "<ROOT>");
+        }
+        let document = command
+            .help_document(&["root".to_owned()])
+            .unwrap_or_else(|error| panic!("case {} failed: {error}", record.id));
+        let snapshot = document
+            .usage_variants()
+            .iter()
+            .map(|variant| {
+                format!(
+                    "{}:{}={}",
+                    variant.command_id_path().join("/"),
+                    variant.id(),
+                    variant.syntax()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        assert_eq!(snapshot, record.field("expected"), "case {}", record.id);
     }
 }
 
@@ -248,7 +377,9 @@ fn fixture_command() -> Command {
                 return Err(Diagnostic::new(
                     DiagnosticCode::Validation,
                     "input 'blocked' is not allowed",
-                ));
+                )
+                .with_target(nagi_cli::DiagnosticTarget::argument("input"))
+                .with_hint("choose another input"));
             }
             Ok(())
         })
@@ -364,10 +495,10 @@ fn environment(bytes: &[u8]) -> Vec<(OsString, OsString)> {
 
 fn snapshot_parse(result: ParseResult) -> String {
     match result {
-        ParseResult::Help { command_path } => {
+        ParseResult::Help { command_path, .. } => {
             format!("action;kind=help;command={}", command_path.join("/"))
         }
-        ParseResult::Version { version } => format!("action;kind=version;value={version}"),
+        ParseResult::Version { version, .. } => format!("action;kind=version;value={version}"),
         ParseResult::Invocation(invocation) => snapshot_invocation(&invocation),
     }
 }

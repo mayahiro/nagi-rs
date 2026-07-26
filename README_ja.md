@@ -16,9 +16,9 @@ Nagi Rust実装はterminal application向けのnative Text、VT、Surface、TUI�
 
 ```toml
 [dependencies]
-nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" }
-nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" } # Optional
-nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" } # CLI application
+nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
+nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Optional
+nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # CLI application
 ```
 
 依存関係全体の解決結果を維持するため、applicationの`Cargo.lock`をcommitしてください
@@ -49,10 +49,12 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-tui` | App lifecycle、semantic Node、layout、event、Effect、Subscription、terminal loop |
 | `nagi-tui-widgets` | Public TUI APIから構築した21個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
-| `nagi-cli` | Command Graph、typed Invocation validation、Usage Variant付きstructured Help、Diagnostic、Runtime Policy、process統合 |
+| `nagi-cli` | Command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、段階実行Runtime Policy、process統合 |
 | `nagi-cli-test` | ProcessなしのCLI input注入とoutput取得 |
 
 [Nagi semantic specification](https://github.com/mayahiro/nagi/tree/main/spec)がGo実装と共有する挙動を定義します
+
+[Public CLI API guide](https://github.com/mayahiro/nagi/blob/main/docs/CLI_API_ja.md)ではcommand-local scope、Help presentation、structured validator、段階導入を説明します
 
 ## Application test
 
@@ -60,8 +62,8 @@ cargo run -p nagi-cli --example basic -- Nagi
 
 ```toml
 [dev-dependencies]
-nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" }
-nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" }
+nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
+nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
 `nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、frameを操作できます
@@ -90,6 +92,7 @@ Rust repository rootから実行します
 | [Form validation](crates/nagi-tui-widgets/examples/form_validation/README.md) | `cargo run -p nagi-tui-widgets --example form_validation` |
 | [CLI basic](crates/nagi-cli/examples/basic/README.md) | `cargo run -p nagi-cli --example basic -- Nagi` |
 | [CLI subcommands](crates/nagi-cli/examples/subcommands/README.md) | `cargo run -p nagi-cli --example subcommands -- start -vv` |
+| [CLI段階導入](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
 
 ## 制約
 

@@ -1,8 +1,8 @@
 use nagi_text::{WidthProfile, text_width};
 
 use crate::command::{
-    Command, OptionGroupKind, PresenceBasis, argument_label, generated_usage_syntax,
-    option_description, option_display, option_label, usage_command_line,
+    Command, OptionGroupKind, PresenceBasis, SubcommandUsageMode, argument_label,
+    generated_usage_syntax, option_description, option_display, option_label, usage_command_line,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 
@@ -24,19 +24,31 @@ impl UsageVariantDefinition {
 /// One structured invocation syntax in a Help Document
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HelpUsageVariant {
+    command_id_path: Vec<String>,
     id: String,
     syntax: String,
     command_line: String,
 }
 
 impl HelpUsageVariant {
-    fn new(id: impl Into<String>, syntax: impl Into<String>, path: &[String]) -> Self {
+    fn new(
+        command_id_path: Vec<String>,
+        id: impl Into<String>,
+        syntax: impl Into<String>,
+        help_path: &[String],
+    ) -> Self {
         let syntax = syntax.into();
         Self {
+            command_id_path,
             id: id.into(),
-            command_line: usage_command_line(path, &syntax),
+            command_line: usage_command_line(help_path, &syntax),
             syntax,
         }
+    }
+
+    /// Returns the source stable command-ID path
+    pub fn command_id_path(&self) -> &[String] {
+        &self.command_id_path
     }
 
     /// Returns the stable variant identifier
@@ -471,8 +483,11 @@ impl Command {
                 "help path does not identify a command",
             )
         })?;
+        let command_id_path = self
+            .command_id_path_at_path(path)
+            .expect("the validated Help path was resolved above");
 
-        let usage_variants = help_usage_variants(command, path);
+        let usage_variants = help_usage_variants(command, path, &command_id_path);
         let usage = usage_variants
             .iter()
             .map(|variant| variant.command_line.clone())
@@ -567,28 +582,82 @@ impl Command {
     }
 }
 
-fn help_usage_variants(command: &Command, path: &[String]) -> Vec<HelpUsageVariant> {
-    let mut variants = if command.usage_variants.is_empty() {
-        vec![HelpUsageVariant::new(
-            "default",
-            generated_usage_syntax(command),
-            path,
-        )]
+fn help_usage_variants(
+    command: &Command,
+    path: &[String],
+    command_id_path: &[String],
+) -> Vec<HelpUsageVariant> {
+    let mut variants = if command.subcommand_usage == SubcommandUsageMode::Expanded
+        && command.subcommand_required
+        && command.usage_variants.is_empty()
+    {
+        Vec::new()
     } else {
-        command
-            .usage_variants
-            .iter()
-            .map(|variant| HelpUsageVariant::new(&variant.id, &variant.syntax, path))
-            .collect()
+        direct_usage_variants(command, path, command_id_path, "")
     };
-    if !command.subcommands.is_empty() && !command.subcommand_required {
-        variants.push(HelpUsageVariant::new(
-            "subcommand",
-            "[OPTIONS] <COMMAND>",
-            path,
-        ));
+    match command.subcommand_usage {
+        SubcommandUsageMode::Auto
+            if !command.subcommands.is_empty() && !command.subcommand_required =>
+        {
+            variants.push(HelpUsageVariant::new(
+                command_id_path.to_vec(),
+                "subcommand",
+                "[OPTIONS] <COMMAND>",
+                path,
+            ));
+        }
+        SubcommandUsageMode::Expanded => {
+            for child in &command.subcommands {
+                let mut child_id_path = command_id_path.to_vec();
+                child_id_path.push(child.id.clone());
+                variants.extend(direct_usage_variants(
+                    child,
+                    path,
+                    &child_id_path,
+                    &child.name,
+                ));
+            }
+        }
+        SubcommandUsageMode::Auto | SubcommandUsageMode::Hidden => {}
     }
     variants
+}
+
+fn direct_usage_variants(
+    command: &Command,
+    help_path: &[String],
+    command_id_path: &[String],
+    prefix: &str,
+) -> Vec<HelpUsageVariant> {
+    if command.usage_variants.is_empty() {
+        let syntax = prefixed_usage(prefix, &generated_usage_syntax(command));
+        return vec![HelpUsageVariant::new(
+            command_id_path.to_vec(),
+            "default",
+            syntax,
+            help_path,
+        )];
+    }
+    command
+        .usage_variants
+        .iter()
+        .map(|variant| {
+            HelpUsageVariant::new(
+                command_id_path.to_vec(),
+                &variant.id,
+                prefixed_usage(prefix, &variant.syntax),
+                help_path,
+            )
+        })
+        .collect()
+}
+
+fn prefixed_usage(prefix: &str, syntax: &str) -> String {
+    if prefix.is_empty() {
+        syntax.to_owned()
+    } else {
+        format!("{prefix} {syntax}")
+    }
 }
 
 fn render_entry_section(output: &mut String, heading: &str, entries: &[HelpEntry]) {

@@ -331,6 +331,10 @@ impl OptionGroup {
 }
 
 /// Performs application-specific validation over a typed Invocation
+///
+/// During validation, unqualified value access starts at the Command that
+/// declared the validator. Returning a Diagnostic preserves application codes,
+/// semantic categories, value targets, and hints
 pub trait InvocationValidator: Send + Sync {
     /// Returns a structured Diagnostic when validation fails
     fn validate(&self, invocation: &Invocation) -> Result<(), Diagnostic>;
@@ -343,6 +347,18 @@ where
     fn validate(&self, invocation: &Invocation) -> Result<(), Diagnostic> {
         self(invocation)
     }
+}
+
+/// Selects how parent Help presents subcommand invocation syntax
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SubcommandUsageMode {
+    /// Generates one generic optional-subcommand usage line
+    #[default]
+    Auto,
+    /// Omits generated optional-subcommand usage
+    Hidden,
+    /// Expands each immediate child's direct usage variants without recursion
+    Expanded,
 }
 
 /// A validated node in the command graph
@@ -358,6 +374,7 @@ pub struct Command {
     pub(crate) option_groups: Vec<OptionGroup>,
     pub(crate) subcommands: Vec<Command>,
     pub(crate) subcommand_required: bool,
+    pub(crate) subcommand_usage: SubcommandUsageMode,
     pub(crate) usage_variants: Vec<UsageVariantDefinition>,
     pub(crate) examples: Vec<HelpExample>,
     pub(crate) notes: Vec<String>,
@@ -382,6 +399,7 @@ impl Command {
             option_groups: Vec::new(),
             subcommands: Vec::new(),
             subcommand_required: false,
+            subcommand_usage: SubcommandUsageMode::Auto,
             usage_variants: Vec::new(),
             examples: Vec::new(),
             notes: Vec::new(),
@@ -443,6 +461,15 @@ impl Command {
     /// Requires one child command to be selected
     pub fn require_subcommand(mut self) -> Self {
         self.subcommand_required = true;
+        self
+    }
+
+    /// Selects generic, hidden, or expanded subcommand usage in parent Help
+    ///
+    /// This changes Help presentation only and does not change parsing,
+    /// validation, Diagnostics, or Invocation values
+    pub const fn subcommand_usage(mut self, mode: SubcommandUsageMode) -> Self {
+        self.subcommand_usage = mode;
         self
     }
 
@@ -516,8 +543,7 @@ impl Command {
 
     /// Validates the entire graph without consuming argv
     pub fn validate(&self) -> Result<(), Diagnostic> {
-        let mut path_ids = BTreeSet::new();
-        validate_command(self, true, &mut path_ids)
+        validate_command(self, true)
     }
 
     pub(crate) fn command_at_path(&self, path: &[String]) -> Option<&Command> {
@@ -534,6 +560,22 @@ impl Command {
         Some(command)
     }
 
+    pub(crate) fn command_id_path_at_path(&self, path: &[String]) -> Option<Vec<String>> {
+        if path.first().map(String::as_str) != Some(self.name.as_str()) {
+            return None;
+        }
+        let mut command = self;
+        let mut ids = vec![self.id.clone()];
+        for name in &path[1..] {
+            command = command
+                .subcommands
+                .iter()
+                .find(|candidate| candidate.name == *name)?;
+            ids.push(command.id.clone());
+        }
+        Some(ids)
+    }
+
     pub(crate) fn usage_for_path(&self, path: &[String]) -> String {
         let command = self
             .command_at_path(path)
@@ -546,11 +588,7 @@ impl Command {
     }
 }
 
-fn validate_command(
-    command: &Command,
-    root: bool,
-    path_ids: &mut BTreeSet<String>,
-) -> Result<(), Diagnostic> {
+fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
     if !valid_id(&command.id) {
         return invalid(format!("invalid command ID '{}'", command.id));
     }
@@ -583,7 +621,7 @@ fn validate_command(
         ));
     }
 
-    let mut ids = path_ids.clone();
+    let mut ids = BTreeSet::new();
     let mut local_ids = BTreeSet::new();
     let mut longs = BTreeSet::new();
     let mut shorts = BTreeSet::new();
@@ -676,9 +714,8 @@ fn validate_command(
                 ));
             }
         }
-        validate_command(child, false, &mut ids.clone())?;
+        validate_command(child, false)?;
     }
-    *path_ids = ids;
     Ok(())
 }
 
@@ -700,7 +737,10 @@ fn validate_help(command: &Command) -> Result<(), Diagnostic> {
                 command.name, variant.id
             ));
         }
-        if !command.subcommands.is_empty() && variant.id == "subcommand" {
+        if command.subcommand_usage == SubcommandUsageMode::Auto
+            && !command.subcommands.is_empty()
+            && variant.id == "subcommand"
+        {
             return invalid(format!(
                 "command '{}' Help usage variant '{}' conflicts with a generated variant",
                 command.name, variant.id

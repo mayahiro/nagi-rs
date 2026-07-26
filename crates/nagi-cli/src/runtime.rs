@@ -202,7 +202,7 @@ impl Outcome {
 
 /// A language-native command handler
 pub trait Handler: Send + Sync {
-    /// Executes one validated invocation
+    /// Executes one validated Invocation with the selected leaf as current scope
     fn handle(&self, context: &mut Context, invocation: &Invocation)
     -> Result<Outcome, Diagnostic>;
 }
@@ -246,67 +246,134 @@ impl Command {
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
         match self.parse_with_environment(arguments, environment) {
-            Ok(ParseResult::Help { command_path }) => {
+            Ok(result) => self.run_parsed_with_policy(context, result, policy),
+            Err(diagnostic) => {
+                context
+                    .stderr()
+                    .write_all(policy.render_diagnostic(&diagnostic).as_bytes())?;
+                Ok(Outcome::new(policy.status_for_diagnostic(&diagnostic)))
+            }
+        }
+    }
+
+    /// Executes a result parsed by this Command Graph through the default Policy
+    pub fn run_parsed(&self, context: &mut Context, result: ParseResult) -> io::Result<Outcome> {
+        self.run_parsed_with_policy(context, result, &RuntimePolicy::default())
+    }
+
+    /// Executes a result parsed by this Command Graph through an explicit Policy
+    ///
+    /// This is the staged-adoption bridge between parser-only dispatch and
+    /// Nagi Help, version, or registered Handler execution. A result whose
+    /// canonical or stable path does not identify the same graph is rejected
+    pub fn run_parsed_with_policy(
+        &self,
+        context: &mut Context,
+        result: ParseResult,
+        policy: &RuntimePolicy,
+    ) -> io::Result<Outcome> {
+        if self
+            .command_id_path_at_path(result.command_path())
+            .as_deref()
+            != Some(result.command_id_path())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Parse Result does not belong to this Command Graph",
+            ));
+        }
+        match result {
+            ParseResult::Help { command_path, .. } => {
                 let document = self.help_document(&command_path).map_err(diagnostic_io)?;
                 let help = policy.render_help(&document);
                 context.stdout().write_all(help.as_bytes())?;
                 Ok(Outcome::success())
             }
-            Ok(ParseResult::Version { version }) => {
+            ParseResult::Version { version, .. } => {
                 writeln!(context.stdout(), "{} {version}", self.name)?;
                 Ok(Outcome::success())
             }
-            Ok(ParseResult::Invocation(invocation)) => {
-                if context.cancellation().is_cancelled() {
-                    return Ok(Outcome::new(
-                        policy
-                            .exit_code_policy()
-                            .status_for(crate::diagnostic::DiagnosticCategory::Cancellation),
-                    ));
-                }
-                let command = self
-                    .command_at_path(invocation.command_path())
-                    .expect("validated invocation paths identify commands");
-                let Some(handler) = &command.handler else {
-                    let diagnostic = Diagnostic::new(
-                        DiagnosticCode::MissingHandler,
-                        format!("command '{}' has no handler", command.name),
-                    )
-                    .with_command_path(invocation.command_path().to_vec());
-                    context
-                        .stderr()
-                        .write_all(policy.render_diagnostic(&diagnostic).as_bytes())?;
-                    return Ok(Outcome::new(
-                        policy.exit_code_policy().status_for(diagnostic.category()),
-                    ));
-                };
-                match handler.handle(context, &invocation) {
-                    Ok(outcome)
-                        if context.cancellation().is_cancelled()
-                            && outcome.status() == ExitStatus::SUCCESS =>
-                    {
-                        Ok(Outcome::new(policy.exit_code_policy().status_for(
-                            crate::diagnostic::DiagnosticCategory::Cancellation,
-                        )))
-                    }
-                    Ok(outcome) => Ok(outcome),
-                    Err(diagnostic) => {
-                        context
-                            .stderr()
-                            .write_all(policy.render_diagnostic(&diagnostic).as_bytes())?;
-                        Ok(Outcome::new(
-                            policy.exit_code_policy().status_for(diagnostic.category()),
-                        ))
-                    }
-                }
+            ParseResult::Invocation(invocation) => {
+                self.run_invocation_with_policy(context, &invocation, policy)
             }
+        }
+    }
+
+    /// Executes one Invocation validated by this Command Graph
+    ///
+    /// An Invocation whose canonical or stable command path does not identify
+    /// the same graph is rejected as invalid input
+    pub fn run_invocation(
+        &self,
+        context: &mut Context,
+        invocation: &Invocation,
+    ) -> io::Result<Outcome> {
+        self.run_invocation_with_policy(context, invocation, &RuntimePolicy::default())
+    }
+
+    /// Executes one Invocation validated by this Command Graph through a Policy
+    ///
+    /// An Invocation whose canonical or stable command path does not identify
+    /// the same graph is rejected as invalid input
+    pub fn run_invocation_with_policy(
+        &self,
+        context: &mut Context,
+        invocation: &Invocation,
+        policy: &RuntimePolicy,
+    ) -> io::Result<Outcome> {
+        let expected_id_path = self
+            .command_id_path_at_path(invocation.command_path())
+            .filter(|path| path == invocation.command_id_path())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Invocation does not belong to this Command Graph",
+                )
+            })?;
+        debug_assert_eq!(expected_id_path, invocation.command_id_path());
+        if context.cancellation().is_cancelled() {
+            return Ok(Outcome::new(
+                policy
+                    .exit_code_policy()
+                    .status_for(crate::diagnostic::DiagnosticCategory::Cancellation),
+            ));
+        }
+        let command = self
+            .command_at_path(invocation.command_path())
+            .expect("the checked canonical path identifies a command");
+        let Some(handler) = &command.handler else {
+            let diagnostic = Diagnostic::new(
+                DiagnosticCode::MissingHandler,
+                format!("command '{}' has no handler", command.name),
+            )
+            .with_command_path(invocation.command_path().to_vec());
+            context
+                .stderr()
+                .write_all(policy.render_diagnostic(&diagnostic).as_bytes())?;
+            return Ok(Outcome::new(policy.status_for_diagnostic(&diagnostic)));
+        };
+        match handler.handle(context, invocation) {
+            Ok(outcome)
+                if context.cancellation().is_cancelled()
+                    && outcome.status() == ExitStatus::SUCCESS =>
+            {
+                Ok(Outcome::new(policy.exit_code_policy().status_for(
+                    crate::diagnostic::DiagnosticCategory::Cancellation,
+                )))
+            }
+            Ok(outcome) => Ok(outcome),
             Err(diagnostic) => {
+                let mut diagnostic = diagnostic
+                    .with_default_target_path(invocation.value_scope_id_path())
+                    .with_command_path(invocation.command_path().to_vec());
+                if diagnostic.category() == crate::diagnostic::DiagnosticCategory::Usage {
+                    diagnostic =
+                        diagnostic.with_usage(self.usage_for_path(invocation.command_path()));
+                }
                 context
                     .stderr()
                     .write_all(policy.render_diagnostic(&diagnostic).as_bytes())?;
-                Ok(Outcome::new(
-                    policy.exit_code_policy().status_for(diagnostic.category()),
-                ))
+                Ok(Outcome::new(policy.status_for_diagnostic(&diagnostic)))
             }
         }
     }

@@ -1,8 +1,8 @@
 # Basic command
 
-This example defines one required positional value, parses it as a
-platform-native value, writes through the injected Context, and returns an
-explicit Exit Status
+This example defines one required UTF-8 positional value, retrieves it with the
+fallible required typed accessor, writes through the injected Context, and
+returns an explicit Exit Status
 
 Run it from the Rust repository root:
 

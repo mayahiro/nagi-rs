@@ -3,69 +3,134 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
-/// A stable machine-readable diagnostic code
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DiagnosticCode {
-    /// The command definition is internally inconsistent
-    InvalidSpecification,
-    /// An option spelling is unknown
-    UnknownOption,
-    /// A flag or count option received a value
-    UnexpectedOptionValue,
-    /// A value option has no following value
-    MissingOptionValue,
-    /// A non-repeatable option appeared more than once
-    DuplicateOption,
-    /// A command name or alias is unknown
-    UnknownCommand,
-    /// A required subcommand was not selected
-    MissingSubcommand,
-    /// No positional slot accepts an argument
-    UnexpectedArgument,
-    /// A required option or positional is absent
-    MissingRequired,
-    /// A Value Parser rejected a value
-    InvalidValue,
-    /// An option requirement is not satisfied
-    Requires,
-    /// Conflicting options are both present
-    Conflicts,
-    /// An option-group cardinality rule is not satisfied
-    OptionGroup,
-    /// A language-native Invocation validator rejected a value combination
-    Validation,
-    /// The selected command has no handler
-    MissingHandler,
-    /// A handler reported an application failure
-    HandlerError,
-    /// Execution was cooperatively cancelled
-    Cancelled,
-    /// An injected I/O operation failed
-    IoError,
-}
+/// A stable machine-readable framework or application diagnostic code
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DiagnosticCode(&'static str);
 
+#[allow(non_upper_case_globals)]
 impl DiagnosticCode {
+    /// The command definition is internally inconsistent
+    pub const InvalidSpecification: Self = Self("invalid-specification");
+    /// An option spelling is unknown
+    pub const UnknownOption: Self = Self("unknown-option");
+    /// A flag or count option received a value
+    pub const UnexpectedOptionValue: Self = Self("unexpected-option-value");
+    /// A value option has no following value
+    pub const MissingOptionValue: Self = Self("missing-option-value");
+    /// A non-repeatable option appeared more than once
+    pub const DuplicateOption: Self = Self("duplicate-option");
+    /// A command name or alias is unknown
+    pub const UnknownCommand: Self = Self("unknown-command");
+    /// A required subcommand was not selected
+    pub const MissingSubcommand: Self = Self("missing-subcommand");
+    /// No positional slot accepts an argument
+    pub const UnexpectedArgument: Self = Self("unexpected-argument");
+    /// A required option or positional is absent
+    pub const MissingRequired: Self = Self("missing-required");
+    /// A Value Parser rejected a value
+    pub const InvalidValue: Self = Self("invalid-value");
+    /// An option requirement is not satisfied
+    pub const Requires: Self = Self("requires");
+    /// Conflicting options are both present
+    pub const Conflicts: Self = Self("conflicts");
+    /// An option-group cardinality rule is not satisfied
+    pub const OptionGroup: Self = Self("option-group");
+    /// A language-native Invocation validator rejected a value combination
+    pub const Validation: Self = Self("validation");
+    /// The selected command has no handler
+    pub const MissingHandler: Self = Self("missing-handler");
+    /// A handler reported an application failure
+    pub const HandlerError: Self = Self("handler-error");
+    /// Execution was cooperatively cancelled
+    pub const Cancelled: Self = Self("cancelled");
+    /// An injected I/O operation failed
+    pub const IoError: Self = Self("io-error");
+
+    /// Constructs an application code using the stable identifier grammar
+    ///
+    /// # Panics
+    ///
+    /// Panics when `code` is not a valid stable identifier
+    pub fn application(code: &'static str) -> Self {
+        assert!(valid_diagnostic_code(code), "invalid Diagnostic code");
+        Self(code)
+    }
+
     /// Returns the stable lowercase code
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidSpecification => "invalid-specification",
-            Self::UnknownOption => "unknown-option",
-            Self::UnexpectedOptionValue => "unexpected-option-value",
-            Self::MissingOptionValue => "missing-option-value",
-            Self::DuplicateOption => "duplicate-option",
-            Self::UnknownCommand => "unknown-command",
-            Self::MissingSubcommand => "missing-subcommand",
-            Self::UnexpectedArgument => "unexpected-argument",
-            Self::MissingRequired => "missing-required",
-            Self::InvalidValue => "invalid-value",
-            Self::Requires => "requires",
-            Self::Conflicts => "conflicts",
-            Self::OptionGroup => "option-group",
-            Self::Validation => "validation",
-            Self::MissingHandler => "missing-handler",
-            Self::HandlerError => "handler-error",
-            Self::Cancelled => "cancelled",
-            Self::IoError => "io-error",
+        self.0
+    }
+}
+
+fn valid_diagnostic_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_alphabetic()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Identifies the kind of value referenced by a Diagnostic target
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticTargetKind {
+    /// A command option
+    Option,
+    /// A positional argument
+    Argument,
+}
+
+/// Identifies one option or argument in a structured Diagnostic
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticTarget {
+    kind: DiagnosticTargetKind,
+    command_id_path: Vec<String>,
+    value_id: String,
+}
+
+impl DiagnosticTarget {
+    /// Constructs a target for an option in the current Invocation scope
+    pub fn option(value_id: impl Into<String>) -> Self {
+        Self {
+            kind: DiagnosticTargetKind::Option,
+            command_id_path: Vec::new(),
+            value_id: value_id.into(),
+        }
+    }
+
+    /// Constructs a target for an argument in the current Invocation scope
+    pub fn argument(value_id: impl Into<String>) -> Self {
+        Self {
+            kind: DiagnosticTargetKind::Argument,
+            command_id_path: Vec::new(),
+            value_id: value_id.into(),
+        }
+    }
+
+    /// Returns a copy with an explicit stable command-ID path
+    pub fn with_command_id_path(mut self, path: Vec<String>) -> Self {
+        self.command_id_path = path;
+        self
+    }
+
+    /// Returns whether this target identifies an option or argument
+    pub const fn kind(&self) -> DiagnosticTargetKind {
+        self.kind
+    }
+
+    /// Returns the stable command-ID path
+    pub fn command_id_path(&self) -> &[String] {
+        &self.command_id_path
+    }
+
+    /// Returns the command-local value ID
+    pub fn value_id(&self) -> &str {
+        &self.value_id
+    }
+
+    pub(crate) fn set_default_path(&mut self, path: &[String]) {
+        if self.command_id_path.is_empty() {
+            self.command_id_path = path.to_vec();
         }
     }
 }
@@ -135,58 +200,56 @@ pub struct Diagnostic {
     code: DiagnosticCode,
     category: DiagnosticCategory,
     message: String,
+    metadata: Option<Box<DiagnosticMetadata>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DiagnosticMetadata {
     command_path: Vec<String>,
     usage: Option<String>,
+    targets: Vec<DiagnosticTarget>,
+    hints: Vec<String>,
 }
 
 impl Diagnostic {
     /// Constructs a diagnostic with the semantic category for its code
     pub fn new(code: DiagnosticCode, message: impl Into<String>) -> Self {
-        let category = match code {
-            DiagnosticCode::InvalidSpecification => DiagnosticCategory::Specification,
-            DiagnosticCode::UnknownOption
-            | DiagnosticCode::UnexpectedOptionValue
-            | DiagnosticCode::MissingOptionValue
-            | DiagnosticCode::DuplicateOption
-            | DiagnosticCode::UnknownCommand
-            | DiagnosticCode::MissingSubcommand
-            | DiagnosticCode::UnexpectedArgument
-            | DiagnosticCode::MissingRequired
-            | DiagnosticCode::InvalidValue
-            | DiagnosticCode::Requires
-            | DiagnosticCode::Conflicts
-            | DiagnosticCode::OptionGroup
-            | DiagnosticCode::Validation => DiagnosticCategory::Usage,
-            DiagnosticCode::Cancelled => DiagnosticCategory::Cancellation,
-            DiagnosticCode::IoError => DiagnosticCategory::Io,
-            DiagnosticCode::MissingHandler | DiagnosticCode::HandlerError => {
-                DiagnosticCategory::Execution
-            }
-        };
+        let category = category_for_code(code);
         Self {
             code,
             category,
             message: message.into(),
-            command_path: Vec::new(),
-            usage: None,
+            metadata: None,
         }
     }
 
     /// Adds a canonical command path
     pub fn with_command_path(mut self, path: Vec<String>) -> Self {
-        self.command_path = path;
+        self.metadata_mut().command_path = path;
         self
     }
 
     /// Adds one usage line without the `usage:` prefix
     pub fn with_usage(mut self, usage: impl Into<String>) -> Self {
-        self.usage = Some(usage.into());
+        self.metadata_mut().usage = Some(usage.into());
         self
     }
 
     /// Overrides the semantic category
     pub const fn with_category(mut self, category: DiagnosticCategory) -> Self {
         self.category = category;
+        self
+    }
+
+    /// Appends one structured option or argument target
+    pub fn with_target(mut self, target: DiagnosticTarget) -> Self {
+        self.metadata_mut().targets.push(target);
+        self
+    }
+
+    /// Appends one human-readable remediation hint
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.metadata_mut().hints.push(hint.into());
         self
     }
 
@@ -207,12 +270,30 @@ impl Diagnostic {
 
     /// Returns the canonical command path
     pub fn command_path(&self) -> &[String] {
-        &self.command_path
+        self.metadata
+            .as_deref()
+            .map_or(&[], |metadata| metadata.command_path.as_slice())
     }
 
     /// Returns the optional usage line
     pub fn usage(&self) -> Option<&str> {
-        self.usage.as_deref()
+        self.metadata
+            .as_deref()
+            .and_then(|metadata| metadata.usage.as_deref())
+    }
+
+    /// Returns structured option and argument targets in insertion order
+    pub fn targets(&self) -> &[DiagnosticTarget] {
+        self.metadata
+            .as_deref()
+            .map_or(&[], |metadata| metadata.targets.as_slice())
+    }
+
+    /// Returns human-readable remediation hints in insertion order
+    pub fn hints(&self) -> &[String] {
+        self.metadata
+            .as_deref()
+            .map_or(&[], |metadata| metadata.hints.as_slice())
     }
 
     /// Renders deterministic plain text with one final newline
@@ -221,6 +302,42 @@ impl Diagnostic {
             &crate::policy::PlainDiagnosticRenderer::default(),
             self,
         )
+    }
+
+    pub(crate) fn with_default_target_path(mut self, path: &[String]) -> Self {
+        if let Some(metadata) = self.metadata.as_deref_mut() {
+            for target in &mut metadata.targets {
+                target.set_default_path(path);
+            }
+        }
+        self
+    }
+
+    fn metadata_mut(&mut self) -> &mut DiagnosticMetadata {
+        self.metadata
+            .get_or_insert_with(|| Box::new(DiagnosticMetadata::default()))
+    }
+}
+
+fn category_for_code(code: DiagnosticCode) -> DiagnosticCategory {
+    match code.as_str() {
+        "invalid-specification" => DiagnosticCategory::Specification,
+        "unknown-option"
+        | "unexpected-option-value"
+        | "missing-option-value"
+        | "duplicate-option"
+        | "unknown-command"
+        | "missing-subcommand"
+        | "unexpected-argument"
+        | "missing-required"
+        | "invalid-value"
+        | "requires"
+        | "conflicts"
+        | "option-group"
+        | "validation" => DiagnosticCategory::Usage,
+        "cancelled" => DiagnosticCategory::Cancellation,
+        "io-error" => DiagnosticCategory::Io,
+        _ => DiagnosticCategory::Execution,
     }
 }
 

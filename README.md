@@ -17,9 +17,9 @@ Add only the application framework and optional components that you use
 
 ```toml
 [dependencies]
-nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" }
-nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" } # Optional
-nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" } # CLI applications
+nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
+nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Optional
+nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # CLI applications
 ```
 
 Commit an application's `Cargo.lock` to preserve its complete dependency
@@ -51,11 +51,14 @@ The complete source and behavior are documented with the examples below
 | `nagi-tui` | App lifecycle, semantic nodes, layout, events, Effects, Subscriptions, and terminal loop |
 | `nagi-tui-widgets` | 21 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
-| `nagi-cli` | Command Graph, typed Invocation validation, structured Help with Usage Variants, Diagnostics, Runtime Policy, and process integration |
+| `nagi-cli` | Command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, staged Runtime Policy, and process integration |
 | `nagi-cli-test` | Process-free CLI input injection and output capture |
 
 The [Nagi semantic specifications](https://github.com/mayahiro/nagi/tree/main/spec)
-define behavior shared with the Go implementations
+define behavior shared with the Go implementations. The
+[public CLI API guide](https://github.com/mayahiro/nagi/blob/main/docs/CLI_API.md)
+explains command-local scopes, Help presentation, structured validators, and
+staged adoption
 
 ## Testing applications
 
@@ -63,8 +66,8 @@ Add only the matching test support crate
 
 ```toml
 [dev-dependencies]
-nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" }
-nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.6" }
+nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
+nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
 `nagi-tui-test` drives messages, terminal input, resize, virtual time, Effects,
@@ -96,6 +99,7 @@ Run commands from the Rust repository root
 | [Form validation](crates/nagi-tui-widgets/examples/form_validation/README.md) | `cargo run -p nagi-tui-widgets --example form_validation` |
 | [CLI basic](crates/nagi-cli/examples/basic/README.md) | `cargo run -p nagi-cli --example basic -- Nagi` |
 | [CLI subcommands](crates/nagi-cli/examples/subcommands/README.md) | `cargo run -p nagi-cli --example subcommands -- start -vv` |
+| [CLI staged adoption](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
 
 ## Limitations
 
