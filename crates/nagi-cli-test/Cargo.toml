@@ -12,4 +12,4 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-nagi-cli = { path = "../nagi-cli", version = "0.2.5" }
+nagi-cli = { path = "../nagi-cli", version = "0.2.6" }

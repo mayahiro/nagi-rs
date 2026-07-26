@@ -8,7 +8,7 @@ use nagi_cli::{Command, Context, Diagnostic, DiagnosticCode, Invocation, OptionS
 fn application() -> Command {
     Command::new("service")
         .about("Manage a service")
-        .version("0.2.5")
+        .version("0.2.6")
         .require_subcommand()
         .subcommand(
             Command::new("start")

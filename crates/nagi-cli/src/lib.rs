@@ -25,7 +25,7 @@ pub use command::{
 pub use diagnostic::{Diagnostic, DiagnosticCategory, DiagnosticCode, ExitStatus};
 pub use help::{
     HelpBlock, HelpDocument, HelpEntry, HelpExample, HelpLink, HelpOptionGroup, HelpOptionRelation,
-    HelpOptionRelationKind, HelpRenderer, HelpSection, PlainHelpRenderer,
+    HelpOptionRelationKind, HelpRenderer, HelpSection, HelpUsageVariant, PlainHelpRenderer,
 };
 pub use parser::{Invocation, ParseResult};
 pub use policy::{DiagnosticRenderer, ExitCodePolicy, PlainDiagnosticRenderer, RuntimePolicy};

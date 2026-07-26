@@ -9,7 +9,8 @@ use nagi_cli::{Argument, Command, Context, Diagnostic, DiagnosticCode, Invocatio
 fn application() -> Command {
     Command::new("greet")
         .about("Print a greeting")
-        .version("0.2.5")
+        .version("0.2.6")
+        .usage_variant("named", "<NAME> [OPTIONS]")
         .argument(Argument::new("name").required().help("Name to greet"))
         .example("named greeting", "greet Nagi")
         .note("Help and diagnostics are written separately from command output")

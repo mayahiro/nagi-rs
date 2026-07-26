@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode, display_os};
-use crate::help::{HelpBlock, HelpExample, HelpLink, HelpSection};
+use crate::help::{HelpBlock, HelpExample, HelpLink, HelpSection, UsageVariantDefinition};
 use crate::parser::Invocation;
 use crate::runtime::Handler;
 use crate::value::{ValueParser, raw_parser};
@@ -358,6 +358,7 @@ pub struct Command {
     pub(crate) option_groups: Vec<OptionGroup>,
     pub(crate) subcommands: Vec<Command>,
     pub(crate) subcommand_required: bool,
+    pub(crate) usage_variants: Vec<UsageVariantDefinition>,
     pub(crate) examples: Vec<HelpExample>,
     pub(crate) notes: Vec<String>,
     pub(crate) links: Vec<HelpLink>,
@@ -381,6 +382,7 @@ impl Command {
             option_groups: Vec::new(),
             subcommands: Vec::new(),
             subcommand_required: false,
+            usage_variants: Vec::new(),
             examples: Vec::new(),
             notes: Vec::new(),
             links: Vec::new(),
@@ -441,6 +443,17 @@ impl Command {
     /// Requires one child command to be selected
     pub fn require_subcommand(mut self) -> Self {
         self.subcommand_required = true;
+        self
+    }
+
+    /// Appends one Help-only invocation syntax with a stable ID
+    ///
+    /// The syntax is a non-empty suffix relative to the canonical command path
+    /// and does not change argv parsing, Invocation validation, Diagnostic
+    /// usage, or Invocation values
+    pub fn usage_variant(mut self, id: impl Into<String>, syntax: impl Into<String>) -> Self {
+        self.usage_variants
+            .push(UsageVariantDefinition::new(id, syntax));
         self
     }
 
@@ -670,6 +683,30 @@ fn validate_command(
 }
 
 fn validate_help(command: &Command) -> Result<(), Diagnostic> {
+    if !command.usage_variants.is_empty() && command.subcommand_required {
+        return invalid(format!(
+            "command '{}' declares Help usage variants while requiring a subcommand",
+            command.name
+        ));
+    }
+    let mut usage_ids = BTreeSet::new();
+    for variant in &command.usage_variants {
+        if !valid_id(&variant.id)
+            || !usage_ids.insert(&variant.id)
+            || !valid_usage_syntax(&variant.syntax)
+        {
+            return invalid(format!(
+                "command '{}' has an invalid Help usage variant '{}'",
+                command.name, variant.id
+            ));
+        }
+        if !command.subcommands.is_empty() && variant.id == "subcommand" {
+            return invalid(format!(
+                "command '{}' Help usage variant '{}' conflicts with a generated variant",
+                command.name, variant.id
+            ));
+        }
+    }
     if command
         .examples
         .iter()
@@ -722,6 +759,14 @@ fn validate_help(command: &Command) -> Result<(), Diagnostic> {
     Ok(())
 }
 
+fn valid_usage_syntax(syntax: &str) -> bool {
+    let bytes = syntax.as_bytes();
+    !bytes.is_empty()
+        && bytes.first() != Some(&b' ')
+        && bytes.last() != Some(&b' ')
+        && bytes.iter().all(|byte| *byte >= 0x20 && *byte != 0x7f)
+}
+
 fn invalid<T>(message: String) -> Result<T, Diagnostic> {
     Err(Diagnostic::new(
         DiagnosticCode::InvalidSpecification,
@@ -750,15 +795,23 @@ fn reserved_short(value: char) -> bool {
 }
 
 pub(crate) fn usage_line(command: &Command, path: &[String]) -> String {
-    let mut usage = format!("{} [OPTIONS]", path.join(" "));
+    usage_command_line(path, &generated_usage_syntax(command))
+}
+
+pub(crate) fn generated_usage_syntax(command: &Command) -> String {
+    let mut syntax = "[OPTIONS]".to_owned();
     for argument in &command.arguments {
-        usage.push(' ');
-        usage.push_str(&argument_label(argument));
+        syntax.push(' ');
+        syntax.push_str(&argument_label(argument));
     }
     if command.subcommand_required {
-        usage.push_str(" <COMMAND>");
+        syntax.push_str(" <COMMAND>");
     }
-    usage
+    syntax
+}
+
+pub(crate) fn usage_command_line(path: &[String], syntax: &str) -> String {
+    format!("{} {syntax}", path.join(" "))
 }
 
 pub(crate) fn argument_label(argument: &Argument) -> String {

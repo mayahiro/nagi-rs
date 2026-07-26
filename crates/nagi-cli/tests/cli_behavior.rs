@@ -82,6 +82,17 @@ fn graph_validation_rejects_path_and_sibling_collisions() {
         Command::new("root")
             .option(OptionSpec::flag("known").long("known"))
             .option_group(OptionGroup::at_most_one("source", ["known", "known"])),
+        Command::new("root")
+            .usage_variant("node", "<NODE>")
+            .usage_variant("node", "<X> <Y>"),
+        Command::new("root").usage_variant("node", "<NODE>\n"),
+        Command::new("root")
+            .require_subcommand()
+            .usage_variant("node", "<NODE>")
+            .subcommand(Command::new("child")),
+        Command::new("root")
+            .usage_variant("subcommand", "<NODE>")
+            .subcommand(Command::new("child")),
     ];
     for command in invalid {
         assert_eq!(
@@ -216,13 +227,16 @@ fn option_group_kinds_are_enforced() {
 #[test]
 fn help_document_exposes_structured_additions() {
     let command = Command::new("root")
+        .usage_variant("node", "<NODE> [OPTIONS]")
+        .usage_variant("coordinates", "<X> <Y> [OPTIONS]")
         .option(OptionSpec::flag("a").long("a").conflicts("b"))
         .option(OptionSpec::flag("b").long("b"))
         .option_group(OptionGroup::at_most_one("selection", ["a", "b"]))
         .example("basic", "root --a")
         .note("Choose one source")
         .link("guide", "https://example.com/guide")
-        .help_section(HelpSection::new("details", "Details").paragraph("Additional text"));
+        .help_section(HelpSection::new("details", "Details").paragraph("Additional text"))
+        .subcommand(Command::new("child"));
     let document = command.help_document(&["root".to_owned()]).unwrap();
     assert_eq!(document.examples().len(), 1);
     assert_eq!(document.notes().len(), 1);
@@ -230,6 +244,19 @@ fn help_document_exposes_structured_additions() {
     assert_eq!(document.sections().len(), 1);
     assert_eq!(document.option_relations().len(), 1);
     assert_eq!(document.option_groups().len(), 1);
+    assert_eq!(document.usage_variants().len(), 3);
+    assert_eq!(document.usage_variants()[0].id(), "node");
+    assert_eq!(document.usage_variants()[0].syntax(), "<NODE> [OPTIONS]");
+    assert_eq!(
+        document.usage_variants()[0].command_line(),
+        "root <NODE> [OPTIONS]"
+    );
+    assert_eq!(document.usage()[1], "root <X> <Y> [OPTIONS]");
+    assert_eq!(document.usage_variants()[2].id(), "subcommand");
+    assert_eq!(
+        document.usage_variants()[2].command_line(),
+        "root [OPTIONS] <COMMAND>"
+    );
     assert_eq!(document.options()[0].id(), "a");
     assert_eq!(document.option_groups()[0].option_ids()[0], "a");
     assert_eq!(document.option_groups()[0].option_labels()[0], "--a");
@@ -238,6 +265,26 @@ fn help_document_exposes_structured_additions() {
     assert_eq!(
         document.option_relations()[0].kind(),
         nagi_cli::HelpOptionRelationKind::Conflicts
+    );
+}
+
+#[test]
+fn usage_variants_remain_help_only() {
+    let generated = Command::new("root")
+        .help_document(&["root".to_owned()])
+        .unwrap();
+    assert_eq!(generated.usage_variants().len(), 1);
+    assert_eq!(generated.usage_variants()[0].id(), "default");
+    assert_eq!(generated.usage_variants()[0].syntax(), "[OPTIONS]");
+
+    let command = Command::new("root")
+        .usage_variant("node", "<NODE>")
+        .argument(Argument::new("value").required());
+    let document = command.help_document(&["root".to_owned()]).unwrap();
+    assert_eq!(document.usage()[0], "root <NODE>");
+    assert_eq!(
+        command.parse::<_, &str>([]).unwrap_err().usage(),
+        Some("root [OPTIONS] <VALUE>")
     );
 }
 

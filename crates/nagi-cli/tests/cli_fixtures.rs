@@ -256,6 +256,8 @@ fn fixture_command() -> Command {
             Command::new("serve")
                 .alias("s")
                 .about("Serve files")
+                .usage_variant("host", "<HOST> [OPTIONS]")
+                .usage_variant("mode", "--mode <http|https> <HOST> [OPTIONS]")
                 .option(
                     OptionSpec::value("port")
                         .long("port")

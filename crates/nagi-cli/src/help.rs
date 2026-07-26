@@ -1,10 +1,59 @@
 use nagi_text::{WidthProfile, text_width};
 
 use crate::command::{
-    Command, OptionGroupKind, PresenceBasis, argument_label, option_description, option_display,
-    option_label, usage_line,
+    Command, OptionGroupKind, PresenceBasis, argument_label, generated_usage_syntax,
+    option_description, option_display, option_label, usage_command_line,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
+
+#[derive(Clone)]
+pub(crate) struct UsageVariantDefinition {
+    pub(crate) id: String,
+    pub(crate) syntax: String,
+}
+
+impl UsageVariantDefinition {
+    pub(crate) fn new(id: impl Into<String>, syntax: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            syntax: syntax.into(),
+        }
+    }
+}
+
+/// One structured invocation syntax in a Help Document
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HelpUsageVariant {
+    id: String,
+    syntax: String,
+    command_line: String,
+}
+
+impl HelpUsageVariant {
+    fn new(id: impl Into<String>, syntax: impl Into<String>, path: &[String]) -> Self {
+        let syntax = syntax.into();
+        Self {
+            id: id.into(),
+            command_line: usage_command_line(path, &syntax),
+            syntax,
+        }
+    }
+
+    /// Returns the stable variant identifier
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the command-path-relative syntax suffix
+    pub fn syntax(&self) -> &str {
+        &self.syntax
+    }
+
+    /// Returns the complete canonical usage line
+    pub fn command_line(&self) -> &str {
+        &self.command_line
+    }
+}
 
 /// One labeled description in a Help Document
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,6 +302,7 @@ pub struct HelpDocument {
     command_path: Vec<String>,
     description: String,
     usage: Vec<String>,
+    usage_variants: Vec<HelpUsageVariant>,
     commands: Vec<HelpEntry>,
     arguments: Vec<HelpEntry>,
     options: Vec<HelpEntry>,
@@ -275,9 +325,14 @@ impl HelpDocument {
         &self.description
     }
 
-    /// Returns generated usage lines
+    /// Returns rendered usage lines
     pub fn usage(&self) -> &[String] {
         &self.usage
+    }
+
+    /// Returns structured usage metadata
+    pub fn usage_variants(&self) -> &[HelpUsageVariant] {
+        &self.usage_variants
     }
 
     /// Returns child-command entries
@@ -417,10 +472,11 @@ impl Command {
             )
         })?;
 
-        let mut usage = vec![usage_line(command, path)];
-        if !command.subcommands.is_empty() && !command.subcommand_required {
-            usage.push(format!("{} [OPTIONS] <COMMAND>", path.join(" ")));
-        }
+        let usage_variants = help_usage_variants(command, path);
+        let usage = usage_variants
+            .iter()
+            .map(|variant| variant.command_line.clone())
+            .collect();
 
         let mut commands = command
             .subcommands
@@ -492,6 +548,7 @@ impl Command {
             command_path: path.to_vec(),
             description: command.about.clone(),
             usage,
+            usage_variants,
             commands,
             arguments,
             options,
@@ -508,6 +565,30 @@ impl Command {
     pub fn render_help(&self, path: &[String]) -> Result<String, Diagnostic> {
         Ok(self.help_document(path)?.render())
     }
+}
+
+fn help_usage_variants(command: &Command, path: &[String]) -> Vec<HelpUsageVariant> {
+    let mut variants = if command.usage_variants.is_empty() {
+        vec![HelpUsageVariant::new(
+            "default",
+            generated_usage_syntax(command),
+            path,
+        )]
+    } else {
+        command
+            .usage_variants
+            .iter()
+            .map(|variant| HelpUsageVariant::new(&variant.id, &variant.syntax, path))
+            .collect()
+    };
+    if !command.subcommands.is_empty() && !command.subcommand_required {
+        variants.push(HelpUsageVariant::new(
+            "subcommand",
+            "[OPTIONS] <COMMAND>",
+            path,
+        ));
+    }
+    variants
 }
 
 fn render_entry_section(output: &mut String, heading: &str, entries: &[HelpEntry]) {
