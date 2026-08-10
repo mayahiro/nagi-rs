@@ -7,6 +7,7 @@ use std::time::Duration;
 use nagi_surface::SurfaceError;
 use nagi_vt::{Event, KeyAction, KeyCode, MouseButton, MouseKind, TerminalOp};
 
+use crate::action_routing::{ActionIndex, ResolvedActionRoute, validate_action_owners};
 use crate::effect::RuntimeCommand;
 use crate::renderer::operations;
 use crate::routing::{FocusChange, InteractiveKind, PointerChange, TreeIndex};
@@ -17,8 +18,8 @@ use crate::supervisor::{EffectDiagnostics, EffectSupervisor};
 use crate::text_edit::{TextEdit, apply_text_edit, normalize_cursor};
 use crate::wake::WakeHandle;
 use crate::{
-    App, Clock, EventDispatch, EventResult, InteractionState, Node, NodeId, Point, ScrollOffset,
-    Size, SubscriptionKey, Surface, SystemClock, TaskKey, Timestamp,
+    App, BindingConflict, Clock, EventDispatch, EventResult, InteractionState, Node, NodeId, Point,
+    ResolvedActions, ScrollOffset, Size, SubscriptionKey, Surface, SystemClock, TaskKey, Timestamp,
 };
 
 /// The default maximum number of messages waiting in a runtime queue
@@ -74,6 +75,8 @@ pub enum RuntimeError {
     DuplicateNodeId(NodeId),
     /// Two subscription sources used the same stable key
     DuplicateSubscriptionKey(SubscriptionKey),
+    /// One active semantic action group has conflicting key bindings
+    BindingConflict(BindingConflict),
 }
 
 impl fmt::Display for RuntimeError {
@@ -91,6 +94,7 @@ impl fmt::Display for RuntimeError {
             Self::DuplicateSubscriptionKey(key) => {
                 write!(formatter, "duplicate SubscriptionKey {key}")
             }
+            Self::BindingConflict(error) => error.fmt(formatter),
         }
     }
 }
@@ -99,12 +103,19 @@ impl Error for RuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Surface(error) => Some(error),
+            Self::BindingConflict(error) => Some(error),
             Self::ZeroQueueCapacity
             | Self::ZeroTaskLimit
             | Self::ZeroSubscriptionCapacity
             | Self::DuplicateNodeId(_)
             | Self::DuplicateSubscriptionKey(_) => None,
         }
+    }
+}
+
+impl From<BindingConflict> for RuntimeError {
+    fn from(error: BindingConflict) -> Self {
+        Self::BindingConflict(error)
     }
 }
 
@@ -210,6 +221,9 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     view_tree: Option<Node<Application::Message>>,
     tree_index: TreeIndex,
     next_tree_index: TreeIndex,
+    action_index: ActionIndex<Application::Message>,
+    next_action_index: ActionIndex<Application::Message>,
+    resolved_action_route: Option<ResolvedActionRoute<Application::Message>>,
     effects: EffectSupervisor<Application::Message>,
     subscriptions: SubscriptionSupervisor<Application::Message>,
     subscriptions_dirty: bool,
@@ -281,6 +295,9 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             view_tree: None,
             tree_index: TreeIndex::default(),
             next_tree_index: TreeIndex::default(),
+            action_index: ActionIndex::default(),
+            next_action_index: ActionIndex::default(),
+            resolved_action_route: None,
             effects,
             subscriptions,
             subscriptions_dirty: false,
@@ -613,6 +630,20 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         true
     }
 
+    /// Returns resolved semantic action groups on the active target-to-root route
+    ///
+    /// Groups outside the nearest StopAtScope boundary are omitted. Each
+    /// projection contains the complete active root-to-target scope path
+    pub fn active_action_groups(&mut self) -> Result<Vec<ResolvedActions>, RuntimeError> {
+        self.ensure_tree()?;
+        let route = self.tree_index.route(self.interaction.focused.as_ref());
+        self.ensure_action_route(&route)?;
+        Ok(self
+            .resolved_action_route
+            .as_ref()
+            .map_or_else(Vec::new, ResolvedActionRoute::groups))
+    }
+
     /// Routes one normalized event through focus, hit testing, and ancestors
     pub fn dispatch_event(&mut self, event: &Event) -> Result<EventDispatch, RuntimeEventError> {
         self.ensure_tree()?;
@@ -659,8 +690,19 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         }
 
         let route = self.tree_index.route(target.as_ref());
+        self.ensure_action_route(&route)?;
         let mut dispatch = EventDispatch::default();
         for (index, id) in route.into_iter().enumerate() {
+            let action_result = self
+                .resolved_action_route
+                .as_ref()
+                .and_then(|resolved| resolved.match_event(index, event).invoke());
+            if let Some(result) = action_result {
+                self.apply_event_result(result, &mut dispatch)?;
+                if dispatch.consumed {
+                    break;
+                }
+            }
             let kind = self
                 .tree_index
                 .record(&id)
@@ -690,6 +732,23 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
         }
         Ok(dispatch)
+    }
+
+    fn ensure_action_route(&mut self, route: &[NodeId]) -> Result<(), RuntimeError> {
+        if !self.action_index.has_actions() {
+            self.resolved_action_route = None;
+            return Ok(());
+        }
+        if self
+            .resolved_action_route
+            .as_ref()
+            .is_some_and(|resolved| resolved.matches_route(route))
+        {
+            return Ok(());
+        }
+        let resolved = ResolvedActionRoute::resolve(route, &self.action_index)?;
+        self.resolved_action_route = Some(resolved);
+        Ok(())
     }
 
     fn handle_text_input(
@@ -866,6 +925,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         &mut self,
         view: &Node<Application::Message>,
         index: &mut TreeIndex,
+        actions: &mut ActionIndex<Application::Message>,
     ) -> Result<(), RuntimeError> {
         let Some(focused) = self.interaction.focused.clone() else {
             return Ok(());
@@ -915,7 +975,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
             self.interaction.request_scroll(&id, next);
             view.prepare_interaction(self.size, &mut self.interaction);
-            view.build_tree_index_into(self.size, &self.interaction, index)
+            view.build_tree_index_into(self.size, &self.interaction, index, actions)
                 .map_err(RuntimeError::DuplicateNodeId)?;
         }
         Ok(())
@@ -927,8 +987,15 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         }
         let view = self.app.view(crate::ViewContext::new(self.size));
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
-        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
+        let mut action_index = std::mem::take(&mut self.next_action_index);
+        if let Err(id) = view.build_tree_index_into(
+            self.size,
+            &self.interaction,
+            &mut tree_index,
+            &mut action_index,
+        ) {
             self.next_tree_index = tree_index;
+            self.next_action_index = action_index;
             return Err(RuntimeError::DuplicateNodeId(id));
         }
         self.interaction
@@ -943,19 +1010,39 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         }
         self.apply_pending_interaction(&tree_index);
         if view.prepare_interaction(self.size, &mut self.interaction) {
-            if let Err(id) =
-                view.build_tree_index_into(self.size, &self.interaction, &mut tree_index)
-            {
+            if let Err(id) = view.build_tree_index_into(
+                self.size,
+                &self.interaction,
+                &mut tree_index,
+                &mut action_index,
+            ) {
                 self.next_tree_index = tree_index;
+                self.next_action_index = action_index;
                 return Err(RuntimeError::DuplicateNodeId(id));
             }
         }
-        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index) {
+        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index, &mut action_index) {
             self.next_tree_index = tree_index;
+            self.next_action_index = action_index;
             return Err(error);
         }
+        let resolved_action_route = match resolve_frame_actions(
+            &tree_index,
+            &action_index,
+            self.interaction.focused.as_ref(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.next_tree_index = tree_index;
+                self.next_action_index = action_index;
+                return Err(error);
+            }
+        };
         let previous = std::mem::replace(&mut self.tree_index, tree_index);
         self.next_tree_index = previous;
+        let previous = std::mem::replace(&mut self.action_index, action_index);
+        self.next_action_index = previous;
+        self.resolved_action_route = resolved_action_route;
         self.view_tree = Some(view);
         Ok(())
     }
@@ -976,8 +1063,15 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         }
         let view = self.app.view(crate::ViewContext::new(self.size));
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
-        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
+        let mut action_index = std::mem::take(&mut self.next_action_index);
+        if let Err(id) = view.build_tree_index_into(
+            self.size,
+            &self.interaction,
+            &mut tree_index,
+            &mut action_index,
+        ) {
             self.next_tree_index = tree_index;
+            self.next_action_index = action_index;
             return Err(RuntimeError::DuplicateNodeId(id));
         }
         {
@@ -999,17 +1093,34 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         }
         self.apply_pending_interaction(&tree_index);
         if view.prepare_interaction(self.size, &mut self.interaction) {
-            if let Err(id) =
-                view.build_tree_index_into(self.size, &self.interaction, &mut tree_index)
-            {
+            if let Err(id) = view.build_tree_index_into(
+                self.size,
+                &self.interaction,
+                &mut tree_index,
+                &mut action_index,
+            ) {
                 self.next_tree_index = tree_index;
+                self.next_action_index = action_index;
                 return Err(RuntimeError::DuplicateNodeId(id));
             }
         }
-        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index) {
+        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index, &mut action_index) {
             self.next_tree_index = tree_index;
+            self.next_action_index = action_index;
             return Err(error);
         }
+        let resolved_action_route = match resolve_frame_actions(
+            &tree_index,
+            &action_index,
+            self.interaction.focused.as_ref(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.next_tree_index = tree_index;
+                self.next_action_index = action_index;
+                return Err(error);
+            }
+        };
         let mut surface = match self.spare_surface.take() {
             Some(mut surface)
                 if surface.width() == self.size.width && surface.height() == self.size.height =>
@@ -1021,6 +1132,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 Ok(surface) => surface,
                 Err(error) => {
                     self.next_tree_index = tree_index;
+                    self.next_action_index = action_index;
                     return Err(error.into());
                 }
             },
@@ -1038,6 +1150,9 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.view_tree = Some(view);
         let previous = std::mem::replace(&mut self.tree_index, tree_index);
         self.next_tree_index = previous;
+        let previous = std::mem::replace(&mut self.action_index, action_index);
+        self.next_action_index = previous;
+        self.resolved_action_route = resolved_action_route;
         self.dirty = false;
         self.urgent_frame = false;
         self.last_frame = Some(now);
@@ -1053,6 +1168,19 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.process_pending()?;
         self.render_if_dirty()
     }
+}
+
+fn resolve_frame_actions<Message>(
+    tree: &TreeIndex,
+    actions: &ActionIndex<Message>,
+    target: Option<&NodeId>,
+) -> Result<Option<ResolvedActionRoute<Message>>, RuntimeError> {
+    validate_action_owners(tree, actions)?;
+    if !actions.has_actions() {
+        return Ok(None);
+    }
+    let route = tree.route(target);
+    Ok(Some(ResolvedActionRoute::resolve(&route, actions)?))
 }
 
 fn visible_axis_offset(
@@ -1088,8 +1216,9 @@ mod tests {
 
     use crate::fixture_support;
     use crate::{
-        CancelToken, DeliveryPolicy, Effect, EventResult, Insets, KeyEvent, KeyProtocol, Modifiers,
-        Node, NodeId, ScrollOffset, Subscription, SubscriptionKey, Task, TaskKey, VirtualClock,
+        Action, ActionDescriptor, CancelToken, DeliveryPolicy, Effect, EventResult, Insets,
+        KeyBinding, KeyEvent, KeyProtocol, KeyStroke, Modifiers, Node, NodeId, ScrollOffset,
+        Subscription, SubscriptionKey, Task, TaskKey, VirtualClock,
     };
 
     use super::*;
@@ -1506,6 +1635,57 @@ mod tests {
         assert_eq!(runtime.app().results, ["new"]);
         assert_eq!(runtime.task_generation(&TaskKey::from("search")), 2);
         assert_eq!(runtime.effect_diagnostics().stale_results(), 1);
+    }
+
+    struct CachedActionApp;
+
+    impl App for CachedActionApp {
+        type Message = ();
+
+        fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::text("target").focusable("target").on_actions(
+                "target",
+                [Action::new(
+                    ActionDescriptor::new(
+                        "app.action",
+                        "Action",
+                        [KeyBinding::new(KeyStroke::character('x', Modifiers::NONE))],
+                    ),
+                    |_| EventResult::ignored(),
+                )],
+            )
+        }
+    }
+
+    #[test]
+    fn dispatch_reuses_the_resolved_action_route_for_unchanged_focus() {
+        let mut runtime = Runtime::with_clock(
+            CachedActionApp,
+            RuntimeConfig::new(Size::new(8, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        runtime.request_focus(&NodeId::from("target")).unwrap();
+        runtime.active_action_groups().unwrap();
+        let before = std::ptr::from_ref(runtime.resolved_action_route.as_ref().unwrap());
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Character('x'),
+            modifiers: Modifiers::NONE,
+            action: KeyAction::Press,
+            text: Some("x".to_owned()),
+            protocol: KeyProtocol::Legacy,
+        });
+
+        runtime.dispatch_event(&event).unwrap();
+        runtime.dispatch_event(&event).unwrap();
+
+        let after = std::ptr::from_ref(runtime.resolved_action_route.as_ref().unwrap());
+        assert_eq!(before, after);
     }
 
     enum InputMessage {

@@ -46,7 +46,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-text` | Unicode 17 grapheme、terminal幅profile、wrap、truncate、位置変換 |
 | `nagi-vt` | Typed terminal input／output、Color、Attributes、Style |
 | `nagi-surface` | Geometry、Cell、Surface描画、composition、diff、snapshot |
-| `nagi-tui` | App lifecycle、semantic Node、layout、event、Effect、Subscription、terminal loop |
+| `nagi-tui` | App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
 | `nagi-tui-widgets` | Public TUI APIから構築した21個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
 | `nagi-cli` | Command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、段階実行Runtime Policy、process統合 |
@@ -66,7 +66,7 @@ nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
-`nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、frameを操作できます
+`nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、frame、activeなresolved actionを操作できます
 
 `nagi-cli-test`はprocess起動やsignal handler設定を行わず、argvとprocess serviceを注入してoutputとExit Statusを取得します
 

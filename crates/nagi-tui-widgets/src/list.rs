@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use nagi_tui::{
-    EventResult, Insets, Length, Node, NodeId, ScrollAxis, ScrollOffset, ScrollViewportOptions,
-    Size, Style, VirtualFragment,
+    Action, ActionDescriptor, EventResult, Insets, Length, Node, NodeId, ScrollAxis, ScrollOffset,
+    ScrollViewportOptions, Size, Style, VirtualFragment,
 };
 
-use crate::event::is_activation_event;
-use crate::navigation::navigate_event;
+use crate::action::{COLLECTION_ACTIONS, CollectionAction, vertical_collection_action_descriptors};
+use crate::event::is_pointer_activation_event;
+use crate::navigation::navigate;
 
 /// One stable item rendered by a [`List`]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +73,10 @@ impl Default for ListStyle {
 }
 
 /// A vertically arranged, keyboard and pointer selectable collection
+///
+/// The root owns standard activation and vertical selection actions.
+/// Left-button press stays raw on each row so keyboard rebinding does not
+/// remove pointer selection
 pub struct List<Message> {
     id: NodeId,
     items: Vec<ListItem>,
@@ -159,6 +164,18 @@ impl<Message: 'static> List<Message> {
         self
     }
 
+    /// Returns the ordered semantic action descriptors declared by this list
+    ///
+    /// The order is activate, previous, next, first, and last. Every descriptor
+    /// is disabled-pass-through when the list is disabled or has no item after
+    /// filtering and windowing
+    #[must_use]
+    pub fn action_descriptors(&self) -> [ActionDescriptor; 5] {
+        vertical_collection_action_descriptors(
+            self.enabled && list_has_visible_items(&self.items, &self.filter, self.window),
+        )
+    }
+
     /// Builds the public semantic node for this list
     #[must_use]
     pub fn into_node(mut self) -> Node<Message> {
@@ -167,6 +184,8 @@ impl<Message: 'static> List<Message> {
             visible = list_window(&visible, offset, limit);
         }
         let selected = normalized_list_selection(&visible, self.selected);
+        let descriptors =
+            vertical_collection_action_descriptors(self.enabled && selected.is_some());
         let visible = Arc::new(visible);
         if let Some((viewport_id, height)) = self.viewport.take() {
             return virtual_list_node(
@@ -177,6 +196,7 @@ impl<Message: 'static> List<Message> {
                 self.enabled,
                 self.style,
                 self.on_select,
+                descriptors,
                 viewport_id,
                 height,
             );
@@ -207,7 +227,7 @@ impl<Message: 'static> List<Message> {
             let row = Node::styled_text(content, style)
                 .with_id(item_id.clone())
                 .on_event(item_id, move |event| {
-                    if is_activation_event(event) {
+                    if is_pointer_activation_event(event) {
                         EventResult::message(click_select(original_index))
                             .focus(click_focus.clone())
                     } else {
@@ -218,31 +238,25 @@ impl<Message: 'static> List<Message> {
                 children.push(row);
                 continue;
             }
-            let navigation_focus = root_id.clone();
-            let navigation_select = Arc::clone(&self.on_select);
-            let navigation_visible = Arc::clone(&visible);
-            children.push(
-                Node::column([row])
-                    .focusable(root_id.clone())
-                    .with_focused_style(self.style.focused)
-                    .on_event(root_id.clone(), move |event| {
-                        let Some(next) = navigate_event(event, navigation_visible.len(), position)
-                        else {
-                            return EventResult::ignored();
-                        };
-                        let mut result = EventResult::consumed().focus(navigation_focus.clone());
-                        if next != position {
-                            result = result.emit(navigation_select(navigation_visible[next]));
-                        }
-                        result
-                    }),
-            );
+            children.push(list_action_target(
+                Node::column([row]),
+                root_id.clone(),
+                Arc::clone(&visible),
+                position,
+                Some(self.style.focused),
+                Arc::clone(&self.on_select),
+                descriptors.clone(),
+            ));
         }
 
+        let root = Node::column(children);
         if self.enabled && selected.is_some() {
-            Node::column(children)
+            root
         } else {
-            Node::column(children).with_id(root_id)
+            root.with_id(root_id.clone()).on_actions(
+                root_id,
+                descriptors.map(|descriptor| Action::new(descriptor, |_| EventResult::ignored())),
+            )
         }
     }
 }
@@ -256,12 +270,14 @@ fn virtual_list_node<Message: 'static>(
     enabled: bool,
     style: ListStyle,
     on_select: Arc<dyn Fn(usize) -> Message>,
+    descriptors: [ActionDescriptor; 5],
     viewport_id: NodeId,
     height: Length,
 ) -> Node<Message> {
     let content_height = u32::try_from(visible.len()).unwrap_or(u32::MAX);
     let items = Arc::new(items);
     let outer_root_id = root_id.clone();
+    let fragment_descriptors = descriptors.clone();
     let viewport = Node::virtual_scroll_viewport_with_options(
         viewport_id,
         Size::new(0, content_height),
@@ -278,7 +294,15 @@ fn virtual_list_node<Message: 'static>(
             let end = start.saturating_add(count).min(visible.len());
             let rows = (start..end).map(|position| {
                 virtual_list_row(
-                    &items, &visible, selected, position, enabled, style, &root_id, &on_select,
+                    &items,
+                    &visible,
+                    selected,
+                    position,
+                    enabled,
+                    style,
+                    &root_id,
+                    &on_select,
+                    &fragment_descriptors,
                 )
             });
             let visible_rows = Node::padding(
@@ -290,13 +314,14 @@ fn virtual_list_node<Message: 'static>(
                 if let Some(position) =
                     selected.filter(|position| *position < start || *position >= end)
                 {
-                    let proxy = list_navigation_target(
+                    let proxy = list_action_target(
                         Node::spacer(0, 1),
                         root_id.clone(),
                         Arc::clone(&visible),
                         position,
                         None,
                         Arc::clone(&on_select),
+                        fragment_descriptors.clone(),
                     );
                     layers.push(Node::padding(
                         proxy,
@@ -313,7 +338,10 @@ fn virtual_list_node<Message: 'static>(
     if enabled && selected.is_some() {
         root
     } else {
-        root.with_id(outer_root_id)
+        root.with_id(outer_root_id.clone()).on_actions(
+            outer_root_id,
+            descriptors.map(|descriptor| Action::new(descriptor, |_| EventResult::ignored())),
+        )
     }
 }
 
@@ -327,6 +355,7 @@ fn virtual_list_row<Message: 'static>(
     style: ListStyle,
     root_id: &NodeId,
     on_select: &Arc<dyn Fn(usize) -> Message>,
+    descriptors: &[ActionDescriptor; 5],
 ) -> Node<Message> {
     let original_index = visible[position];
     let item = &items[original_index];
@@ -351,7 +380,7 @@ fn virtual_list_row<Message: 'static>(
     let row = Node::styled_text(content, row_style)
         .with_id(item_id.clone())
         .on_event(item_id, move |event| {
-            if is_activation_event(event) {
+            if is_pointer_activation_event(event) {
                 EventResult::message(click_select(original_index)).focus(click_focus.clone())
             } else {
                 EventResult::ignored()
@@ -360,53 +389,110 @@ fn virtual_list_row<Message: 'static>(
     if !is_selected {
         return row.with_length(Length::Fixed(1));
     }
-    list_navigation_target(
+    list_action_target(
         Node::column([row]),
         root_id.clone(),
         Arc::clone(visible),
         position,
         Some(style.focused),
         Arc::clone(on_select),
+        descriptors.clone(),
     )
     .with_length(Length::Fixed(1))
 }
 
-fn list_navigation_target<Message: 'static>(
+fn list_action_target<Message: 'static>(
     node: Node<Message>,
     root_id: NodeId,
     visible: Arc<Vec<usize>>,
     position: usize,
     focused_style: Option<Style>,
     on_select: Arc<dyn Fn(usize) -> Message>,
+    descriptors: [ActionDescriptor; 5],
 ) -> Node<Message> {
-    let navigation_focus = root_id.clone();
-    let mut node = node
-        .focusable(root_id.clone())
-        .on_event(root_id, move |event| {
-            let Some(next) = navigate_event(event, visible.len(), position) else {
-                return EventResult::ignored();
-            };
-            let mut result = EventResult::consumed().focus(navigation_focus.clone());
-            if next != position {
-                result = result.emit(on_select(visible[next]));
-            }
-            result
-        });
+    let mut node = node.focusable(root_id.clone()).on_actions(
+        root_id.clone(),
+        list_actions(descriptors, root_id, visible, position, on_select),
+    );
     if let Some(style) = focused_style {
         node = node.with_focused_style(style);
     }
     node
 }
 
+fn list_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; 5],
+    root_id: NodeId,
+    visible: Arc<Vec<usize>>,
+    position: usize,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+) -> impl Iterator<Item = Action<Message>> {
+    descriptors
+        .into_iter()
+        .zip(COLLECTION_ACTIONS)
+        .map(move |(descriptor, action)| {
+            let focus_id = root_id.clone();
+            let visible = Arc::clone(&visible);
+            let on_select = Arc::clone(&on_select);
+            Action::new(descriptor, move |_| {
+                list_action_result(
+                    action,
+                    &focus_id,
+                    visible.as_ref(),
+                    position,
+                    on_select.as_ref(),
+                )
+            })
+        })
+}
+
+fn list_action_result<Message>(
+    action: CollectionAction,
+    focus_id: &NodeId,
+    visible: &[usize],
+    position: usize,
+    on_select: &dyn Fn(usize) -> Message,
+) -> EventResult<Message> {
+    let result = EventResult::consumed().focus(focus_id.clone());
+    let Some(navigation) = action.navigation() else {
+        return result.emit(on_select(visible[position]));
+    };
+    let next = navigate(visible.len(), position, navigation).unwrap_or(position);
+    if next == position {
+        result
+    } else {
+        result.emit(on_select(visible[next]))
+    }
+}
+
 fn list_visible_indices(items: &[ListItem], query: &str) -> Vec<usize> {
-    let query = query.to_ascii_lowercase();
     items
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| {
-            (query.is_empty() || item.label.to_ascii_lowercase().contains(&query)).then_some(index)
-        })
+        .filter_map(|(index, item)| list_item_matches(item, query).then_some(index))
         .collect()
+}
+
+fn list_has_visible_items(items: &[ListItem], query: &str, window: Option<(usize, usize)>) -> bool {
+    let offset = match window {
+        Some((_, 0)) => return false,
+        Some((offset, _)) => offset,
+        None => 0,
+    };
+    items
+        .iter()
+        .filter(|item| list_item_matches(item, query))
+        .nth(offset)
+        .is_some()
+}
+
+fn list_item_matches(item: &ListItem, query: &str) -> bool {
+    query.is_empty()
+        || item
+            .label
+            .as_bytes()
+            .windows(query.len())
+            .any(|window| window.eq_ignore_ascii_case(query.as_bytes()))
 }
 
 fn list_window(indices: &[usize], offset: usize, limit: usize) -> Vec<usize> {

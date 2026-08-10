@@ -207,15 +207,27 @@ impl TreeIndex {
             (Some(modal), _) => Some(modal),
             (None, target) => target,
         };
-        route_path(
-            &self
-                .records
-                .iter()
-                .map(|record| (record.id.clone(), record.parent.clone()))
-                .collect(),
-            self.root.as_ref(),
-            target,
-        )
+        self.raw_route(target)
+    }
+
+    pub(crate) fn raw_route(&self, target: Option<&NodeId>) -> Vec<NodeId> {
+        let mut route = Vec::new();
+        let mut current = target.cloned();
+        let mut remaining = self.records.len().saturating_add(1);
+        while let Some(id) = current {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            route.push(id.clone());
+            current = self.record(&id).and_then(|record| record.parent.clone());
+        }
+        if let Some(root) = &self.root {
+            if !route.contains(root) {
+                route.push(root.clone());
+            }
+        }
+        route
     }
 
     pub(crate) fn hit_test(&self, point: Point) -> Option<NodeId> {
@@ -276,6 +288,7 @@ impl TreeIndex {
     }
 }
 
+#[cfg(test)]
 fn route_path(
     parents: &HashMap<NodeId, Option<NodeId>>,
     root: Option<&NodeId>,

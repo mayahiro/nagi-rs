@@ -1,5 +1,3 @@
-use nagi_tui::{Event, KeyAction, KeyCode};
-
 #[derive(Clone, Copy)]
 pub(crate) enum Navigation {
     Normalize,
@@ -18,27 +16,6 @@ pub(crate) fn navigate(count: usize, selected: usize, action: Navigation) -> Opt
         Navigation::Home => 0,
         Navigation::End => count - 1,
     })
-}
-
-pub(crate) fn navigate_event(event: &Event, count: usize, selected: usize) -> Option<usize> {
-    let Event::Key(key) = event else {
-        return None;
-    };
-    if key.action == KeyAction::Release
-        || key.modifiers.alt
-        || key.modifiers.control
-        || key.modifiers.meta
-    {
-        return None;
-    }
-    let action = match key.code {
-        KeyCode::Up => Navigation::Up,
-        KeyCode::Down => Navigation::Down,
-        KeyCode::Home => Navigation::Home,
-        KeyCode::End => Navigation::End,
-        _ => return None,
-    };
-    navigate(count, selected, action)
 }
 
 fn normalize_selection(count: usize, selected: usize) -> Option<usize> {

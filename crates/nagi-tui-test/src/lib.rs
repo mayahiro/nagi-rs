@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use nagi_tui::{
     App, EffectDiagnostics, Event, EventAction, Frame, InteractionState, NodeId, QueueFull,
-    Runtime, RuntimeConfig, RuntimeError, RuntimeEventError, ScrollOffset, ScrollState, Size,
-    SubscriptionDiagnostics, SubscriptionKey, TaskKey, TimedInputDecoder, VirtualClock,
+    ResolvedActions, Runtime, RuntimeConfig, RuntimeError, RuntimeEventError, ScrollOffset,
+    ScrollState, Size, SubscriptionDiagnostics, SubscriptionKey, TaskKey, TimedInputDecoder,
+    VirtualClock,
 };
 
 mod manual_subscription;
@@ -163,6 +164,11 @@ where
     #[must_use]
     pub fn scroll_state(&self, id: &NodeId) -> Option<ScrollState> {
         self.runtime.interaction().scroll_state(id)
+    }
+
+    /// Returns resolved action groups on the active target-to-root route
+    pub fn active_action_groups(&mut self) -> Result<Vec<ResolvedActions>, HarnessError> {
+        Ok(self.runtime.active_action_groups()?)
     }
 
     /// Returns the number of supervised tasks that have not fully finished
@@ -336,7 +342,10 @@ where
 mod tests {
     use std::thread;
 
-    use nagi_tui::{DeliveryPolicy, Effect, KeyCode, Node, Subscription, Task};
+    use nagi_tui::{
+        Action, ActionDescriptor, DeliveryPolicy, Effect, EventResult, KeyBinding, KeyCode,
+        KeyStroke, Modifiers, Node, Subscription, Task,
+    };
 
     use super::*;
 
@@ -384,6 +393,45 @@ mod tests {
         assert_eq!(harness.frames().len(), 2);
         assert_eq!(harness.message_history().len(), 2);
         assert!(harness.exit_requested());
+    }
+
+    struct ActionProjectionApp;
+
+    impl App for ActionProjectionApp {
+        type Message = ();
+
+        fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+            Node::text("action").focusable("owner").on_actions(
+                "owner",
+                [Action::new(
+                    ActionDescriptor::new(
+                        "app.action",
+                        "Action",
+                        [KeyBinding::new(KeyStroke::character('x', Modifiers::NONE))],
+                    ),
+                    |_| EventResult::consumed(),
+                )],
+            )
+        }
+    }
+
+    #[test]
+    fn active_action_projection_is_observable() {
+        let mut harness = Harness::new(ActionProjectionApp, Size::new(8, 1), |_| {
+            EventAction::Ignore
+        })
+        .unwrap();
+        harness.request_focus(&NodeId::from("owner")).unwrap();
+
+        let groups = harness.active_action_groups().unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].owner().as_str(), "owner");
+        assert_eq!(groups[0].actions()[0].id().as_str(), "app.action");
     }
 
     struct ManualApp {

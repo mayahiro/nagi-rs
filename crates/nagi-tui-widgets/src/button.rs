@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use nagi_tui::{EventResult, Node, NodeId, Style};
+use nagi_tui::{Action, ActionAvailability, ActionDescriptor, EventResult, Node, NodeId, Style};
 
-use crate::event::is_activation_event;
+use crate::activate_action_descriptor;
+use crate::event::is_pointer_activation_event;
 
 /// Visual styles used by a [`Button`]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +35,10 @@ impl Default for ButtonStyle {
     }
 }
 
-/// A focusable command that emits one message when activated
+/// A focusable command with semantic keyboard and raw pointer activation
+///
+/// Keyboard activation declares [`crate::ACTIVATE_ACTION_ID`]. Left-button
+/// press remains a raw pointer event so keyboard rebinding does not remove it
 pub struct Button<Message> {
     id: NodeId,
     label: String,
@@ -74,23 +78,45 @@ impl<Message: 'static> Button<Message> {
         self
     }
 
+    /// Returns the semantic activation descriptor declared by this button
+    #[must_use]
+    pub fn action_descriptor(&self) -> ActionDescriptor {
+        activate_action_descriptor().with_availability(if self.enabled {
+            ActionAvailability::Enabled
+        } else {
+            ActionAvailability::DisabledPassThrough
+        })
+    }
+
     /// Builds the public semantic node for this button
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
         let content = format!("[ {} ]", self.label);
+        let descriptor = self.action_descriptor();
         if !self.enabled {
-            return Node::styled_text(content, self.style.disabled).with_id(self.id);
+            let id = self.id;
+            return Node::styled_text(content, self.style.disabled)
+                .with_id(id.clone())
+                .on_actions(id, [Action::new(descriptor, |_| EventResult::ignored())]);
         }
 
         let id = self.id;
-        let handler_id = id.clone();
+        let action_handler_id = id.clone();
+        let pointer_handler_id = id.clone();
         let on_activate = self.on_activate;
+        let on_pointer_activate = Arc::clone(&on_activate);
         Node::styled_text(content, self.style.normal)
             .focusable(id.clone())
             .with_focused_style(self.style.focused)
+            .on_actions(
+                id.clone(),
+                [Action::new(descriptor, move |_| {
+                    EventResult::message(on_activate()).focus(action_handler_id.clone())
+                })],
+            )
             .on_event(id, move |event| {
-                if is_activation_event(event) {
-                    EventResult::message(on_activate()).focus(handler_id.clone())
+                if is_pointer_activation_event(event) {
+                    EventResult::message(on_pointer_activate()).focus(pointer_handler_id.clone())
                 } else {
                     EventResult::ignored()
                 }

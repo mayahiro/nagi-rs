@@ -8,13 +8,15 @@ use nagi_text::{
 };
 use nagi_vt::Style;
 
+use crate::action_routing::{ActionIndex, NodeKeyInteraction};
 use crate::layout::{Track, add_size, allocate_into, horizontal_rect, inset, vertical_rect};
 use crate::panel::{BorderGlyphs, content_insets as panel_content_insets, glyphs as border_glyphs};
 use crate::rich_text::ParagraphLayoutCache;
 use crate::routing::{EventHandler, InteractiveKind, NodeRecord, TreeIndex};
 use crate::{
-    BorderKind, Event, EventResult, InteractionState, Length, NodeId, PanelOptions,
-    ParagraphOptions, Rect, ScrollAxis, ScrollOffset, ScrollState, Size, TextSpan, WrapMode,
+    Action, BorderKind, Event, EventResult, InteractionState, KeyScope, Length, NodeId,
+    PanelOptions, ParagraphOptions, Rect, ScrollAxis, ScrollOffset, ScrollState, Size, TextSpan,
+    WrapMode,
 };
 
 /// Padding widths around a node
@@ -138,6 +140,7 @@ pub struct Node<Message> {
     focusable: bool,
     focused_style: Option<Style>,
     handler: Option<Box<EventHandler<Message>>>,
+    key_interaction: Option<Box<NodeKeyInteraction<Message>>>,
     message: PhantomData<fn() -> Message>,
 }
 
@@ -551,6 +554,33 @@ impl<Message> Node<Message> {
         self
     }
 
+    /// Attaches a complete semantic action group under a stable owner identity
+    ///
+    /// A later call replaces the complete group
+    #[must_use]
+    pub fn on_actions(
+        mut self,
+        id: impl Into<NodeId>,
+        actions: impl IntoIterator<Item = Action<Message>>,
+    ) -> Self {
+        self.id = Some(id.into());
+        self.key_interaction_mut().set_actions(actions);
+        self
+    }
+
+    /// Attaches one immutable KeyMap scope to this semantic node
+    ///
+    /// The scope ID becomes the node identity. Later identity modifiers may
+    /// replace it without retaining a stale scope identity. A later call
+    /// replaces the complete scope
+    #[must_use]
+    pub fn with_key_scope(mut self, scope: KeyScope) -> Self {
+        self.id = Some(scope.id().clone());
+        self.key_interaction_mut()
+            .set_scope(scope.key_map().clone(), scope.propagation());
+        self
+    }
+
     /// Sets this node's main-axis sizing rule in a row or column
     #[must_use]
     pub fn with_length(mut self, length: Length) -> Self {
@@ -566,8 +596,14 @@ impl<Message> Node<Message> {
             focusable: false,
             focused_style: None,
             handler: None,
+            key_interaction: None,
             message: PhantomData,
         }
+    }
+
+    fn key_interaction_mut(&mut self) -> &mut NodeKeyInteraction<Message> {
+        self.key_interaction
+            .get_or_insert_with(|| Box::new(NodeKeyInteraction::new()))
     }
 
     pub(crate) fn render_to(&self, surface: &mut Surface, interaction: &InteractionState) {
@@ -753,10 +789,12 @@ impl<Message> Node<Message> {
         size: Size,
         interaction: &InteractionState,
         index: &mut TreeIndex,
+        actions: &mut ActionIndex<Message>,
     ) -> Result<(), NodeId> {
         let bounds = Rect::new(0, 0, size.width, size.height);
         index.clear();
-        self.build_index(bounds, bounds, None, true, interaction, index)
+        actions.clear();
+        self.build_index(bounds, bounds, None, true, interaction, index, actions)
     }
 
     pub(crate) fn prepare_interaction(
@@ -857,6 +895,7 @@ impl<Message> Node<Message> {
         is_root: bool,
         interaction: &InteractionState,
         index: &mut TreeIndex,
+        actions: &mut ActionIndex<Message>,
     ) -> Result<(), NodeId> {
         let mut child_parent = parent.cloned();
         if let Some(id) = &self.id {
@@ -880,6 +919,9 @@ impl<Message> Node<Message> {
                 },
                 is_root,
             )?;
+            if let Some(key_interaction) = &self.key_interaction {
+                actions.register(id, key_interaction);
+            }
             child_parent = Some(id.clone());
         }
         let parent = child_parent.as_ref();
@@ -893,18 +935,34 @@ impl<Message> Node<Message> {
             NodeKind::Row(linear) => {
                 let layout = linear.layout(rect, true);
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-                    child.build_index(child_rect, clip, parent, false, interaction, index)?;
+                    child.build_index(
+                        child_rect,
+                        clip,
+                        parent,
+                        false,
+                        interaction,
+                        index,
+                        actions,
+                    )?;
                 }
             }
             NodeKind::Column(linear) => {
                 let layout = linear.layout(rect, false);
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-                    child.build_index(child_rect, clip, parent, false, interaction, index)?;
+                    child.build_index(
+                        child_rect,
+                        clip,
+                        parent,
+                        false,
+                        interaction,
+                        index,
+                        actions,
+                    )?;
                 }
             }
             NodeKind::Stack(children) => {
                 for child in children {
-                    child.build_index(rect, clip, parent, false, interaction, index)?;
+                    child.build_index(rect, clip, parent, false, interaction, index, actions)?;
                 }
             }
             NodeKind::Padding { insets, child } => child.build_index(
@@ -914,6 +972,7 @@ impl<Message> Node<Message> {
                 false,
                 interaction,
                 index,
+                actions,
             )?,
             NodeKind::Border { child, .. } => child.build_index(
                 inset(rect, 1, 1, 1, 1),
@@ -922,6 +981,7 @@ impl<Message> Node<Message> {
                 false,
                 interaction,
                 index,
+                actions,
             )?,
             NodeKind::Align {
                 horizontal,
@@ -934,6 +994,7 @@ impl<Message> Node<Message> {
                 false,
                 interaction,
                 index,
+                actions,
             )?,
             NodeKind::Clip(child) => child.build_index(
                 rect,
@@ -942,6 +1003,7 @@ impl<Message> Node<Message> {
                 false,
                 interaction,
                 index,
+                actions,
             )?,
             NodeKind::ScrollViewport { child, options } => {
                 let id = self
@@ -955,6 +1017,7 @@ impl<Message> Node<Message> {
                     false,
                     interaction,
                     index,
+                    actions,
                 )?;
             }
             NodeKind::VirtualScrollViewport(virtual_node) => {
@@ -987,11 +1050,12 @@ impl<Message> Node<Message> {
                         false,
                         interaction,
                         index,
+                        actions,
                     )?;
                 }
             }
             NodeKind::Modal(child) => {
-                child.build_index(rect, clip, parent, false, interaction, index)?
+                child.build_index(rect, clip, parent, false, interaction, index, actions)?
             }
             NodeKind::Panel { options, child, .. } => {
                 let insets = panel_content_insets(*options);
@@ -1002,6 +1066,7 @@ impl<Message> Node<Message> {
                     false,
                     interaction,
                     index,
+                    actions,
                 )?;
             }
         }

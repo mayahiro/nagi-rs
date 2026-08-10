@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod action;
 mod bar_chart;
 mod button;
 mod calendar;
@@ -31,6 +32,11 @@ mod tree_state;
 #[cfg(test)]
 mod fixture_support;
 
+pub use action::{
+    ACTIVATE_ACTION_ID, COLLAPSE_ACTION_ID, EXPAND_ACTION_ID, SELECTION_FIRST_ACTION_ID,
+    SELECTION_LAST_ACTION_ID, SELECTION_NEXT_ACTION_ID, SELECTION_PREVIOUS_ACTION_ID,
+    activate_action_descriptor,
+};
 pub use bar_chart::{BarChart, BarChartBar, BarChartStyle};
 pub use button::{Button, ButtonStyle};
 pub use calendar::{Calendar, CalendarDate, CalendarStyle, CalendarWeekStart};

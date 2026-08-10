@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use nagi_tui::{
-    EventResult, HorizontalAlignment, Insets, Length, Node, NodeId, ParagraphOptions, ScrollAxis,
-    ScrollOffset, ScrollViewportOptions, Size, Style, TextSpan, VirtualFragment, WrapMode,
+    Action, ActionDescriptor, EventResult, HorizontalAlignment, Insets, Length, Node, NodeId,
+    ParagraphOptions, ScrollAxis, ScrollOffset, ScrollViewportOptions, Size, Style, TextSpan,
+    VirtualFragment, WrapMode,
 };
 
-use crate::event::is_activation_event;
-use crate::navigation::{Navigation, navigate, navigate_event};
+use crate::action::{COLLECTION_ACTIONS, CollectionAction, vertical_collection_action_descriptors};
+use crate::event::is_pointer_activation_event;
+use crate::navigation::{Navigation, navigate};
 
 /// One sized column rendered by a [`Table`]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +110,10 @@ impl Default for TableStyle {
 }
 
 /// A sized-column table with one composite focus target and owned row selection
+///
+/// The root owns standard activation and vertical selection actions.
+/// Left-button press stays raw on each row so keyboard rebinding does not
+/// remove pointer selection
 pub struct Table<Message> {
     id: NodeId,
     columns: Vec<TableColumn>,
@@ -183,11 +189,22 @@ impl<Message: 'static> Table<Message> {
         self
     }
 
+    /// Returns the ordered semantic action descriptors declared by this table
+    ///
+    /// The order is activate, previous, next, first, and last. Every descriptor
+    /// is disabled-pass-through when the table is disabled or empty
+    #[must_use]
+    pub fn action_descriptors(&self) -> [ActionDescriptor; 5] {
+        vertical_collection_action_descriptors(self.enabled && !self.rows.is_empty())
+    }
+
     /// Builds the public semantic node for this table
     #[must_use]
     pub fn into_node(mut self) -> Node<Message> {
         let row_count = self.rows.len();
         let selected = navigate(row_count, self.selected, Navigation::Normalize);
+        let descriptors =
+            vertical_collection_action_descriptors(self.enabled && selected.is_some());
         let headings: Vec<_> = self
             .columns
             .iter()
@@ -211,6 +228,7 @@ impl<Message: 'static> Table<Message> {
                 self.enabled,
                 self.style,
                 self.on_select,
+                descriptors.clone(),
                 viewport_id,
                 height,
             );
@@ -218,7 +236,11 @@ impl<Message: 'static> Table<Message> {
             return if self.enabled && selected.is_some() {
                 root
             } else {
-                root.with_id(root_id)
+                root.with_id(root_id.clone()).on_actions(
+                    root_id,
+                    descriptors
+                        .map(|descriptor| Action::new(descriptor, |_| EventResult::ignored())),
+                )
             };
         }
         let mut row_nodes = Vec::with_capacity(self.rows.len());
@@ -249,7 +271,7 @@ impl<Message: 'static> Table<Message> {
             let click_focus = root_id.clone();
             let click_select = Arc::clone(&self.on_select);
             let row = node.with_id(row_id.clone()).on_event(row_id, move |event| {
-                if !is_activation_event(event) {
+                if !is_pointer_activation_event(event) {
                     return EventResult::ignored();
                 }
                 EventResult::message(click_select(index)).focus(click_focus.clone())
@@ -258,23 +280,15 @@ impl<Message: 'static> Table<Message> {
                 row_nodes.push(row);
                 continue;
             }
-            let navigation_focus = root_id.clone();
-            let navigation_select = Arc::clone(&self.on_select);
-            row_nodes.push(
-                Node::column([row])
-                    .focusable(root_id.clone())
-                    .with_focused_style(self.style.focused)
-                    .on_event(root_id.clone(), move |event| {
-                        let Some(next) = navigate_event(event, row_count, index) else {
-                            return EventResult::ignored();
-                        };
-                        let mut result = EventResult::consumed().focus(navigation_focus.clone());
-                        if next != index {
-                            result = result.emit(navigation_select(next));
-                        }
-                        result
-                    }),
-            );
+            row_nodes.push(table_action_target(
+                Node::column([row]),
+                root_id.clone(),
+                row_count,
+                index,
+                Some(self.style.focused),
+                Arc::clone(&self.on_select),
+                descriptors.clone(),
+            ));
         }
 
         let mut children = Vec::with_capacity(row_nodes.len().saturating_add(1));
@@ -284,7 +298,10 @@ impl<Message: 'static> Table<Message> {
         if self.enabled && selected.is_some() {
             root
         } else {
-            root.with_id(root_id)
+            root.with_id(root_id.clone()).on_actions(
+                root_id,
+                descriptors.map(|descriptor| Action::new(descriptor, |_| EventResult::ignored())),
+            )
         }
     }
 }
@@ -299,6 +316,7 @@ fn virtual_table_body<Message: 'static>(
     enabled: bool,
     style: TableStyle,
     on_select: Arc<dyn Fn(usize) -> Message>,
+    descriptors: [ActionDescriptor; 5],
     viewport_id: NodeId,
     height: Length,
 ) -> Node<Message> {
@@ -332,6 +350,7 @@ fn virtual_table_body<Message: 'static>(
                         style,
                         &root_id,
                         &on_select,
+                        &descriptors,
                     )
                 })),
                 Insets::new(u32::try_from(start).unwrap_or(u32::MAX), 0, 0, 0),
@@ -339,13 +358,14 @@ fn virtual_table_body<Message: 'static>(
             let mut layers = vec![visible_rows];
             if enabled {
                 if let Some(index) = selected.filter(|index| *index < start || *index >= end) {
-                    let proxy = table_navigation_target(
+                    let proxy = table_action_target(
                         Node::spacer(0, 1),
                         root_id.clone(),
                         rows.len(),
                         index,
                         None,
                         Arc::clone(&on_select),
+                        descriptors.clone(),
                     );
                     layers.push(Node::padding(
                         proxy,
@@ -371,6 +391,7 @@ fn virtual_table_row<Message: 'static>(
     style: TableStyle,
     root_id: &NodeId,
     on_select: &Arc<dyn Fn(usize) -> Message>,
+    descriptors: &[ActionDescriptor; 5],
 ) -> Node<Message> {
     let row = &rows[index];
     let is_selected = selected == Some(index);
@@ -391,7 +412,7 @@ fn virtual_table_row<Message: 'static>(
     let click_focus = root_id.clone();
     let click_select = Arc::clone(on_select);
     let row = node.with_id(row_id.clone()).on_event(row_id, move |event| {
-        if !is_activation_event(event) {
+        if !is_pointer_activation_event(event) {
             return EventResult::ignored();
         }
         EventResult::message(click_select(index)).focus(click_focus.clone())
@@ -399,42 +420,73 @@ fn virtual_table_row<Message: 'static>(
     if !is_selected {
         return row.with_length(Length::Fixed(1));
     }
-    table_navigation_target(
+    table_action_target(
         Node::column([row]),
         root_id.clone(),
         rows.len(),
         index,
         Some(style.focused),
         Arc::clone(on_select),
+        descriptors.clone(),
     )
     .with_length(Length::Fixed(1))
 }
 
-fn table_navigation_target<Message: 'static>(
+fn table_action_target<Message: 'static>(
     node: Node<Message>,
     root_id: NodeId,
     row_count: usize,
     index: usize,
     focused_style: Option<Style>,
     on_select: Arc<dyn Fn(usize) -> Message>,
+    descriptors: [ActionDescriptor; 5],
 ) -> Node<Message> {
-    let navigation_focus = root_id.clone();
-    let mut node = node
-        .focusable(root_id.clone())
-        .on_event(root_id, move |event| {
-            let Some(next) = navigate_event(event, row_count, index) else {
-                return EventResult::ignored();
-            };
-            let mut result = EventResult::consumed().focus(navigation_focus.clone());
-            if next != index {
-                result = result.emit(on_select(next));
-            }
-            result
-        });
+    let mut node = node.focusable(root_id.clone()).on_actions(
+        root_id.clone(),
+        table_actions(descriptors, root_id, row_count, index, on_select),
+    );
     if let Some(style) = focused_style {
         node = node.with_focused_style(style);
     }
     node
+}
+
+fn table_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; 5],
+    root_id: NodeId,
+    row_count: usize,
+    index: usize,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+) -> impl Iterator<Item = Action<Message>> {
+    descriptors
+        .into_iter()
+        .zip(COLLECTION_ACTIONS)
+        .map(move |(descriptor, action)| {
+            let focus_id = root_id.clone();
+            let on_select = Arc::clone(&on_select);
+            Action::new(descriptor, move |_| {
+                table_action_result(action, &focus_id, row_count, index, on_select.as_ref())
+            })
+        })
+}
+
+fn table_action_result<Message>(
+    action: CollectionAction,
+    focus_id: &NodeId,
+    row_count: usize,
+    index: usize,
+    on_select: &dyn Fn(usize) -> Message,
+) -> EventResult<Message> {
+    let result = EventResult::consumed().focus(focus_id.clone());
+    let Some(navigation) = action.navigation() else {
+        return result.emit(on_select(index));
+    };
+    let next = navigate(row_count, index, navigation).unwrap_or(index);
+    if next == index {
+        result
+    } else {
+        result.emit(on_select(next))
+    }
 }
 
 fn table_row<Message>(

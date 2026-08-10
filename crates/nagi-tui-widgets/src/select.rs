@@ -1,9 +1,49 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use nagi_tui::{Event, EventResult, KeyAction, KeyCode, Node, NodeId, Style};
+use nagi_tui::{
+    Action, ActionAvailability, ActionDescriptor, EventResult, KeyCode, Node, NodeId, Style,
+};
 
-use crate::event::is_activation_event;
+use crate::action::{
+    SELECTION_FIRST_ACTION_ID, SELECTION_FIRST_ACTION_LABEL, SELECTION_LAST_ACTION_ID,
+    SELECTION_LAST_ACTION_LABEL, SELECTION_NEXT_ACTION_ID, SELECTION_NEXT_ACTION_LABEL,
+    SELECTION_PREVIOUS_ACTION_ID, SELECTION_PREVIOUS_ACTION_LABEL, activate_action_descriptor,
+    repeatable_action_binding,
+};
+use crate::event::is_pointer_activation_event;
 use crate::navigation::{Navigation, navigate};
+
+static SELECT_NAVIGATION_ACTION_DESCRIPTORS: LazyLock<[ActionDescriptor; 4]> =
+    LazyLock::new(|| {
+        [
+            ActionDescriptor::new(
+                SELECTION_PREVIOUS_ACTION_ID,
+                SELECTION_PREVIOUS_ACTION_LABEL,
+                [
+                    repeatable_action_binding(KeyCode::Left),
+                    repeatable_action_binding(KeyCode::Up),
+                ],
+            ),
+            ActionDescriptor::new(
+                SELECTION_NEXT_ACTION_ID,
+                SELECTION_NEXT_ACTION_LABEL,
+                [
+                    repeatable_action_binding(KeyCode::Right),
+                    repeatable_action_binding(KeyCode::Down),
+                ],
+            ),
+            ActionDescriptor::new(
+                SELECTION_FIRST_ACTION_ID,
+                SELECTION_FIRST_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Home)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_LAST_ACTION_ID,
+                SELECTION_LAST_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::End)],
+            ),
+        ]
+    });
 
 /// Visual styles used by a [`Select`]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,7 +72,10 @@ impl Default for SelectStyle {
     }
 }
 
-/// A compact selector that exposes one application-owned option at a time
+/// A compact selector with semantic keyboard and raw pointer selection
+///
+/// Keyboard handling declares standard activation and selection actions.
+/// Left-button press remains raw so keyboard rebinding does not remove it
 pub struct Select<Message> {
     id: NodeId,
     options: Vec<String>,
@@ -84,6 +127,15 @@ impl<Message: 'static> Select<Message> {
         self
     }
 
+    /// Returns the ordered semantic action descriptors declared by this selector
+    ///
+    /// The order is activate, previous, next, first, and last. Every descriptor
+    /// is disabled-pass-through when the selector is disabled or empty
+    #[must_use]
+    pub fn action_descriptors(&self) -> [ActionDescriptor; 5] {
+        select_action_descriptors(self.enabled && !self.options.is_empty())
+    }
+
     /// Builds the public semantic node for this selector
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
@@ -92,50 +144,149 @@ impl<Message: 'static> Select<Message> {
             || format!("< {} >", self.placeholder),
             |index| format!("< {} >", self.options[index]),
         );
+        let descriptors = self.action_descriptors();
         let Some(selected) = selected.filter(|_| self.enabled) else {
-            return Node::styled_text(content, self.style.disabled).with_id(self.id);
+            let id = self.id;
+            return Node::styled_text(content, self.style.disabled)
+                .with_id(id.clone())
+                .on_actions(
+                    id,
+                    descriptors
+                        .map(|descriptor| Action::new(descriptor, |_| EventResult::ignored())),
+                );
         };
 
         let id = self.id;
-        let focus_id = id.clone();
         let count = self.options.len();
         let on_select = self.on_select;
+        let actions = descriptors
+            .into_iter()
+            .zip(SELECT_ACTIONS)
+            .map(|(descriptor, action)| {
+                select_action(
+                    descriptor,
+                    action,
+                    count,
+                    selected,
+                    id.clone(),
+                    Arc::clone(&on_select),
+                )
+            });
+        let pointer_focus_id = id.clone();
+        let pointer_select = Arc::clone(&on_select);
         Node::styled_text(content, self.style.normal)
             .focusable(id.clone())
             .with_focused_style(self.style.focused)
+            .on_actions(id.clone(), actions)
             .on_event(id, move |event| {
-                let Some(next) = select_event(event, count, selected) else {
+                if !is_pointer_activation_event(event) {
                     return EventResult::ignored();
-                };
-                let mut result = EventResult::consumed().focus(focus_id.clone());
-                if next != selected {
-                    result = result.emit(on_select(next));
                 }
-                result
+                select_action_result(
+                    SelectAction::Activate,
+                    count,
+                    selected,
+                    &pointer_focus_id,
+                    pointer_select.as_ref(),
+                )
             })
     }
 }
 
-fn select_event(event: &Event, count: usize, selected: usize) -> Option<usize> {
-    if is_activation_event(event) {
-        return Some((selected + 1) % count);
-    }
-    let Event::Key(key) = event else {
-        return None;
+#[derive(Clone, Copy)]
+enum SelectAction {
+    Activate,
+    Previous,
+    Next,
+    First,
+    Last,
+}
+
+const SELECT_ACTIONS: [SelectAction; 5] = [
+    SelectAction::Activate,
+    SelectAction::Previous,
+    SelectAction::Next,
+    SelectAction::First,
+    SelectAction::Last,
+];
+
+fn select_action_descriptors(enabled: bool) -> [ActionDescriptor; 5] {
+    let availability = if enabled {
+        ActionAvailability::Enabled
+    } else {
+        ActionAvailability::DisabledPassThrough
     };
-    if key.action == KeyAction::Release
-        || key.modifiers.alt
-        || key.modifiers.control
-        || key.modifiers.meta
-    {
-        return None;
-    }
-    let action = match key.code {
-        KeyCode::Left | KeyCode::Up => Navigation::Up,
-        KeyCode::Right | KeyCode::Down => Navigation::Down,
-        KeyCode::Home => Navigation::Home,
-        KeyCode::End => Navigation::End,
-        _ => return None,
+    [
+        activate_action_descriptor().with_availability(availability),
+        SELECT_NAVIGATION_ACTION_DESCRIPTORS[0]
+            .clone()
+            .with_availability(availability),
+        SELECT_NAVIGATION_ACTION_DESCRIPTORS[1]
+            .clone()
+            .with_availability(availability),
+        SELECT_NAVIGATION_ACTION_DESCRIPTORS[2]
+            .clone()
+            .with_availability(availability),
+        SELECT_NAVIGATION_ACTION_DESCRIPTORS[3]
+            .clone()
+            .with_availability(availability),
+    ]
+}
+
+fn select_action<Message: 'static>(
+    descriptor: ActionDescriptor,
+    action: SelectAction,
+    count: usize,
+    selected: usize,
+    focus_id: NodeId,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+) -> Action<Message> {
+    Action::new(descriptor, move |_| {
+        select_action_result(action, count, selected, &focus_id, on_select.as_ref())
+    })
+}
+
+fn select_action_result<Message>(
+    action: SelectAction,
+    count: usize,
+    selected: usize,
+    focus_id: &NodeId,
+    on_select: &dyn Fn(usize) -> Message,
+) -> EventResult<Message> {
+    let next = match action {
+        SelectAction::Activate => (selected + 1) % count,
+        SelectAction::Previous => navigate(count, selected, Navigation::Up).unwrap_or(selected),
+        SelectAction::Next => navigate(count, selected, Navigation::Down).unwrap_or(selected),
+        SelectAction::First => navigate(count, selected, Navigation::Home).unwrap_or(selected),
+        SelectAction::Last => navigate(count, selected, Navigation::End).unwrap_or(selected),
     };
-    navigate(count, selected, action)
+    let result = EventResult::consumed().focus(focus_id.clone());
+    if next == selected {
+        result
+    } else {
+        result.emit(on_select(next))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_action_descriptors;
+
+    #[test]
+    fn navigation_descriptor_clones_reuse_immutable_storage() {
+        let first = select_action_descriptors(true);
+        let second = select_action_descriptors(false);
+
+        for index in 1..first.len() {
+            assert!(std::ptr::eq(
+                first[index].id().as_str(),
+                second[index].id().as_str()
+            ));
+            assert!(std::ptr::eq(first[index].label(), second[index].label()));
+            assert!(std::ptr::eq(
+                first[index].default_bindings(),
+                second[index].default_bindings()
+            ));
+        }
+    }
 }

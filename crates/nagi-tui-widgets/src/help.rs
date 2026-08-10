@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use nagi_text::{WidthProfile, text_width};
-use nagi_tui::{Node, Style};
+use nagi_tui::{ActionAvailability, BindingSupport, Node, ResolvedAction, Style};
 
 /// Arrangement of key bindings in a [`Help`] view
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -118,6 +118,30 @@ impl<Message> Help<Message> {
         }
     }
 
+    /// Creates compact help from Help-visible resolved actions
+    ///
+    /// Each effective key becomes one binding in action and binding order
+    /// without duplicating key notation. Unavailable actions and bindings with
+    /// unsupported terminal metadata become disabled Help bindings
+    #[must_use]
+    pub fn from_resolved_actions<'a>(
+        actions: impl IntoIterator<Item = &'a ResolvedAction>,
+    ) -> Self {
+        let mut bindings = Vec::new();
+        for action in actions {
+            if !action.is_help_visible() {
+                continue;
+            }
+            let action_enabled = action.availability() == ActionAvailability::Enabled;
+            bindings.extend(action.bindings().iter().map(|binding| HelpBinding {
+                key: binding.stroke().notation(),
+                description: action.label().to_owned(),
+                enabled: action_enabled && binding.support() != BindingSupport::Unsupported,
+            }));
+        }
+        Self::new(bindings)
+    }
+
     /// Replaces the binding arrangement
     #[must_use]
     pub const fn mode(mut self, mode: HelpMode) -> Self {
@@ -194,4 +218,43 @@ fn full_node<Message>(bindings: Vec<HelpBinding>, style: HelpStyle) -> Node<Mess
             Node::styled_text(binding.description, description_style),
         ])
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use nagi_tui::{
+        ActionDescriptor, BindingSupport, KeyBinding, KeyStroke, Modifiers, NodeId, resolve_actions,
+    };
+
+    use super::*;
+
+    #[test]
+    fn resolved_help_filters_hidden_actions_and_disables_unsupported_bindings() {
+        let visible = ActionDescriptor::new(
+            "app.visible",
+            "Visible",
+            [
+                KeyBinding::new(KeyStroke::character('u', Modifiers::NONE))
+                    .with_support(BindingSupport::Unsupported),
+                KeyBinding::new(KeyStroke::character('v', Modifiers::NONE)),
+            ],
+        );
+        let hidden = ActionDescriptor::new(
+            "app.hidden",
+            "Hidden",
+            [KeyBinding::new(KeyStroke::character('h', Modifiers::NONE))],
+        )
+        .with_help_visible(false);
+        let resolved = resolve_actions(&NodeId::from("owner"), &[visible, hidden], &[]).unwrap();
+
+        let help = Help::<()>::from_resolved_actions(resolved.actions());
+
+        assert_eq!(
+            help.bindings
+                .iter()
+                .map(|binding| (binding.key(), binding.description(), binding.is_enabled()))
+                .collect::<Vec<_>>(),
+            [("u", "Visible", false), ("v", "Visible", true)]
+        );
+    }
 }

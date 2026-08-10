@@ -1,8 +1,9 @@
-//! Application, semantic view, interaction, effects, subscriptions, and
-//! terminal runtime facade for Nagi TUI
+//! Application, semantic view, scoped key maps, interaction, effects,
+//! subscriptions, and terminal runtime facade for Nagi TUI
 
 #![deny(unsafe_code)]
 
+mod action_routing;
 mod ansi_text;
 mod app;
 mod clock;
@@ -10,6 +11,7 @@ mod effect;
 mod identity;
 mod input;
 mod interaction;
+mod keymap;
 mod layout;
 mod node;
 mod panel;
@@ -36,6 +38,11 @@ pub use effect::{CancelToken, Effect, ScopeId, Task, TaskKey};
 pub use identity::NodeId;
 pub use input::{EventAction, TimedInputDecoder};
 pub use interaction::{InteractionState, ScrollAxis, ScrollOffset, ScrollState, TextInputState};
+pub use keymap::{
+    Action, ActionAvailability, ActionDescriptor, ActionEvent, ActionId, BindingConflict,
+    BindingConflictKind, BindingSupport, KeyBinding, KeyMap, KeyMapError, KeyScope,
+    KeyScopePropagation, KeyStroke, RepeatPolicy, ResolvedAction, ResolvedActions, resolve_actions,
+};
 pub use layout::Length;
 pub use nagi_surface::{Point, Rect, Size, Surface};
 pub use nagi_vt::{

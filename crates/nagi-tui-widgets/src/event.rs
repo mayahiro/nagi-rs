@@ -13,6 +13,14 @@ pub(crate) fn is_activation_event(event: &Event) -> bool {
     }
 }
 
+pub(crate) fn is_pointer_activation_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Mouse(mouse)
+            if mouse.kind == MouseKind::Press && mouse.button == MouseButton::Left
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use nagi_tui::{KeyEvent, KeyProtocol, MouseEvent};
