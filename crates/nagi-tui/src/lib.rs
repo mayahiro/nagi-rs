@@ -1,5 +1,6 @@
-//! Application, semantic view, scoped key maps, interaction, effects,
-//! subscriptions, and terminal runtime facade for Nagi TUI
+//! Terminal Presentation Rules, application, semantic view, scoped key maps,
+//! interaction, effects, subscriptions, and terminal runtime facade for Nagi
+//! TUI
 
 #![deny(unsafe_code)]
 
@@ -16,6 +17,7 @@ mod keymap;
 mod layout;
 mod node;
 mod panel;
+mod presentation;
 mod renderer;
 mod rich_text;
 mod routing;
@@ -71,6 +73,11 @@ pub use node::{
     ScrollViewportOptions, VerticalAlignment, VirtualFragment, VirtualViewport,
 };
 pub use panel::{BorderKind, PanelOptions, PanelStyle};
+pub use presentation::{
+    ComputedPresentation, DeclarationValue, DuplicatePresentationState, PresentationDeclaration,
+    PresentationDisplay, PresentationRule, PresentationSelector, PresentationSheet,
+    PresentationState, TextStyleDeclaration,
+};
 pub use rich_text::{ParagraphOptions, TextSpan, WrapMode};
 pub use routing::{EventDispatch, EventResult};
 pub use runtime::{

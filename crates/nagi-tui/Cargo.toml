@@ -13,6 +13,7 @@ missing_docs = "deny"
 unsafe_code = "allow"
 
 [dependencies]
+nagi-content = { path = "../nagi-content", version = "0.2.7" }
 nagi-surface = { path = "../nagi-surface", version = "0.2.7" }
 nagi-text = { path = "../nagi-text", version = "0.2.7" }
 nagi-vt = { path = "../nagi-vt", version = "0.2.7" }

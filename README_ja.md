@@ -48,7 +48,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-text` | Unicode 17 grapheme、terminal幅profile、wrap、truncate、位置変換 |
 | `nagi-vt` | Typed terminal input／output、Color、Attributes、Style |
 | `nagi-surface` | Geometry、Cell、Surface描画、composition、diff、snapshot |
-| `nagi-tui` | App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
+| `nagi-tui` | Terminal Presentation Rules、App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
 | `nagi-tui-widgets` | Public TUI APIから構築した27個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
 | `nagi-cli` | Command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、段階実行Runtime Policy、process統合 |
@@ -81,6 +81,7 @@ Rust repository rootから実行します
 | Example | Command |
 | --- | --- |
 | [Source-neutral Content](crates/nagi-content/examples/content/README.md) | `cargo run -p nagi-content --example content` |
+| [Terminal Presentation Rules](crates/nagi-tui/examples/presentation/README.md) | `cargo run -p nagi-tui --example presentation` |
 | [Counter](crates/nagi-tui/examples/counter/README.md) | `cargo run -p nagi-tui --example counter` |
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |

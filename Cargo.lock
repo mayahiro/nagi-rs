@@ -39,6 +39,7 @@ version = "0.2.7"
 name = "nagi-tui"
 version = "0.2.7"
 dependencies = [
+ "nagi-content",
  "nagi-surface",
  "nagi-text",
  "nagi-vt",
