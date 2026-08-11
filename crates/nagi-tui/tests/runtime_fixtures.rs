@@ -6,9 +6,10 @@ use nagi_tui::{
     Action, ActionAvailability, ActionDescriptor, ActionId, App, BindingConflictKind, Capabilities,
     Effect, Event, EventResult, FOCUS_NEXT_ACTION_ID, FOCUS_PREVIOUS_ACTION_ID, Insets, KeyAction,
     KeyBinding, KeyCode, KeyEvent, KeyMap, KeyProtocol, KeyScope, KeyScopePropagation, KeyStroke,
-    Length, Modifiers, MouseButton, MouseEvent, MouseKind, Node, NodeId, Runtime, RuntimeError,
-    RuntimeEventError, SCROLL_PAGE_DOWN_ACTION_ID, ScrollAxis, ScrollOffset, ScrollViewportOptions,
-    Size, Style, Subscription, VirtualClock, encode,
+    Length, ModalFocusOptions, ModalInitialFocus, ModalReturnFocus, Modifiers, MouseButton,
+    MouseEvent, MouseKind, Node, NodeId, Runtime, RuntimeError, RuntimeEventError,
+    SCROLL_PAGE_DOWN_ACTION_ID, ScrollAxis, ScrollOffset, ScrollViewportOptions, Size, Style,
+    Subscription, VirtualClock, encode,
 };
 
 #[derive(Default)]
@@ -135,6 +136,161 @@ fn text_input_cursor_snapshot_matches_shared_fixture() {
             record.id
         );
     }
+}
+
+struct ModalFocusFixtureApp {
+    view: String,
+    first: ModalFocusOptions,
+    second: ModalFocusOptions,
+}
+
+impl App for ModalFocusFixtureApp {
+    type Message = String;
+
+    fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        let background = modal_focus_background();
+        match self.view.as_str() {
+            "base" => background,
+            "a" => Node::stack([background, modal_focus_node("a", self.first.clone(), false)]),
+            "a-empty" => Node::stack([background, modal_focus_node("a", self.first.clone(), true)]),
+            "b" => Node::stack([
+                background,
+                modal_focus_node("b", self.second.clone(), false),
+            ]),
+            "a+b" => Node::stack([
+                background,
+                modal_focus_node("a", self.first.clone(), false),
+                modal_focus_node("b", self.second.clone(), false),
+            ]),
+            "a>b" => Node::stack([
+                background,
+                Node::modal_with_focus(
+                    "modal-a",
+                    Node::column([
+                        modal_focus_content("a"),
+                        modal_focus_node("b", self.second.clone(), false),
+                    ]),
+                    self.first.clone(),
+                ),
+            ]),
+            view => panic!("unknown modal focus fixture view {view}"),
+        }
+    }
+}
+
+#[test]
+fn modal_focus_lifecycle_matches_shared_fixtures() {
+    let Some(records) = support::load(
+        "interaction/modal-focus-lifecycle.txt",
+        "modal-focus-lifecycle",
+        &[
+            "views",
+            "focus",
+            "a-initial",
+            "a-return",
+            "b-initial",
+            "b-return",
+            "expected",
+        ],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let views = fixture_list(record.field("views"));
+        let expected = fixture_list(record.field("expected"));
+        assert_eq!(views.len(), expected.len(), "case {}", record.id);
+        let mut runtime = Runtime::with_clock(
+            ModalFocusFixtureApp {
+                view: views[0].clone(),
+                first: modal_focus_options(record.field("a-initial"), record.field("a-return")),
+                second: modal_focus_options(record.field("b-initial"), record.field("b-return")),
+            },
+            nagi_tui::RuntimeConfig::new(Size::new(30, 8)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        if record.field("focus") != "none" {
+            assert!(
+                runtime
+                    .request_focus(&NodeId::from(record.field("focus")))
+                    .unwrap(),
+                "case {} initial focus",
+                record.id
+            );
+        }
+        assert_modal_fixture_focus(&runtime, &expected[0], &record.id, 0);
+
+        for (step, view) in views.iter().enumerate().skip(1) {
+            runtime.app_mut().view.clone_from(view);
+            runtime.request_frame();
+            runtime.render_if_dirty().unwrap();
+            assert_modal_fixture_focus(&runtime, &expected[step], &record.id, step);
+        }
+    }
+}
+
+fn modal_focus_background() -> Node<String> {
+    Node::column([
+        Node::text("background first").focusable("background-first"),
+        Node::text("opener").focusable("opener"),
+        Node::text("background target").focusable("background-target"),
+    ])
+}
+
+fn modal_focus_content(prefix: &str) -> Node<String> {
+    Node::column([
+        Node::text(format!("{prefix} first")).focusable(format!("{prefix}-first")),
+        Node::text(format!("{prefix} target")).focusable(format!("{prefix}-target")),
+    ])
+}
+
+fn modal_focus_node(prefix: &str, focus: ModalFocusOptions, empty: bool) -> Node<String> {
+    let child = if empty {
+        Node::text(format!("{prefix} empty"))
+    } else {
+        modal_focus_content(prefix)
+    };
+    Node::modal_with_focus(format!("modal-{prefix}"), child, focus)
+}
+
+fn modal_focus_options(initial: &str, return_focus: &str) -> ModalFocusOptions {
+    ModalFocusOptions {
+        initial: match initial {
+            "first" => ModalInitialFocus::First,
+            "none" => ModalInitialFocus::None,
+            value => ModalInitialFocus::Target(NodeId::from(
+                value
+                    .strip_prefix("target/")
+                    .unwrap_or_else(|| panic!("invalid modal initial focus {value}")),
+            )),
+        },
+        return_focus: match return_focus {
+            "previous" => ModalReturnFocus::Previous,
+            "none" => ModalReturnFocus::None,
+            value => ModalReturnFocus::Target(NodeId::from(
+                value
+                    .strip_prefix("target/")
+                    .unwrap_or_else(|| panic!("invalid modal return focus {value}")),
+            )),
+        },
+    }
+}
+
+fn assert_modal_fixture_focus(
+    runtime: &Runtime<ModalFocusFixtureApp, VirtualClock>,
+    expected: &str,
+    case: &str,
+    step: usize,
+) {
+    let actual = runtime.interaction().focused().map(NodeId::as_str);
+    let expected = (expected != "none").then_some(expected);
+    assert_eq!(actual, expected, "case {case} step {step}");
 }
 
 struct KeyRoutingApp {
@@ -376,7 +532,17 @@ fn focus_navigation_view(scenario: &str) -> Node<String> {
                 .unwrap();
             content.with_key_scope(KeyScope::new("root", key_map))
         }
-        "focus-modal-no-focus" => Node::padding(Node::modal("modal", content), Insets::all(0)),
+        "focus-modal-no-focus" => Node::padding(
+            Node::modal_with_focus(
+                "modal",
+                content,
+                ModalFocusOptions {
+                    initial: ModalInitialFocus::None,
+                    ..ModalFocusOptions::default()
+                },
+            ),
+            Insets::all(0),
+        ),
         _ => content,
     }
 }
@@ -469,6 +635,129 @@ fn core_scroll_options(axis: ScrollAxis, message: &'static str) -> ScrollViewpor
         on_scroll: Some(Box::new(move |_| message.to_owned())),
         ..ScrollViewportOptions::default()
     }
+}
+
+struct RevealRuntimeApp {
+    lines: u32,
+    viewport: u32,
+    prior_reveal: Option<NodeId>,
+    reveal: Option<NodeId>,
+    focus: Option<NodeId>,
+    ensure_focus: bool,
+    stick_to_end: bool,
+    updates: Vec<String>,
+}
+
+impl App for RevealRuntimeApp {
+    type Message = String;
+
+    fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+        self.updates.push(message);
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        let rows = (0..self.lines).map(|index| {
+            let id = NodeId::new(format!("row-{index}"));
+            let row = Node::text(index.to_string()).with_id(id.clone());
+            let row = if self.focus.as_ref() == Some(&id) {
+                row.focusable(id)
+            } else {
+                row
+            };
+            row.with_length(Length::Fixed(1))
+        });
+        let mut viewport = Node::scroll_viewport_with_options(
+            "viewport",
+            Node::column(rows),
+            ScrollViewportOptions {
+                axis: ScrollAxis::Vertical,
+                stick_to_end: self.stick_to_end,
+                ensure_focused_visible: self.ensure_focus,
+                on_scroll: Some(Box::new(|_| "user-scroll".to_owned())),
+            },
+        );
+        if let Some(target) = &self.prior_reveal {
+            viewport = viewport.reveal_descendant(target.clone());
+        }
+        if let Some(target) = &self.reveal {
+            viewport = viewport.reveal_descendant(target.clone());
+        }
+        Node::column([
+            viewport.with_length(Length::Fixed(self.viewport)),
+            Node::text("outside")
+                .with_id("outside")
+                .with_length(Length::Fixed(1)),
+        ])
+    }
+}
+
+#[test]
+fn explicit_reveal_targets_match_shared_fixtures() {
+    let Some(records) = support::load(
+        "interaction/reveal-runtime.txt",
+        "interaction-reveal-runtime",
+        &[
+            "lines",
+            "viewport",
+            "prior-reveal",
+            "reveal",
+            "focus",
+            "ensure-focus",
+            "stick-end",
+            "expected-offset",
+            "expected-top",
+        ],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let viewport = number(record.field("viewport"));
+        let focus = fixture_node_id(record.field("focus"));
+        let mut runtime = Runtime::with_clock(
+            RevealRuntimeApp {
+                lines: number(record.field("lines")),
+                viewport,
+                prior_reveal: fixture_node_id(record.field("prior-reveal")),
+                reveal: fixture_node_id(record.field("reveal")),
+                focus: focus.clone(),
+                ensure_focus: record.field("ensure-focus") == "true",
+                stick_to_end: record.field("stick-end") == "true",
+                updates: Vec::new(),
+            },
+            nagi_tui::RuntimeConfig::new(Size::new(8, viewport.saturating_add(1))),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        let mut frame = runtime.render_if_dirty().unwrap().unwrap();
+        if let Some(focus) = focus {
+            assert!(runtime.request_focus(&focus).unwrap(), "case {}", record.id);
+            frame = runtime.render_if_dirty().unwrap().unwrap();
+        }
+
+        assert_eq!(
+            runtime
+                .interaction()
+                .scroll_offset(&NodeId::from("viewport"))
+                .y,
+            number(record.field("expected-offset")),
+            "case {}",
+            record.id
+        );
+        assert_eq!(
+            frame.surface().cell(0, 0).unwrap().content(),
+            record.field("expected-top"),
+            "case {}",
+            record.id
+        );
+        assert_eq!(runtime.queued_messages(), 0, "case {}", record.id);
+        assert!(runtime.app().updates.is_empty(), "case {}", record.id);
+    }
+}
+
+fn fixture_node_id(value: &str) -> Option<NodeId> {
+    (value != "-").then(|| NodeId::new(value))
 }
 
 fn core_fixture_action(code: KeyCode, ignored: bool) -> Action<String> {

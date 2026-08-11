@@ -63,6 +63,18 @@ pub const EXPAND_ACTION_ID: &str = "nagi.expand";
 /// Stable Action ID for dismissing the current transient surface
 pub const DISMISS_ACTION_ID: &str = "nagi.dismiss";
 
+/// Stable Action ID for invoking a dialog's explicit default action
+pub const CONFIRM_ACTION_ID: &str = "nagi.confirm";
+
+/// Stable Action ID for submitting a Composer value
+pub const COMPOSER_SUBMIT_ACTION_ID: &str = "nagi.composer.submit";
+
+/// Stable Action ID for recalling the previous history entry
+pub const HISTORY_PREVIOUS_ACTION_ID: &str = "nagi.history.previous";
+
+/// Stable Action ID for recalling the next history entry
+pub const HISTORY_NEXT_ACTION_ID: &str = "nagi.history.next";
+
 pub(crate) const ACTIVATE_ACTION_LABEL: &str = "Activate";
 pub(crate) const SELECTION_PREVIOUS_ACTION_LABEL: &str = "Previous";
 pub(crate) const SELECTION_NEXT_ACTION_LABEL: &str = "Next";
@@ -98,6 +110,17 @@ static DISMISS_ACTION_DESCRIPTOR: LazyLock<ActionDescriptor> = LazyLock::new(|| 
         DISMISS_ACTION_ID,
         "Dismiss",
         [repeatable_action_binding(KeyCode::Escape)],
+    )
+});
+
+static CONFIRM_ACTION_DESCRIPTOR: LazyLock<ActionDescriptor> = LazyLock::new(|| {
+    ActionDescriptor::new(
+        CONFIRM_ACTION_ID,
+        "Confirm",
+        [KeyBinding::new(KeyStroke::new(
+            KeyCode::Enter,
+            Modifiers::NONE,
+        ))],
     )
 });
 
@@ -174,6 +197,15 @@ pub fn dismiss_action_descriptor() -> ActionDescriptor {
     DISMISS_ACTION_DESCRIPTOR.clone()
 }
 
+/// Returns the enabled standard dialog-confirmation descriptor
+///
+/// Exact unmodified Enter is the default binding. Explicit repeat events are
+/// ignored by this root action
+#[must_use]
+pub fn confirm_action_descriptor() -> ActionDescriptor {
+    CONFIRM_ACTION_DESCRIPTOR.clone()
+}
+
 pub(crate) fn repeatable_action_binding(code: KeyCode) -> KeyBinding {
     KeyBinding::new(KeyStroke::new(code, Modifiers::NONE))
         .with_repeat_policy(RepeatPolicy::AllowRepeat)
@@ -208,7 +240,11 @@ mod tests {
 
     #[test]
     fn standard_descriptor_clones_reuse_immutable_storage() {
-        for descriptor in [activate_action_descriptor, dismiss_action_descriptor] {
+        for descriptor in [
+            activate_action_descriptor,
+            confirm_action_descriptor,
+            dismiss_action_descriptor,
+        ] {
             let first = descriptor();
             let second = descriptor();
 

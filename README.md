@@ -49,7 +49,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-vt` | Typed terminal input/output, Color, Attributes, and Style |
 | `nagi-surface` | Geometry, Cells, Surface drawing, composition, diffing, and snapshots |
 | `nagi-tui` | App lifecycle, semantic nodes, scoped key maps, layout, events, Effects, Subscriptions, and terminal loop |
-| `nagi-tui-widgets` | 21 standard widgets built from the public TUI API |
+| `nagi-tui-widgets` | 25 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
 | `nagi-cli` | Command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, staged Runtime Policy, and process integration |
 | `nagi-cli-test` | Process-free CLI input injection and output capture |
@@ -111,7 +111,27 @@ suspend and resume, and `/dev/tty` acquisition are not supported
 
 `ScrollViewport` clips and scrolls an eager child tree. Large data sets can use
 `Node::virtual_scroll_viewport`, which declares the complete cell extent and
-constructs only the current visible or bounded-overscan `VirtualFragment`
+constructs only the current visible or bounded-overscan `VirtualFragment`.
+`Node::reveal_descendant` keeps a stable descendant ID visible without moving
+focus; virtual targets must be present in the current fragment
+
+`TextArea` keeps no-wrap behavior by default. `soft_wrap` adds visual-line
+navigation, `boundary_navigation` can pass Up and Down through at visual
+boundaries, and `viewport` follows an application-identified caret without an
+extra Tab stop
+
+`Composer` adds controlled submit and history recall, automatic row bounds,
+optional validation content, and insertion limits over `TextArea`. Applications
+retain ownership of message meaning, history persistence, and sensitive-value
+policy
+
+`Disclosure` keeps expanded state in the application and constructs its body
+only while expanded. Core Modal scopes focus their first descendant on entry
+and return to previous focus on close by default; both targets are configurable
+
+`Dialog` composes application-defined action lists, lazy controlled details,
+explicit default and cancel targets, focus policies, and Cell-width action
+wrapping. `ConfirmDialog` is the explicit-default two-action convenience
 
 CLI process integration supports Linux and macOS, preserves Unix argument
 values, and converts SIGINT into cooperative cancellation. Shell completion,

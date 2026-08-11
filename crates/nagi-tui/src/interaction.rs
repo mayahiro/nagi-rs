@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::NodeId;
+use crate::{ModalFocusOptions, ModalInitialFocus, ModalReturnFocus, NodeId};
 
 #[cfg(test)]
 use crate::fixture_support;
@@ -119,6 +119,19 @@ pub struct InteractionState {
     pub(crate) pointer_capture: Option<NodeId>,
     pub(crate) text_inputs: HashMap<NodeId, TextInputState>,
     pub(crate) scrolls: HashMap<NodeId, ScrollInteraction>,
+    modal_focus_stack: Vec<ModalFocusFrame>,
+}
+
+#[derive(Clone, Debug)]
+struct ModalFocusFrame {
+    id: NodeId,
+    return_focus: Option<NodeId>,
+}
+
+enum FocusLifecycleTransition {
+    Stable,
+    Enter(ModalInitialFocus),
+    Exit(Option<NodeId>),
 }
 
 impl InteractionState {
@@ -226,12 +239,51 @@ impl InteractionState {
         active: &HashSet<NodeId>,
         previous_focus_order: &[NodeId],
         current_focus_order: &[NodeId],
+        active_modal: Option<(&NodeId, &ModalFocusOptions)>,
+        focus_fallback: Option<&NodeId>,
     ) {
-        self.focused = reconcile_focus(
-            previous_focus_order,
-            current_focus_order,
-            self.focused.as_ref(),
-        );
+        let transition = self.reconcile_modal_focus(active, active_modal);
+        self.focused = match transition {
+            FocusLifecycleTransition::Enter(ModalInitialFocus::First) => {
+                current_focus_order.first().cloned()
+            }
+            FocusLifecycleTransition::Enter(ModalInitialFocus::Target(target)) => {
+                if current_focus_order.contains(&target) {
+                    Some(target)
+                } else {
+                    current_focus_order.first().cloned()
+                }
+            }
+            FocusLifecycleTransition::Enter(ModalInitialFocus::None) => None,
+            FocusLifecycleTransition::Exit(Some(target)) => {
+                if current_focus_order.contains(&target) {
+                    Some(target)
+                } else {
+                    reconcile_focus(
+                        previous_focus_order,
+                        current_focus_order,
+                        self.focused.as_ref(),
+                    )
+                }
+            }
+            FocusLifecycleTransition::Exit(None) => None,
+            FocusLifecycleTransition::Stable => {
+                if self
+                    .focused
+                    .as_ref()
+                    .is_some_and(|focused| !current_focus_order.contains(focused))
+                    && focus_fallback.is_some_and(|target| current_focus_order.contains(target))
+                {
+                    focus_fallback.cloned()
+                } else {
+                    reconcile_focus(
+                        previous_focus_order,
+                        current_focus_order,
+                        self.focused.as_ref(),
+                    )
+                }
+            }
+        };
         if self
             .pointer_capture
             .as_ref()
@@ -241,6 +293,57 @@ impl InteractionState {
         }
         self.text_inputs.retain(|id, _| active.contains(id));
         self.scrolls.retain(|id, _| active.contains(id));
+    }
+
+    fn reconcile_modal_focus(
+        &mut self,
+        active: &HashSet<NodeId>,
+        active_modal: Option<(&NodeId, &ModalFocusOptions)>,
+    ) -> FocusLifecycleTransition {
+        let Some((modal, options)) = active_modal else {
+            if self.modal_focus_stack.is_empty() {
+                return FocusLifecycleTransition::Stable;
+            }
+            let return_focus = self.modal_focus_stack[0].return_focus.clone();
+            self.modal_focus_stack.clear();
+            return FocusLifecycleTransition::Exit(return_focus);
+        };
+
+        if let Some(position) = self
+            .modal_focus_stack
+            .iter()
+            .position(|frame| &frame.id == modal)
+        {
+            if position + 1 == self.modal_focus_stack.len() {
+                return FocusLifecycleTransition::Stable;
+            }
+            let return_focus = self.modal_focus_stack[position + 1].return_focus.clone();
+            self.modal_focus_stack.truncate(position + 1);
+            return FocusLifecycleTransition::Exit(return_focus);
+        }
+
+        let mut previous_focus = self.focused.clone();
+        while self
+            .modal_focus_stack
+            .last()
+            .is_some_and(|frame| !active.contains(&frame.id))
+        {
+            previous_focus = self
+                .modal_focus_stack
+                .pop()
+                .expect("checked non-empty modal focus stack")
+                .return_focus;
+        }
+        let return_focus = match &options.return_focus {
+            ModalReturnFocus::Previous => previous_focus,
+            ModalReturnFocus::Target(target) => Some(target.clone()),
+            ModalReturnFocus::None => None,
+        };
+        self.modal_focus_stack.push(ModalFocusFrame {
+            id: modal.clone(),
+            return_focus,
+        });
+        FocusLifecycleTransition::Enter(options.initial.clone())
     }
 }
 
@@ -449,6 +552,8 @@ mod tests {
                 &active,
                 &ids(record.field("previous-focus")),
                 &ids(record.field("current-focus")),
+                None,
+                None,
             );
 
             assert_eq!(

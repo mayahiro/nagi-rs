@@ -5,7 +5,8 @@ use nagi_tui::{
     TerminalOptions, run_terminal,
 };
 use nagi_tui_widgets::{
-    Checkbox, Command, CommandPalette, Radio, Scrollbar, ScrollbarOrientation, Select, TabItem,
+    Button, Checkbox, Command, CommandPalette, Composer, ComposerOverflowPolicy, ComposerState,
+    Dialog, DialogAction, Disclosure, Radio, Scrollbar, ScrollbarOrientation, Select, TabItem,
     Table, TableColumn, TableRow, Tabs, TextArea, TextAreaState, Tree, TreeItem,
 };
 
@@ -15,12 +16,18 @@ enum Message {
     SelectMode(usize),
     SelectTheme(usize),
     EditNotes(TextAreaState),
+    EditComposer(ComposerState),
+    SubmitComposer,
     SelectRow(usize),
     SelectTree(usize),
     ToggleTree(usize, bool),
+    ToggleDetails(bool),
     QueryChanged(String),
     SelectCommand(usize),
     ActivateCommand(usize),
+    OpenDialog,
+    ChooseDialog(usize),
+    CloseDialog,
 }
 
 struct Gallery {
@@ -29,12 +36,16 @@ struct Gallery {
     mode: usize,
     theme: usize,
     notes: TextAreaState,
+    composer: ComposerState,
+    composer_history: Vec<String>,
     row: usize,
     tree: usize,
     tree_expanded: bool,
+    details_expanded: bool,
     query: String,
     command: usize,
     last_action: String,
+    dialog_open: bool,
 }
 
 impl Default for Gallery {
@@ -45,12 +56,16 @@ impl Default for Gallery {
             mode: 0,
             theme: 0,
             notes: TextAreaState::at_end("Multiline notes\nremain application state"),
+            composer: ComposerState::at_end("Draft message"),
+            composer_history: vec!["Earlier message".to_owned()],
             row: 0,
             tree: 0,
             tree_expanded: true,
+            details_expanded: false,
             query: String::new(),
             command: 0,
             last_action: "None".to_owned(),
+            dialog_open: false,
         }
     }
 }
@@ -65,6 +80,18 @@ impl App for Gallery {
             Message::SelectMode(index) => self.mode = index,
             Message::SelectTheme(index) => self.theme = index,
             Message::EditNotes(state) => self.notes = state,
+            Message::EditComposer(state) => self.composer = state,
+            Message::SubmitComposer => {
+                let value = self.composer.text_area().value().to_owned();
+                if !value.trim().is_empty() {
+                    if self.composer_history.len() == 8 {
+                        self.composer_history.remove(0);
+                    }
+                    self.composer_history.push(value.clone());
+                    self.composer = ComposerState::at_end("");
+                    self.last_action = format!("Submitted: {}", value.replace('\n', " / "));
+                }
+            }
             Message::SelectRow(index) => self.row = index,
             Message::SelectTree(index) => self.tree = index,
             Message::ToggleTree(index, expanded) => {
@@ -72,6 +99,7 @@ impl App for Gallery {
                     self.tree_expanded = expanded;
                 }
             }
+            Message::ToggleDetails(expanded) => self.details_expanded = expanded,
             Message::QueryChanged(query) => self.query = query,
             Message::SelectCommand(index) => self.command = index,
             Message::ActivateCommand(index) => {
@@ -81,6 +109,16 @@ impl App for Gallery {
                     .unwrap_or("Unknown")
                     .to_owned();
             }
+            Message::OpenDialog => self.dialog_open = true,
+            Message::ChooseDialog(index) => {
+                self.last_action = ["Open from dialog", "Save from dialog"]
+                    .get(index)
+                    .copied()
+                    .unwrap_or("Unknown dialog action")
+                    .to_owned();
+                self.dialog_open = false;
+            }
+            Message::CloseDialog => self.dialog_open = false,
         }
         Effect::none()
     }
@@ -89,7 +127,7 @@ impl App for Gallery {
         Subscription::none()
     }
 
-    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+    fn view(&self, context: nagi_tui::ViewContext) -> Node<Self::Message> {
         let tabs = Tabs::new(
             "gallery-tabs",
             [
@@ -104,11 +142,11 @@ impl App for Gallery {
         .with_length(Length::Fixed(1));
 
         let page = match self.page {
-            0 => self.inputs_page(),
+            0 => self.inputs_page(context.size.width.saturating_sub(4).max(1)),
             1 => self.data_page(),
             _ => self.commands_page(),
         };
-        Node::border(
+        let content = Node::border(
             Node::column([
                 Node::styled_text(
                     "Extended Widget Gallery",
@@ -124,12 +162,54 @@ impl App for Gallery {
                     .with_length(Length::Fixed(1)),
             ]),
             Style::default(),
+        );
+        if !self.dialog_open {
+            return content;
+        }
+        let dialog = Dialog::new(
+            "choice-dialog",
+            Node::text("Choose one application-defined command"),
+            [
+                DialogAction::new("dialog-open", "Open", || Message::ChooseDialog(0)),
+                DialogAction::new("dialog-save", "Save", || Message::ChooseDialog(1)),
+                DialogAction::new("dialog-cancel", "Cancel", || Message::CloseDialog),
+            ],
         )
+        .title(Node::styled_text(
+            "Generic dialog",
+            Style {
+                bold: true,
+                ..Style::default()
+            },
+        ))
+        .default_action("dialog-cancel")
+        .cancel_action("dialog-cancel")
+        .action_wrap_width(context.size.width.saturating_sub(4).max(1))
+        .into_node();
+        Node::stack([content, dialog])
     }
 }
 
 impl Gallery {
-    fn inputs_page(&self) -> Node<Message> {
+    fn inputs_page(&self, composer_width: u32) -> Node<Message> {
+        let composer_valid = !self.composer.text_area().value().trim().is_empty();
+        let mut composer = Composer::new(
+            "composer",
+            "composer-viewport",
+            "composer-caret",
+            self.composer.clone(),
+            Message::EditComposer,
+            || Message::SubmitComposer,
+        )
+        .placeholder("Enter a message")
+        .soft_wrap(composer_width)
+        .rows(1, 3)
+        .history(self.composer_history.clone())
+        .maximum_graphemes(240, ComposerOverflowPolicy::Truncate)
+        .submit_enabled(composer_valid);
+        if !composer_valid {
+            composer = composer.validation(Node::text("A message is required"));
+        }
         Node::column([
             Checkbox::new(
                 "feature",
@@ -163,10 +243,20 @@ impl Gallery {
                     .into_node(),
                 Style::default(),
             ),
+            Node::text("Composer: Enter submits, Shift-Enter inserts a line"),
+            Node::border(composer.into_node(), Style::default()),
         ])
     }
 
     fn data_page(&self) -> Node<Message> {
+        let details = Disclosure::new(
+            "process-details",
+            Node::text("Process details"),
+            self.details_expanded,
+            Message::ToggleDetails,
+        )
+        .body(|| Node::text("Metrics are application-owned detail content"))
+        .into_node();
         let table = Table::new(
             "process-table",
             [
@@ -200,6 +290,7 @@ impl Gallery {
             .unwrap_or(u64::MAX)
             .saturating_mul(35);
         Node::column([
+            details,
             table,
             Node::text("Tree:"),
             tree,
@@ -231,6 +322,7 @@ impl Gallery {
             .title("Command Palette")
             .into_node(),
             Node::text(format!("Last action: {}", self.last_action)),
+            Button::new("open-dialog", "Open generic dialog", || Message::OpenDialog).into_node(),
         ])
     }
 }

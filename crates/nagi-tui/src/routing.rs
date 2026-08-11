@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use crate::{Event, NodeId, Point, Rect, ScrollAxis};
+use crate::{Event, ModalFocusOptions, NodeId, Point, Rect, ScrollAxis};
 
 #[cfg(test)]
 use crate::fixture_support;
@@ -180,9 +180,12 @@ pub(crate) struct TreeIndex {
     pub(crate) records: Vec<NodeRecord>,
     pub(crate) by_id: HashMap<NodeId, usize>,
     pub(crate) focus_order: Vec<NodeId>,
+    pub(crate) reveal_targets: Vec<(NodeId, NodeId)>,
+    focus_fallbacks: Vec<(usize, NodeId)>,
     pub(crate) active: HashSet<NodeId>,
     pub(crate) root: Option<NodeId>,
     pub(crate) active_modal: Option<NodeId>,
+    pub(crate) active_modal_focus: ModalFocusOptions,
 }
 
 impl TreeIndex {
@@ -190,9 +193,12 @@ impl TreeIndex {
         self.records.clear();
         self.by_id.clear();
         self.focus_order.clear();
+        self.reveal_targets.clear();
+        self.focus_fallbacks.clear();
         self.active.clear();
         self.root = None;
         self.active_modal = None;
+        self.active_modal_focus = ModalFocusOptions::default();
     }
 
     pub(crate) fn register(&mut self, record: NodeRecord, is_root: bool) -> Result<(), NodeId> {
@@ -205,6 +211,7 @@ impl TreeIndex {
         }
         if record.kind == InteractiveKind::Modal {
             self.active_modal = Some(record.id.clone());
+            self.active_modal_focus = ModalFocusOptions::default();
         }
         if record.focusable {
             self.focus_order.push(record.id.clone());
@@ -215,8 +222,33 @@ impl TreeIndex {
         Ok(())
     }
 
+    pub(crate) fn register_reveal(&mut self, viewport: NodeId, target: NodeId) {
+        self.reveal_targets.push((viewport, target));
+    }
+
+    pub(crate) fn register_focus_fallback(&mut self, id: &NodeId, target: NodeId) {
+        if let Some(index) = self.by_id.get(id) {
+            self.focus_fallbacks.push((*index, target));
+        }
+    }
+
+    pub(crate) fn set_active_modal_focus(&mut self, id: &NodeId, focus: ModalFocusOptions) {
+        if self.active_modal.as_ref() == Some(id) {
+            self.active_modal_focus = focus;
+        }
+    }
+
     pub(crate) fn record(&self, id: &NodeId) -> Option<&NodeRecord> {
         self.by_id.get(id).map(|index| &self.records[*index])
+    }
+
+    pub(crate) fn focus_fallback(&self, id: &NodeId) -> Option<&NodeId> {
+        let record = *self.by_id.get(id)?;
+        let position = self
+            .focus_fallbacks
+            .binary_search_by_key(&record, |(index, _)| *index)
+            .ok()?;
+        Some(&self.focus_fallbacks[position].1)
     }
 
     pub(crate) fn route(&self, target: Option<&NodeId>) -> Vec<NodeId> {
@@ -308,15 +340,16 @@ impl TreeIndex {
                 .is_none_or(|modal| self.is_within(id, modal))
     }
 
-    fn is_within(&self, id: &NodeId, ancestor: &NodeId) -> bool {
+    pub(crate) fn is_within(&self, id: &NodeId, ancestor: &NodeId) -> bool {
         let mut current = Some(id);
-        let mut visited = HashSet::new();
+        let mut remaining = self.records.len().saturating_add(1);
         while let Some(id) = current {
+            if remaining == 0 {
+                return false;
+            }
+            remaining -= 1;
             if id == ancestor {
                 return true;
-            }
-            if !visited.insert(id.clone()) {
-                return false;
             }
             current = self.record(id).and_then(|record| record.parent.as_ref());
         }

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use nagi_tui::{
-    Action, ActionAvailability, ActionDescriptor, EventResult, HorizontalAlignment, Node, NodeId,
-    Style, VerticalAlignment,
+    Action, ActionAvailability, ActionDescriptor, EventResult, HorizontalAlignment,
+    ModalFocusOptions, ModalInitialFocus, ModalReturnFocus, Node, NodeId, Style, VerticalAlignment,
 };
 
 use crate::dismiss_action_descriptor;
@@ -22,6 +22,7 @@ pub struct Modal<Message> {
     child: Node<Message>,
     title: String,
     style: ModalStyle,
+    focus: ModalFocusOptions,
     on_escape: Option<Arc<dyn Fn() -> Message>>,
 }
 
@@ -34,6 +35,7 @@ impl<Message: 'static> Modal<Message> {
             child,
             title: String::new(),
             style: ModalStyle::default(),
+            focus: ModalFocusOptions::default(),
             on_escape: None,
         }
     }
@@ -49,6 +51,20 @@ impl<Message: 'static> Modal<Message> {
     #[must_use]
     pub const fn style(mut self, style: ModalStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    /// Sets the focus policy used when this modal becomes active
+    #[must_use]
+    pub fn initial_focus(mut self, focus: ModalInitialFocus) -> Self {
+        self.focus.initial = focus;
+        self
+    }
+
+    /// Sets the focus policy used when this modal stops being active
+    #[must_use]
+    pub fn return_focus(mut self, focus: ModalReturnFocus) -> Self {
+        self.focus.return_focus = focus;
         self
     }
 
@@ -85,7 +101,7 @@ impl<Message: 'static> Modal<Message> {
             VerticalAlignment::Center,
         );
         let id = self.id;
-        let modal = Node::modal(id.clone(), centered);
+        let modal = Node::modal_with_focus(id.clone(), centered, self.focus);
         let action = match self.on_escape {
             Some(on_escape) => Action::new(descriptor, move |_| EventResult::message(on_escape())),
             None => Action::new(descriptor, |_| EventResult::ignored()),

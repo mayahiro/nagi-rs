@@ -1030,64 +1030,93 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         Ok(())
     }
 
-    fn ensure_focused_visible(
+    fn ensure_reveal_targets_visible(
         &mut self,
         view: &Node<Application::Message>,
         index: &mut TreeIndex,
         actions: &mut ActionIndex<Application::Message>,
     ) -> Result<(), RuntimeError> {
-        let Some(focused) = self.interaction.focused.clone() else {
-            return Ok(());
-        };
-        let scrolls: Vec<_> = index
-            .route(Some(&focused))
-            .into_iter()
-            .filter(|id| {
-                view.scroll_options(id)
-                    .is_some_and(|options| options.ensure_focused_visible)
-            })
-            .collect();
-        for id in scrolls {
-            let Some(target) = index.record(&focused).cloned() else {
+        if let Some(focused) = self.interaction.focused.clone() {
+            let scrolls: Vec<_> = index
+                .route(Some(&focused))
+                .into_iter()
+                .filter(|id| {
+                    index
+                        .reveal_targets
+                        .iter()
+                        .all(|(viewport, _)| viewport != id)
+                        && view
+                            .scroll_options(id)
+                            .is_some_and(|options| options.ensure_focused_visible)
+                })
+                .collect();
+            for viewport in scrolls {
+                self.ensure_target_visible(view, index, actions, &viewport, &focused)?;
+            }
+        }
+
+        let mut remaining = index.reveal_targets.len();
+        while remaining > 0 {
+            remaining = remaining.min(index.reveal_targets.len());
+            if remaining == 0 {
                 break;
-            };
-            let Some(viewport) = index.record(&id).cloned() else {
-                continue;
-            };
-            let Some(axis) = view.scroll_options(&id).map(|options| options.axis) else {
-                continue;
-            };
-            let Some(state) = self.interaction.scroll_state(&id) else {
-                continue;
-            };
-            let mut next = state.offset;
-            if axis.allows_horizontal() {
-                next.x = visible_axis_offset(
-                    next.x,
-                    viewport.rect.x,
-                    viewport.rect.width,
-                    target.rect.x,
-                    target.rect.width,
-                );
             }
-            if axis.allows_vertical() {
-                next.y = visible_axis_offset(
-                    next.y,
-                    viewport.rect.y,
-                    viewport.rect.height,
-                    target.rect.y,
-                    target.rect.height,
-                );
-            }
-            if next == state.offset {
-                continue;
-            }
-            self.interaction.request_scroll(&id, next);
-            view.prepare_interaction(self.size, &mut self.interaction);
-            view.build_tree_index_into(self.size, &self.interaction, index, actions)
-                .map_err(RuntimeError::DuplicateNodeId)?;
+            remaining -= 1;
+            let (viewport, target) = index.reveal_targets[remaining].clone();
+            self.ensure_target_visible(view, index, actions, &viewport, &target)?;
         }
         Ok(())
+    }
+
+    fn ensure_target_visible(
+        &mut self,
+        view: &Node<Application::Message>,
+        index: &mut TreeIndex,
+        actions: &mut ActionIndex<Application::Message>,
+        viewport_id: &NodeId,
+        target_id: &NodeId,
+    ) -> Result<(), RuntimeError> {
+        if !index.is_within(target_id, viewport_id) {
+            return Ok(());
+        }
+        let Some(target) = index.record(target_id).cloned() else {
+            return Ok(());
+        };
+        let Some(viewport) = index.record(viewport_id).cloned() else {
+            return Ok(());
+        };
+        let Some(axis) = view.scroll_options(viewport_id).map(|options| options.axis) else {
+            return Ok(());
+        };
+        let Some(state) = self.interaction.scroll_state(viewport_id) else {
+            return Ok(());
+        };
+        let mut next = state.offset;
+        if axis.allows_horizontal() {
+            next.x = visible_axis_offset(
+                next.x,
+                viewport.rect.x,
+                viewport.rect.width,
+                target.rect.x,
+                target.rect.width,
+            );
+        }
+        if axis.allows_vertical() {
+            next.y = visible_axis_offset(
+                next.y,
+                viewport.rect.y,
+                viewport.rect.height,
+                target.rect.y,
+                target.rect.height,
+            );
+        }
+        if next == state.offset {
+            return Ok(());
+        }
+        self.interaction.request_scroll(viewport_id, next);
+        view.prepare_interaction(self.size, &mut self.interaction);
+        view.build_tree_index_into(self.size, &self.interaction, index, actions)
+            .map_err(RuntimeError::DuplicateNodeId)
     }
 
     fn ensure_tree(&mut self) -> Result<(), RuntimeError> {
@@ -1107,8 +1136,16 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.next_action_index = action_index;
             return Err(RuntimeError::DuplicateNodeId(id));
         }
-        self.interaction
-            .reconcile(&tree_index.active, &[], tree_index.focus_scope().as_ref());
+        self.interaction.reconcile(
+            &tree_index.active,
+            &[],
+            tree_index.focus_scope().as_ref(),
+            tree_index
+                .active_modal
+                .as_ref()
+                .map(|modal| (modal, &tree_index.active_modal_focus)),
+            None,
+        );
         if self
             .interaction
             .pointer_capture
@@ -1130,7 +1167,9 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 return Err(RuntimeError::DuplicateNodeId(id));
             }
         }
-        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index, &mut action_index) {
+        if let Err(error) =
+            self.ensure_reveal_targets_visible(&view, &mut tree_index, &mut action_index)
+        {
             self.next_tree_index = tree_index;
             self.next_action_index = action_index;
             return Err(error);
@@ -1187,10 +1226,21 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         {
             let previous_focus_order = self.tree_index.focus_scope();
             let current_focus_order = tree_index.focus_scope();
+            let focus_fallback = self
+                .interaction
+                .focused
+                .as_ref()
+                .and_then(|focused| self.tree_index.focus_fallback(focused))
+                .cloned();
             self.interaction.reconcile(
                 &tree_index.active,
                 previous_focus_order.as_ref(),
                 current_focus_order.as_ref(),
+                tree_index
+                    .active_modal
+                    .as_ref()
+                    .map(|modal| (modal, &tree_index.active_modal_focus)),
+                focus_fallback.as_ref(),
             );
         }
         if self
@@ -1214,7 +1264,9 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 return Err(RuntimeError::DuplicateNodeId(id));
             }
         }
-        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index, &mut action_index) {
+        if let Err(error) =
+            self.ensure_reveal_targets_visible(&view, &mut tree_index, &mut action_index)
+        {
             self.next_tree_index = tree_index;
             self.next_action_index = action_index;
             return Err(error);
@@ -2552,5 +2604,71 @@ mod tests {
             ScrollOffset::new(0, 3)
         );
         assert_eq!(frame.surface().cell(0, 1).unwrap().content(), "4");
+    }
+
+    struct NestedRevealApp;
+
+    impl App for NestedRevealApp {
+        type Message = ();
+
+        fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            let rows = (0..5).map(|index| {
+                let row = Node::text(index.to_string());
+                let row = if index == 4 {
+                    row.with_id("target")
+                } else {
+                    row
+                };
+                row.with_length(crate::Length::Fixed(1))
+            });
+            let inner = Node::scroll_viewport_with_options(
+                "inner",
+                Node::column(rows),
+                crate::ScrollViewportOptions {
+                    axis: crate::ScrollAxis::Vertical,
+                    ..crate::ScrollViewportOptions::default()
+                },
+            )
+            .reveal_descendant("target")
+            .with_length(crate::Length::Fixed(2));
+            Node::scroll_viewport_with_options(
+                "outer",
+                Node::column([
+                    Node::text("header").with_length(crate::Length::Fixed(2)),
+                    inner,
+                ]),
+                crate::ScrollViewportOptions {
+                    axis: crate::ScrollAxis::Vertical,
+                    ..crate::ScrollViewportOptions::default()
+                },
+            )
+            .reveal_descendant("target")
+        }
+    }
+
+    #[test]
+    fn nested_explicit_reveal_adjusts_inner_before_outer() {
+        let mut runtime = Runtime::with_clock(
+            NestedRevealApp,
+            RuntimeConfig::new(Size::new(8, 3)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+
+        let frame = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(
+            runtime.interaction().scroll_offset(&NodeId::from("inner")),
+            ScrollOffset::new(0, 3)
+        );
+        assert_eq!(
+            runtime.interaction().scroll_offset(&NodeId::from("outer")),
+            ScrollOffset::new(0, 1)
+        );
+        assert_eq!(frame.surface().cell(0, 2).unwrap().content(), "4");
     }
 }

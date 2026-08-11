@@ -15,6 +15,8 @@ use crate::{
 pub(crate) struct NodeKeyInteraction<Message> {
     actions: Rc<[Action<Message>]>,
     scope: Option<NodeKeyScope>,
+    reveal_target: Option<NodeId>,
+    focus_fallback: Option<NodeId>,
 }
 
 impl<Message> NodeKeyInteraction<Message> {
@@ -22,6 +24,8 @@ impl<Message> NodeKeyInteraction<Message> {
         Self {
             actions: Rc::from([]),
             scope: None,
+            reveal_target: None,
+            focus_fallback: None,
         }
     }
 
@@ -34,6 +38,22 @@ impl<Message> NodeKeyInteraction<Message> {
             key_map,
             propagation,
         });
+    }
+
+    pub(crate) fn set_reveal_target(&mut self, target: NodeId) {
+        self.reveal_target = Some(target);
+    }
+
+    pub(crate) fn reveal_target(&self) -> Option<&NodeId> {
+        self.reveal_target.as_ref()
+    }
+
+    pub(crate) fn set_focus_fallback(&mut self, target: NodeId) {
+        self.focus_fallback = Some(target);
+    }
+
+    pub(crate) fn focus_fallback(&self) -> Option<&NodeId> {
+        self.focus_fallback.as_ref()
     }
 
     fn is_empty(&self) -> bool {

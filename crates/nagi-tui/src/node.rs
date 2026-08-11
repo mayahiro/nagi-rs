@@ -115,6 +115,39 @@ pub struct VirtualFragment<Message> {
     node: Box<Node<Message>>,
 }
 
+/// Focus selection applied when a modal becomes active
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ModalInitialFocus {
+    /// Focus the first focusable node in the modal scope
+    #[default]
+    First,
+    /// Focus a specific stable node, falling back to the first focusable node
+    Target(NodeId),
+    /// Leave the modal scope unfocused
+    None,
+}
+
+/// Focus selection applied when a modal stops being active
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ModalReturnFocus {
+    /// Return to the node focused immediately before modal entry
+    #[default]
+    Previous,
+    /// Focus a specific stable node after the modal closes
+    Target(NodeId),
+    /// Leave the resumed scope unfocused
+    None,
+}
+
+/// Focus lifecycle policies attached to one modal scope
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModalFocusOptions {
+    /// Policy used when the modal becomes active
+    pub initial: ModalInitialFocus,
+    /// Policy used when the modal stops being active
+    pub return_focus: ModalReturnFocus,
+}
+
 impl<Message> VirtualFragment<Message> {
     /// Creates a fragment whose node begins at `origin` in content coordinates
     #[must_use]
@@ -186,7 +219,10 @@ enum NodeKind<Message> {
         options: ScrollViewportOptions<Message>,
     },
     VirtualScrollViewport(Box<VirtualScrollViewportNode<Message>>),
-    Modal(Box<Node<Message>>),
+    Modal {
+        child: Box<Node<Message>>,
+        focus: ModalFocusOptions,
+    },
     Panel {
         title: String,
         options: PanelOptions,
@@ -502,9 +538,21 @@ impl<Message> Node<Message> {
     }
 
     /// Marks a subtree as the active modal routing and focus scope
+    ///
+    /// The default focus lifecycle selects the first focusable descendant on
+    /// entry and returns to the previously focused node on close
     #[must_use]
     pub fn modal(id: impl Into<NodeId>, child: Self) -> Self {
-        let mut node = Self::new(NodeKind::Modal(Box::new(child)));
+        Self::modal_with_focus(id, child, ModalFocusOptions::default())
+    }
+
+    /// Creates a modal scope with explicit entry and return focus policies
+    #[must_use]
+    pub fn modal_with_focus(id: impl Into<NodeId>, child: Self, focus: ModalFocusOptions) -> Self {
+        let mut node = Self::new(NodeKind::Modal {
+            child: Box::new(child),
+            focus,
+        });
         node.id = Some(id.into());
         node
     }
@@ -581,6 +629,34 @@ impl<Message> Node<Message> {
         self
     }
 
+    /// Keeps an identified descendant visible inside this ScrollViewport
+    ///
+    /// The target must be present below an eager ScrollViewport or in the
+    /// current fragment of a virtual ScrollViewport. A later call replaces the
+    /// target. On other node kinds this metadata has no effect
+    #[must_use]
+    pub fn reveal_descendant(mut self, target: impl Into<NodeId>) -> Self {
+        if matches!(
+            &self.kind,
+            NodeKind::ScrollViewport { .. } | NodeKind::VirtualScrollViewport(_)
+        ) {
+            self.key_interaction_mut().set_reveal_target(target.into());
+        }
+        self
+    }
+
+    /// Prefers a stable focus target when a focused node in this subtree disappears
+    ///
+    /// The target must remain focusable in the next frame and belong to the
+    /// active modal scope. Nested declarations override outer declarations.
+    /// When the target is unavailable, normal deterministic reconciliation is
+    /// used. This metadata has no effect while the current focus remains valid
+    #[must_use]
+    pub fn focus_fallback(mut self, target: impl Into<NodeId>) -> Self {
+        self.key_interaction_mut().set_focus_fallback(target.into());
+        self
+    }
+
     /// Sets this node's main-axis sizing rule in a row or column
     #[must_use]
     pub fn with_length(mut self, length: Length) -> Self {
@@ -654,9 +730,9 @@ impl<Message> Node<Message> {
                     insets.top.saturating_add(insets.bottom),
                 )
             }
-            NodeKind::Align { child, .. } | NodeKind::Clip(child) | NodeKind::Modal(child) => {
-                child.measure(constraints)
-            }
+            NodeKind::Align { child, .. }
+            | NodeKind::Clip(child)
+            | NodeKind::Modal { child, .. } => child.measure(constraints),
             NodeKind::ScrollViewport { child, .. } => child.measure(constraints),
             NodeKind::VirtualScrollViewport(virtual_node) => virtual_node.content_size,
         };
@@ -763,7 +839,7 @@ impl<Message> Node<Message> {
                     );
                 }
             }
-            NodeKind::Modal(child) => child.render(surface, rect, clip, interaction),
+            NodeKind::Modal { child, .. } => child.render(surface, rect, clip, interaction),
             NodeKind::Panel {
                 title,
                 options,
@@ -794,7 +870,16 @@ impl<Message> Node<Message> {
         let bounds = Rect::new(0, 0, size.width, size.height);
         index.clear();
         actions.clear();
-        self.build_index(bounds, bounds, None, true, interaction, index, actions)
+        self.build_index(
+            bounds,
+            bounds,
+            None,
+            true,
+            None,
+            interaction,
+            index,
+            actions,
+        )
     }
 
     pub(crate) fn prepare_interaction(
@@ -869,7 +954,7 @@ impl<Message> Node<Message> {
             | NodeKind::Border { child, .. }
             | NodeKind::Align { child, .. }
             | NodeKind::Clip(child)
-            | NodeKind::Modal(child)
+            | NodeKind::Modal { child, .. }
             | NodeKind::Panel { child, .. }
             | NodeKind::ScrollViewport { child, .. } => child.visit(id, operation),
             NodeKind::VirtualScrollViewport(virtual_node) => virtual_node
@@ -893,10 +978,16 @@ impl<Message> Node<Message> {
         clip: Rect,
         parent: Option<&NodeId>,
         is_root: bool,
+        inherited_focus_fallback: Option<&NodeId>,
         interaction: &InteractionState,
         index: &mut TreeIndex,
         actions: &mut ActionIndex<Message>,
     ) -> Result<(), NodeId> {
+        let focus_fallback = self
+            .key_interaction
+            .as_deref()
+            .and_then(NodeKeyInteraction::focus_fallback)
+            .or(inherited_focus_fallback);
         let mut child_parent = parent.cloned();
         if let Some(id) = &self.id {
             let kind = match &self.kind {
@@ -905,7 +996,7 @@ impl<Message> Node<Message> {
                 NodeKind::VirtualScrollViewport(virtual_node) => {
                     scroll_interactive_kind(virtual_node.options.axis)
                 }
-                NodeKind::Modal(_) => InteractiveKind::Modal,
+                NodeKind::Modal { .. } => InteractiveKind::Modal,
                 _ => InteractiveKind::Generic,
             };
             index.register(
@@ -920,8 +1011,23 @@ impl<Message> Node<Message> {
                 },
                 is_root,
             )?;
+            if let Some(target) = focus_fallback {
+                index.register_focus_fallback(id, target.clone());
+            }
+            if let NodeKind::Modal { focus, .. } = &self.kind {
+                index.set_active_modal_focus(id, focus.clone());
+            }
             if let Some(key_interaction) = &self.key_interaction {
                 actions.register(id, key_interaction);
+            }
+            if kind.is_scroll_viewport() {
+                if let Some(target) = self
+                    .key_interaction
+                    .as_deref()
+                    .and_then(NodeKeyInteraction::reveal_target)
+                {
+                    index.register_reveal(id.clone(), target.clone());
+                }
             }
             child_parent = Some(id.clone());
         }
@@ -941,6 +1047,7 @@ impl<Message> Node<Message> {
                         clip,
                         parent,
                         false,
+                        focus_fallback,
                         interaction,
                         index,
                         actions,
@@ -955,6 +1062,7 @@ impl<Message> Node<Message> {
                         clip,
                         parent,
                         false,
+                        focus_fallback,
                         interaction,
                         index,
                         actions,
@@ -963,7 +1071,16 @@ impl<Message> Node<Message> {
             }
             NodeKind::Stack(children) => {
                 for child in children {
-                    child.build_index(rect, clip, parent, false, interaction, index, actions)?;
+                    child.build_index(
+                        rect,
+                        clip,
+                        parent,
+                        false,
+                        focus_fallback,
+                        interaction,
+                        index,
+                        actions,
+                    )?;
                 }
             }
             NodeKind::Padding { insets, child } => child.build_index(
@@ -971,6 +1088,7 @@ impl<Message> Node<Message> {
                 clip,
                 parent,
                 false,
+                focus_fallback,
                 interaction,
                 index,
                 actions,
@@ -980,6 +1098,7 @@ impl<Message> Node<Message> {
                 clip,
                 parent,
                 false,
+                focus_fallback,
                 interaction,
                 index,
                 actions,
@@ -993,6 +1112,7 @@ impl<Message> Node<Message> {
                 clip,
                 parent,
                 false,
+                focus_fallback,
                 interaction,
                 index,
                 actions,
@@ -1002,6 +1122,7 @@ impl<Message> Node<Message> {
                 clip.intersection(rect),
                 parent,
                 false,
+                focus_fallback,
                 interaction,
                 index,
                 actions,
@@ -1016,6 +1137,7 @@ impl<Message> Node<Message> {
                     clip.intersection(rect),
                     parent,
                     false,
+                    focus_fallback,
                     interaction,
                     index,
                     actions,
@@ -1049,15 +1171,23 @@ impl<Message> Node<Message> {
                         clip.intersection(rect),
                         parent,
                         false,
+                        focus_fallback,
                         interaction,
                         index,
                         actions,
                     )?;
                 }
             }
-            NodeKind::Modal(child) => {
-                child.build_index(rect, clip, parent, false, interaction, index, actions)?
-            }
+            NodeKind::Modal { child, .. } => child.build_index(
+                rect,
+                clip,
+                parent,
+                false,
+                focus_fallback,
+                interaction,
+                index,
+                actions,
+            )?,
             NodeKind::Panel { options, child, .. } => {
                 let insets = panel_content_insets(*options);
                 child.build_index(
@@ -1065,6 +1195,7 @@ impl<Message> Node<Message> {
                     clip,
                     parent,
                     false,
+                    focus_fallback,
                     interaction,
                     index,
                     actions,
@@ -1186,7 +1317,7 @@ impl<Message> Node<Message> {
                 interaction,
             ),
             NodeKind::Clip(child) => child.prepare_at(rect, interaction),
-            NodeKind::Modal(child) => child.prepare_at(rect, interaction),
+            NodeKind::Modal { child, .. } => child.prepare_at(rect, interaction),
             NodeKind::Panel { options, child, .. } => {
                 let insets = panel_content_insets(*options);
                 child.prepare_at(

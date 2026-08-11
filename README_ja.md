@@ -47,7 +47,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-vt` | Typed terminal input／output、Color、Attributes、Style |
 | `nagi-surface` | Geometry、Cell、Surface描画、composition、diff、snapshot |
 | `nagi-tui` | App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
-| `nagi-tui-widgets` | Public TUI APIから構築した21個の標準Widget |
+| `nagi-tui-widgets` | Public TUI APIから構築した25個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
 | `nagi-cli` | Command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、段階実行Runtime Policy、process統合 |
 | `nagi-cli-test` | ProcessなしのCLI input注入とoutput取得 |
@@ -98,7 +98,15 @@ Rust repository rootから実行します
 
 TUIのterminal inputとoutputはterminalへ接続されている必要があります。Mouse reportは既定で無効です。Raw modeとscreen stateは正常return、error、panic経路でbest effortとして復元します。Process abort、nested terminal session、suspendとresume、`/dev/tty`取得には対応していません
 
-`ScrollViewport`はeagerなchild treeをclipしてscrollします。大規模dataでは`Node::virtual_scroll_viewport`を使用し、content全体のCell extentを宣言して現在表示する範囲または上限付きoverscanの`VirtualFragment`だけを構築できます
+`ScrollViewport`はeagerなchild treeをclipしてscrollします。大規模dataでは`Node::virtual_scroll_viewport`を使用し、content全体のCell extentを宣言して現在表示する範囲または上限付きoverscanの`VirtualFragment`だけを構築できます。`Node::reveal_descendant`はfocusを移動せずstable descendant IDを表示範囲内に保ち、virtual targetは現在のfragment内に存在する必要があります
+
+`TextArea`はdefaultでno-wrap挙動を維持します。`soft_wrap`はvisual-line navigationを追加し、`boundary_navigation`はvisual boundaryのUpとDownをpass-throughへ切り替えられ、`viewport`はTab stopを増やさずapplication suppliedのcaret IDへ追従します
+
+`Composer`は`TextArea`へcontrolled submitとhistory recall、自動row境界、任意のvalidation content、挿入制限を加えます。Applicationはmessageの意味、history persistence、sensitive value policyを引き続き所有します
+
+`Disclosure`はexpanded stateをApplicationに維持し、expanded時だけbodyを構築します。Core Modal scopeはdefaultでentry時に最初のdescendantへfocusし、close時に以前のfocusへ戻り、両方のtargetを設定できます
+
+`Dialog`はapplication-defined action list、lazy controlled details、明示的なdefaultとcancel target、focus policy、Cell幅によるaction wrappingを構成します。`ConfirmDialog`はdefaultを明示する二action convenienceです
 
 CLI process統合はLinuxとmacOSへ対応し、Unix argument valueを保持してSIGINTを協調的cancellationへ変換します。Shell completion、設定file読み込み、interactive prompt、TUI統合は提供しません。Portable graphは任意のinvocation grammarを表現しません。Help-only Usage Variantはparser semanticsを変更せずにvalidatorで支えるformを記述できます
 

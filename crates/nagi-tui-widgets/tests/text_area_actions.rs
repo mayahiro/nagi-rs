@@ -151,15 +151,14 @@ fn text_area_actions_match_shared_fixtures() {
             "case {}",
             record.id
         );
-        assert_eq!(
-            runtime.app().state,
-            fixture_state(
+        assert_text_area_state_without_preferred(
+            &runtime.app().state,
+            &fixture_state(
                 record.text("expected"),
                 record.field("expected-cursor"),
                 record.field("expected-anchor"),
             ),
-            "case {}",
-            record.id
+            &record.id,
         );
         assert_eq!(
             dispatch.messages(),
@@ -475,6 +474,25 @@ fn fixture_state(value: String, cursor: &str, anchor: &str) -> TextAreaState {
     } else {
         state.select(fixture_usize(anchor))
     }
+}
+
+fn assert_text_area_state_without_preferred(
+    actual: &TextAreaState,
+    expected: &TextAreaState,
+    case: &str,
+) {
+    assert_eq!(actual.value(), expected.value(), "case {case} value");
+    assert_eq!(actual.cursor(), expected.cursor(), "case {case} cursor");
+    assert_eq!(
+        actual.selection(),
+        expected.selection(),
+        "case {case} selection"
+    );
+    assert_eq!(
+        actual.horizontal_offset(),
+        expected.horizontal_offset(),
+        "case {case} horizontal offset"
+    );
 }
 
 fn has_handler(handlers: &str, expected: &str) -> bool {
