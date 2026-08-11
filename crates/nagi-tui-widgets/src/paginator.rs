@@ -1,8 +1,63 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use nagi_tui::{Event, EventResult, KeyAction, KeyCode, Node, NodeId, Style};
+use nagi_tui::{
+    Action, ActionAvailability, ActionDescriptor, EventResult, KeyCode, Node, NodeId, Style,
+};
 
-use crate::event::is_activation_event;
+use crate::action::{
+    SELECTION_FIRST_ACTION_ID, SELECTION_FIRST_ACTION_LABEL, SELECTION_LAST_ACTION_ID,
+    SELECTION_LAST_ACTION_LABEL, SELECTION_NEXT_ACTION_ID, SELECTION_NEXT_ACTION_LABEL,
+    SELECTION_PREVIOUS_ACTION_ID, SELECTION_PREVIOUS_ACTION_LABEL, repeatable_action_binding,
+};
+use crate::event::is_pointer_activation_event;
+
+static PAGINATOR_ACTION_DESCRIPTORS: LazyLock<[ActionDescriptor; 4]> = LazyLock::new(|| {
+    [
+        ActionDescriptor::new(
+            SELECTION_PREVIOUS_ACTION_ID,
+            SELECTION_PREVIOUS_ACTION_LABEL,
+            [
+                repeatable_action_binding(KeyCode::Left),
+                repeatable_action_binding(KeyCode::Up),
+                repeatable_action_binding(KeyCode::PageUp),
+            ],
+        ),
+        ActionDescriptor::new(
+            SELECTION_NEXT_ACTION_ID,
+            SELECTION_NEXT_ACTION_LABEL,
+            [
+                repeatable_action_binding(KeyCode::Right),
+                repeatable_action_binding(KeyCode::Down),
+                repeatable_action_binding(KeyCode::PageDown),
+            ],
+        ),
+        ActionDescriptor::new(
+            SELECTION_FIRST_ACTION_ID,
+            SELECTION_FIRST_ACTION_LABEL,
+            [repeatable_action_binding(KeyCode::Home)],
+        ),
+        ActionDescriptor::new(
+            SELECTION_LAST_ACTION_ID,
+            SELECTION_LAST_ACTION_LABEL,
+            [repeatable_action_binding(KeyCode::End)],
+        ),
+    ]
+});
+
+#[derive(Clone, Copy)]
+enum PaginatorAction {
+    Previous,
+    Next,
+    First,
+    Last,
+}
+
+const PAGINATOR_ACTIONS: [PaginatorAction; 4] = [
+    PaginatorAction::Previous,
+    PaginatorAction::Next,
+    PaginatorAction::First,
+    PaginatorAction::Last,
+];
 
 /// Page indicator representation
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -110,10 +165,17 @@ impl<Message: 'static> Paginator<Message> {
         self
     }
 
+    /// Returns the ordered semantic navigation actions declared by the root
+    #[must_use]
+    pub fn action_descriptors(&self) -> [ActionDescriptor; 4] {
+        paginator_action_descriptors(self.enabled && self.total > 0)
+    }
+
     /// Builds the public semantic node for this paginator
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
         let page = normalized_page(self.page, self.total);
+        let descriptors = self.action_descriptors();
         let style = if !self.enabled || page.is_none() {
             self.style.disabled
         } else {
@@ -123,20 +185,23 @@ impl<Message: 'static> Paginator<Message> {
             let current = page.map_or(0, |page| page.saturating_add(1));
             let node = Node::styled_text(format!("{current}/{}", self.total), style);
             let Some(page) = page.filter(|_| self.enabled) else {
-                return node.with_id(self.id);
+                let id = self.id;
+                return node
+                    .with_id(id.clone())
+                    .on_actions(id, disabled_paginator_actions(descriptors));
             };
             let id = self.id;
-            let focus_id = id.clone();
-            let on_change = self.on_change;
             return node
                 .focusable(id.clone())
                 .with_focused_style(self.style.focused)
-                .on_event(id, move |event| {
-                    paginator_event_result(event, page, self.total, &focus_id, &on_change)
-                });
+                .on_actions(
+                    id.clone(),
+                    paginator_actions(descriptors, page, self.total, id, self.on_change),
+                );
         }
 
         let page = page.expect("dots require a page");
+        let mut descriptors = Some(descriptors);
         let (start, end) = paginator_window(self.total, page, self.limit);
         let mut children = Vec::with_capacity(end.saturating_sub(start).saturating_mul(2));
         for candidate in start..end {
@@ -155,16 +220,23 @@ impl<Message: 'static> Paginator<Message> {
                     children.push(selected);
                     continue;
                 }
-                let focus_id = self.id.clone();
-                let event_id = self.id.clone();
-                let on_change = Arc::clone(&self.on_change);
+                let id = self.id.clone();
                 children.push(
                     Node::column([selected])
-                        .focusable(self.id.clone())
+                        .focusable(id.clone())
                         .with_focused_style(self.style.focused)
-                        .on_event(event_id, move |event| {
-                            paginator_event_result(event, page, self.total, &focus_id, &on_change)
-                        }),
+                        .on_actions(
+                            id.clone(),
+                            paginator_actions(
+                                descriptors
+                                    .take()
+                                    .expect("selected page owns Paginator actions"),
+                                page,
+                                self.total,
+                                id,
+                                Arc::clone(&self.on_change),
+                            ),
+                        ),
                 );
                 continue;
             }
@@ -178,7 +250,7 @@ impl<Message: 'static> Paginator<Message> {
                 let focus_id = self.id.clone();
                 let on_change = Arc::clone(&self.on_change);
                 node = node.on_event(candidate_id, move |event| {
-                    if !is_activation_event(event) {
+                    if !is_pointer_activation_event(event) {
                         return EventResult::ignored();
                     }
                     EventResult::consumed()
@@ -192,21 +264,48 @@ impl<Message: 'static> Paginator<Message> {
         if self.enabled {
             root
         } else {
-            root.with_id(self.id)
+            let id = self.id;
+            root.with_id(id.clone()).on_actions(
+                id,
+                disabled_paginator_actions(
+                    descriptors.expect("disabled Paginator retains action descriptors"),
+                ),
+            )
         }
     }
 }
 
-fn paginator_event_result<Message>(
-    event: &Event,
+fn paginator_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; 4],
+    page: usize,
+    total: usize,
+    focus_id: NodeId,
+    on_change: Arc<dyn Fn(usize) -> Message>,
+) -> [Action<Message>; 4] {
+    std::array::from_fn(|index| {
+        let action = PAGINATOR_ACTIONS[index];
+        let focus_id = focus_id.clone();
+        let on_change = Arc::clone(&on_change);
+        Action::new(descriptors[index].clone(), move |_| {
+            paginator_action_result(action, page, total, &focus_id, on_change.as_ref())
+        })
+    })
+}
+
+fn disabled_paginator_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; 4],
+) -> [Action<Message>; 4] {
+    descriptors.map(|descriptor| Action::new(descriptor, |_| EventResult::ignored()))
+}
+
+fn paginator_action_result<Message>(
+    action: PaginatorAction,
     page: usize,
     total: usize,
     focus_id: &NodeId,
-    on_change: &Arc<dyn Fn(usize) -> Message>,
+    on_change: &dyn Fn(usize) -> Message,
 ) -> EventResult<Message> {
-    let Some(next) = page_for_event(page, total, event) else {
-        return EventResult::ignored();
-    };
+    let next = page_for_action(page, total, action).unwrap_or(page);
     let result = EventResult::consumed().focus(focus_id.clone());
     if next == page {
         result
@@ -233,27 +332,25 @@ fn paginator_window(total: usize, page: usize, limit: usize) -> (usize, usize) {
     (start, start.saturating_add(limit))
 }
 
-fn page_for_event(page: usize, total: usize, event: &Event) -> Option<usize> {
+fn page_for_action(page: usize, total: usize, action: PaginatorAction) -> Option<usize> {
     let page = normalized_page(page, total)?;
-    let Event::Key(key) = event else {
-        return None;
+    match action {
+        PaginatorAction::Previous => Some(page.saturating_sub(1)),
+        PaginatorAction::Next => Some(page.saturating_add(1).min(total.saturating_sub(1))),
+        PaginatorAction::First => Some(0),
+        PaginatorAction::Last => Some(total.saturating_sub(1)),
+    }
+}
+
+fn paginator_action_descriptors(enabled: bool) -> [ActionDescriptor; 4] {
+    let availability = if enabled {
+        ActionAvailability::Enabled
+    } else {
+        ActionAvailability::DisabledPassThrough
     };
-    if key.action == KeyAction::Release
-        || key.modifiers.alt
-        || key.modifiers.control
-        || key.modifiers.meta
-    {
-        return None;
-    }
-    match key.code {
-        KeyCode::Left | KeyCode::Up | KeyCode::PageUp => Some(page.saturating_sub(1)),
-        KeyCode::Right | KeyCode::Down | KeyCode::PageDown => {
-            Some(page.saturating_add(1).min(total.saturating_sub(1)))
-        }
-        KeyCode::Home => Some(0),
-        KeyCode::End => Some(total.saturating_sub(1)),
-        _ => None,
-    }
+    PAGINATOR_ACTION_DESCRIPTORS
+        .clone()
+        .map(|descriptor| descriptor.with_availability(availability))
 }
 
 fn paginator_page_id(root: &NodeId, page: usize) -> NodeId {
@@ -262,9 +359,10 @@ fn paginator_page_id(root: &NodeId, page: usize) -> NodeId {
 
 #[cfg(test)]
 mod tests {
-    use nagi_tui::{Event, KeyAction, KeyCode, KeyEvent, KeyProtocol, Modifiers};
-
-    use super::{normalized_page, page_for_event, paginator_window};
+    use super::{
+        PaginatorAction, normalized_page, page_for_action, paginator_action_descriptors,
+        paginator_window,
+    };
 
     #[test]
     fn paging_matches_shared_fixtures() {
@@ -301,13 +399,13 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                page_for_event(page, total, &key(KeyCode::Left)),
+                page_for_action(page, total, PaginatorAction::Previous),
                 Some(number(record.field("previous"))),
                 "case {} previous",
                 record.id
             );
             assert_eq!(
-                page_for_event(page, total, &key(KeyCode::Right)),
+                page_for_action(page, total, PaginatorAction::Next),
                 Some(number(record.field("next"))),
                 "case {} next",
                 record.id
@@ -315,14 +413,25 @@ mod tests {
         }
     }
 
-    fn key(code: KeyCode) -> Event {
-        Event::Key(KeyEvent {
-            code,
-            modifiers: Modifiers::NONE,
-            action: KeyAction::Press,
-            text: None,
-            protocol: KeyProtocol::Legacy,
-        })
+    #[test]
+    fn descriptor_clones_reuse_immutable_storage() {
+        let enabled = paginator_action_descriptors(true);
+        let disabled = paginator_action_descriptors(false);
+
+        for index in 0..enabled.len() {
+            assert!(std::ptr::eq(
+                enabled[index].id().as_str(),
+                disabled[index].id().as_str()
+            ));
+            assert!(std::ptr::eq(
+                enabled[index].label(),
+                disabled[index].label()
+            ));
+            assert!(std::ptr::eq(
+                enabled[index].default_bindings(),
+                disabled[index].default_bindings()
+            ));
+        }
     }
 
     fn number(value: &str) -> usize {

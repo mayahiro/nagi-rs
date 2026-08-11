@@ -1,11 +1,95 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use nagi_tui::{
-    Event, EventResult, HorizontalAlignment, KeyAction, KeyCode, Length, Node, NodeId, Style,
-    VerticalAlignment,
+    Action, ActionAvailability, ActionDescriptor, Event, EventResult, HorizontalAlignment, KeyCode,
+    Length, Node, NodeId, Style, VerticalAlignment,
 };
 
-use crate::event::is_activation_event;
+use crate::action::{
+    SELECTION_FIRST_DAY_OF_MONTH_ACTION_ID, SELECTION_FIRST_DAY_OF_MONTH_ACTION_LABEL,
+    SELECTION_LAST_DAY_OF_MONTH_ACTION_ID, SELECTION_LAST_DAY_OF_MONTH_ACTION_LABEL,
+    SELECTION_NEXT_DAY_ACTION_ID, SELECTION_NEXT_DAY_ACTION_LABEL, SELECTION_NEXT_MONTH_ACTION_ID,
+    SELECTION_NEXT_MONTH_ACTION_LABEL, SELECTION_NEXT_WEEK_ACTION_ID,
+    SELECTION_NEXT_WEEK_ACTION_LABEL, SELECTION_PREVIOUS_DAY_ACTION_ID,
+    SELECTION_PREVIOUS_DAY_ACTION_LABEL, SELECTION_PREVIOUS_MONTH_ACTION_ID,
+    SELECTION_PREVIOUS_MONTH_ACTION_LABEL, SELECTION_PREVIOUS_WEEK_ACTION_ID,
+    SELECTION_PREVIOUS_WEEK_ACTION_LABEL, activate_action_descriptor, repeatable_action_binding,
+};
+use crate::event::is_pointer_activation_event;
+
+const CALENDAR_ACTION_COUNT: usize = 9;
+
+static CALENDAR_ACTION_DESCRIPTORS: LazyLock<[ActionDescriptor; CALENDAR_ACTION_COUNT]> =
+    LazyLock::new(|| {
+        [
+            activate_action_descriptor(),
+            ActionDescriptor::new(
+                SELECTION_PREVIOUS_DAY_ACTION_ID,
+                SELECTION_PREVIOUS_DAY_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Left)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_NEXT_DAY_ACTION_ID,
+                SELECTION_NEXT_DAY_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Right)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_PREVIOUS_WEEK_ACTION_ID,
+                SELECTION_PREVIOUS_WEEK_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Up)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_NEXT_WEEK_ACTION_ID,
+                SELECTION_NEXT_WEEK_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Down)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_PREVIOUS_MONTH_ACTION_ID,
+                SELECTION_PREVIOUS_MONTH_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::PageUp)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_NEXT_MONTH_ACTION_ID,
+                SELECTION_NEXT_MONTH_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::PageDown)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_FIRST_DAY_OF_MONTH_ACTION_ID,
+                SELECTION_FIRST_DAY_OF_MONTH_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Home)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_LAST_DAY_OF_MONTH_ACTION_ID,
+                SELECTION_LAST_DAY_OF_MONTH_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::End)],
+            ),
+        ]
+    });
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CalendarAction {
+    Activate,
+    PreviousDay,
+    NextDay,
+    PreviousWeek,
+    NextWeek,
+    PreviousMonth,
+    NextMonth,
+    FirstDayOfMonth,
+    LastDayOfMonth,
+}
+
+const CALENDAR_ACTIONS: [CalendarAction; CALENDAR_ACTION_COUNT] = [
+    CalendarAction::Activate,
+    CalendarAction::PreviousDay,
+    CalendarAction::NextDay,
+    CalendarAction::PreviousWeek,
+    CalendarAction::NextWeek,
+    CalendarAction::PreviousMonth,
+    CalendarAction::NextMonth,
+    CalendarAction::FirstDayOfMonth,
+    CalendarAction::LastDayOfMonth,
+];
 
 /// A proleptic Gregorian date between years 1 and 9999
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -162,9 +246,17 @@ impl<Message: 'static> Calendar<Message> {
         self
     }
 
+    /// Returns the ordered semantic actions declared by the root
+    #[must_use]
+    pub fn action_descriptors(&self) -> [ActionDescriptor; CALENDAR_ACTION_COUNT] {
+        calendar_action_descriptors(self.enabled)
+    }
+
     /// Builds the public semantic node for this calendar
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
+        let descriptors = self.action_descriptors();
+        let mut descriptors = Some(descriptors);
         let first = CalendarDate::new(self.year, i32::from(self.month), 1);
         let active = active_date(first, self.selected);
         let header = Node::align(
@@ -188,7 +280,10 @@ impl<Message: 'static> Calendar<Message> {
             let mut days = Vec::with_capacity(7);
             for weekday in 0..7 {
                 let position = week * 7 + weekday;
-                let date = add_days(first, position - offset);
+                let Some(date) = grid_date(first, position - offset) else {
+                    days.push(Node::text("   ").with_length(Length::Fixed(3)));
+                    continue;
+                };
                 let in_month = date.year == first.year && date.month == first.month;
                 if !in_month && !self.show_adjacent {
                     days.push(Node::text("   ").with_length(Length::Fixed(3)));
@@ -217,17 +312,24 @@ impl<Message: 'static> Calendar<Message> {
                     continue;
                 }
                 if is_selected {
-                    let focus_id = self.id.clone();
-                    let event_id = self.id.clone();
-                    let on_select = Arc::clone(&self.on_select);
+                    let id = self.id.clone();
+                    let actions = calendar_actions(
+                        descriptors
+                            .take()
+                            .expect("selected date owns Calendar actions"),
+                        first,
+                        active,
+                        id.clone(),
+                        Arc::clone(&self.on_select),
+                    );
+                    let focus_id = id.clone();
                     days.push(
                         Node::column([day_node.with_id(day_id)])
                             .with_length(Length::Fixed(3))
-                            .focusable(self.id.clone())
+                            .focusable(id.clone())
                             .with_focused_style(self.style.focused)
-                            .on_event(event_id, move |event| {
-                                selected_event_result(event, first, active, &focus_id, &on_select)
-                            }),
+                            .on_actions(id.clone(), actions)
+                            .on_event(id, move |event| selected_pointer_result(event, &focus_id)),
                     );
                     continue;
                 }
@@ -237,7 +339,7 @@ impl<Message: 'static> Calendar<Message> {
                     day_node
                         .with_id(day_id.clone())
                         .on_event(day_id, move |event| {
-                            if !is_activation_event(event) {
+                            if !is_pointer_activation_event(event) {
                                 return EventResult::ignored();
                             }
                             EventResult::consumed()
@@ -252,30 +354,63 @@ impl<Message: 'static> Calendar<Message> {
         if self.enabled {
             root
         } else {
-            root.with_id(self.id)
+            let id = self.id;
+            root.with_id(id.clone()).on_actions(
+                id,
+                disabled_calendar_actions(
+                    descriptors.expect("disabled Calendar retains action descriptors"),
+                ),
+            )
         }
     }
 }
 
-fn selected_event_result<Message>(
-    event: &Event,
+fn calendar_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; CALENDAR_ACTION_COUNT],
+    displayed: CalendarDate,
+    selected: CalendarDate,
+    focus_id: NodeId,
+    on_select: Arc<dyn Fn(CalendarDate) -> Message>,
+) -> [Action<Message>; CALENDAR_ACTION_COUNT] {
+    std::array::from_fn(|index| {
+        let action = CALENDAR_ACTIONS[index];
+        let focus_id = focus_id.clone();
+        let on_select = Arc::clone(&on_select);
+        Action::new(descriptors[index].clone(), move |_| {
+            calendar_action_result(action, displayed, selected, &focus_id, on_select.as_ref())
+        })
+    })
+}
+
+fn disabled_calendar_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; CALENDAR_ACTION_COUNT],
+) -> [Action<Message>; CALENDAR_ACTION_COUNT] {
+    descriptors.map(|descriptor| Action::new(descriptor, |_| EventResult::ignored()))
+}
+
+fn calendar_action_result<Message>(
+    action: CalendarAction,
     displayed: CalendarDate,
     selected: CalendarDate,
     focus_id: &NodeId,
-    on_select: &Arc<dyn Fn(CalendarDate) -> Message>,
+    on_select: &dyn Fn(CalendarDate) -> Message,
 ) -> EventResult<Message> {
-    if is_activation_event(event) {
-        return EventResult::consumed().focus(focus_id.clone());
-    }
-    let Some(next) = date_for_event(displayed, selected, event) else {
-        return EventResult::ignored();
-    };
     let result = EventResult::consumed().focus(focus_id.clone());
+    let Some(next) = date_for_action(displayed, selected, action) else {
+        return result;
+    };
     if next == selected {
         result
     } else {
         result.emit(on_select(next))
     }
+}
+
+fn selected_pointer_result<Message>(event: &Event, focus_id: &NodeId) -> EventResult<Message> {
+    if !is_pointer_activation_event(event) {
+        return EventResult::ignored();
+    }
+    EventResult::consumed().focus(focus_id.clone())
 }
 
 fn normalize_date(date: CalendarDate) -> CalendarDate {
@@ -364,6 +499,19 @@ fn add_months(date: CalendarDate, months: i32) -> CalendarDate {
     }
 }
 
+fn grid_date(first: CalendarDate, day_offset: i32) -> Option<CalendarDate> {
+    if first.year == 1 && first.month == 1 && day_offset < 0 {
+        return None;
+    }
+    if first.year == 9999
+        && first.month == 12
+        && day_offset >= i32::from(days_in_month(first.year, first.month))
+    {
+        return None;
+    }
+    Some(add_days(first, day_offset))
+}
+
 fn weekday_of(date: CalendarDate) -> i32 {
     let date = normalize_date(date);
     const OFFSETS: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
@@ -395,38 +543,41 @@ fn weekday_labels(start: CalendarWeekStart) -> [&'static str; 7] {
     }
 }
 
-fn date_for_event(
+fn date_for_action(
     displayed: CalendarDate,
     selected: CalendarDate,
-    event: &Event,
+    action: CalendarAction,
 ) -> Option<CalendarDate> {
-    let Event::Key(key) = event else {
-        return None;
-    };
-    if key.action == KeyAction::Release
-        || key.modifiers.alt
-        || key.modifiers.control
-        || key.modifiers.meta
-    {
-        return None;
-    }
     let displayed = CalendarDate::new(displayed.year, i32::from(displayed.month), 1);
     let selected = active_date(displayed, selected);
-    match key.code {
-        KeyCode::Left => Some(add_days(selected, -1)),
-        KeyCode::Right => Some(add_days(selected, 1)),
-        KeyCode::Up => Some(add_days(selected, -7)),
-        KeyCode::Down => Some(add_days(selected, 7)),
-        KeyCode::PageUp => Some(add_months(selected, -1)),
-        KeyCode::PageDown => Some(add_months(selected, 1)),
-        KeyCode::Home => Some(displayed),
-        KeyCode::End => Some(CalendarDate {
+    match action {
+        CalendarAction::Activate => None,
+        CalendarAction::PreviousDay => Some(add_days(selected, -1)),
+        CalendarAction::NextDay => Some(add_days(selected, 1)),
+        CalendarAction::PreviousWeek => Some(add_days(selected, -7)),
+        CalendarAction::NextWeek => Some(add_days(selected, 7)),
+        CalendarAction::PreviousMonth => Some(add_months(selected, -1)),
+        CalendarAction::NextMonth => Some(add_months(selected, 1)),
+        CalendarAction::FirstDayOfMonth => Some(displayed),
+        CalendarAction::LastDayOfMonth => Some(CalendarDate {
             year: displayed.year,
             month: displayed.month,
             day: days_in_month(displayed.year, displayed.month),
         }),
-        _ => None,
     }
+}
+
+fn calendar_action_descriptors(enabled: bool) -> [ActionDescriptor; CALENDAR_ACTION_COUNT] {
+    let availability = if enabled {
+        ActionAvailability::Enabled
+    } else {
+        ActionAvailability::DisabledPassThrough
+    };
+    std::array::from_fn(|index| {
+        CALENDAR_ACTION_DESCRIPTORS[index]
+            .clone()
+            .with_availability(availability)
+    })
 }
 
 fn date_id(root: &NodeId, date: CalendarDate) -> NodeId {
@@ -442,8 +593,8 @@ fn date_id(root: &NodeId, date: CalendarDate) -> NodeId {
 #[cfg(test)]
 mod tests {
     use super::{
-        CalendarDate, CalendarWeekStart, add_days, add_months, days_in_month, month_offset,
-        weekday_of,
+        CalendarDate, CalendarWeekStart, add_days, add_months, calendar_action_descriptors,
+        days_in_month, month_offset, weekday_of,
     };
 
     #[test]
@@ -504,6 +655,27 @@ mod tests {
                 "case {} Sunday offset",
                 record.id
             );
+        }
+    }
+
+    #[test]
+    fn descriptor_clones_reuse_immutable_storage() {
+        let enabled = calendar_action_descriptors(true);
+        let disabled = calendar_action_descriptors(false);
+
+        for index in 0..enabled.len() {
+            assert!(std::ptr::eq(
+                enabled[index].id().as_str(),
+                disabled[index].id().as_str()
+            ));
+            assert!(std::ptr::eq(
+                enabled[index].label(),
+                disabled[index].label()
+            ));
+            assert!(std::ptr::eq(
+                enabled[index].default_bindings(),
+                disabled[index].default_bindings()
+            ));
         }
     }
 

@@ -21,27 +21,83 @@ pub const SELECTION_FIRST_ACTION_ID: &str = "nagi.selection.first";
 /// Stable Action ID for selecting the last item
 pub const SELECTION_LAST_ACTION_ID: &str = "nagi.selection.last";
 
+/// Stable Action ID for selecting one page toward the beginning
+pub const SELECTION_PREVIOUS_PAGE_ACTION_ID: &str = "nagi.selection.previous-page";
+
+/// Stable Action ID for selecting one page toward the end
+pub const SELECTION_NEXT_PAGE_ACTION_ID: &str = "nagi.selection.next-page";
+
+/// Stable Action ID for selecting the previous calendar day
+pub const SELECTION_PREVIOUS_DAY_ACTION_ID: &str = "nagi.selection.previous-day";
+
+/// Stable Action ID for selecting the next calendar day
+pub const SELECTION_NEXT_DAY_ACTION_ID: &str = "nagi.selection.next-day";
+
+/// Stable Action ID for selecting the date one week earlier
+pub const SELECTION_PREVIOUS_WEEK_ACTION_ID: &str = "nagi.selection.previous-week";
+
+/// Stable Action ID for selecting the date one week later
+pub const SELECTION_NEXT_WEEK_ACTION_ID: &str = "nagi.selection.next-week";
+
+/// Stable Action ID for selecting the date one month earlier
+pub const SELECTION_PREVIOUS_MONTH_ACTION_ID: &str = "nagi.selection.previous-month";
+
+/// Stable Action ID for selecting the date one month later
+pub const SELECTION_NEXT_MONTH_ACTION_ID: &str = "nagi.selection.next-month";
+
+/// Stable Action ID for selecting the first day of the displayed month
+pub const SELECTION_FIRST_DAY_OF_MONTH_ACTION_ID: &str = "nagi.selection.first-day-of-month";
+
+/// Stable Action ID for selecting the last day of the displayed month
+pub const SELECTION_LAST_DAY_OF_MONTH_ACTION_ID: &str = "nagi.selection.last-day-of-month";
+
+/// Stable Action ID for navigating back from the current location
+pub const NAVIGATION_BACK_ACTION_ID: &str = "nagi.navigation.back";
+
 /// Stable Action ID for collapsing the current disclosure target
 pub const COLLAPSE_ACTION_ID: &str = "nagi.collapse";
 
 /// Stable Action ID for expanding the current disclosure target
 pub const EXPAND_ACTION_ID: &str = "nagi.expand";
 
+/// Stable Action ID for dismissing the current transient surface
+pub const DISMISS_ACTION_ID: &str = "nagi.dismiss";
+
+pub(crate) const ACTIVATE_ACTION_LABEL: &str = "Activate";
 pub(crate) const SELECTION_PREVIOUS_ACTION_LABEL: &str = "Previous";
 pub(crate) const SELECTION_NEXT_ACTION_LABEL: &str = "Next";
 pub(crate) const SELECTION_FIRST_ACTION_LABEL: &str = "First";
 pub(crate) const SELECTION_LAST_ACTION_LABEL: &str = "Last";
+pub(crate) const SELECTION_PREVIOUS_PAGE_ACTION_LABEL: &str = "Previous page";
+pub(crate) const SELECTION_NEXT_PAGE_ACTION_LABEL: &str = "Next page";
+pub(crate) const SELECTION_PREVIOUS_DAY_ACTION_LABEL: &str = "Previous day";
+pub(crate) const SELECTION_NEXT_DAY_ACTION_LABEL: &str = "Next day";
+pub(crate) const SELECTION_PREVIOUS_WEEK_ACTION_LABEL: &str = "Previous week";
+pub(crate) const SELECTION_NEXT_WEEK_ACTION_LABEL: &str = "Next week";
+pub(crate) const SELECTION_PREVIOUS_MONTH_ACTION_LABEL: &str = "Previous month";
+pub(crate) const SELECTION_NEXT_MONTH_ACTION_LABEL: &str = "Next month";
+pub(crate) const SELECTION_FIRST_DAY_OF_MONTH_ACTION_LABEL: &str = "First day of month";
+pub(crate) const SELECTION_LAST_DAY_OF_MONTH_ACTION_LABEL: &str = "Last day of month";
+pub(crate) const NAVIGATION_BACK_ACTION_LABEL: &str = "Back";
 
 static ACTIVATE_ACTION_DESCRIPTOR: LazyLock<ActionDescriptor> = LazyLock::new(|| {
     ActionDescriptor::new(
         ACTIVATE_ACTION_ID,
-        "Activate",
+        ACTIVATE_ACTION_LABEL,
         [
             KeyBinding::new(KeyStroke::new(KeyCode::Enter, Modifiers::NONE))
                 .with_repeat_policy(RepeatPolicy::AllowRepeat),
             KeyBinding::new(KeyStroke::character(' ', Modifiers::NONE))
                 .with_repeat_policy(RepeatPolicy::AllowRepeat),
         ],
+    )
+});
+
+static DISMISS_ACTION_DESCRIPTOR: LazyLock<ActionDescriptor> = LazyLock::new(|| {
+    ActionDescriptor::new(
+        DISMISS_ACTION_ID,
+        "Dismiss",
+        [repeatable_action_binding(KeyCode::Escape)],
     )
 });
 
@@ -109,6 +165,15 @@ pub fn activate_action_descriptor() -> ActionDescriptor {
     ACTIVATE_ACTION_DESCRIPTOR.clone()
 }
 
+/// Returns the enabled standard dismissal descriptor
+///
+/// Unmodified Escape is the default binding and explicit repeat events remain
+/// enabled to preserve standard transient-surface behavior
+#[must_use]
+pub fn dismiss_action_descriptor() -> ActionDescriptor {
+    DISMISS_ACTION_DESCRIPTOR.clone()
+}
+
 pub(crate) fn repeatable_action_binding(code: KeyCode) -> KeyBinding {
     KeyBinding::new(KeyStroke::new(code, Modifiers::NONE))
         .with_repeat_policy(RepeatPolicy::AllowRepeat)
@@ -143,15 +208,17 @@ mod tests {
 
     #[test]
     fn standard_descriptor_clones_reuse_immutable_storage() {
-        let first = activate_action_descriptor();
-        let second = activate_action_descriptor();
+        for descriptor in [activate_action_descriptor, dismiss_action_descriptor] {
+            let first = descriptor();
+            let second = descriptor();
 
-        assert!(std::ptr::eq(first.id().as_str(), second.id().as_str()));
-        assert!(std::ptr::eq(first.label(), second.label()));
-        assert!(std::ptr::eq(
-            first.default_bindings(),
-            second.default_bindings()
-        ));
+            assert!(std::ptr::eq(first.id().as_str(), second.id().as_str()));
+            assert!(std::ptr::eq(first.label(), second.label()));
+            assert!(std::ptr::eq(
+                first.default_bindings(),
+                second.default_bindings()
+            ));
+        }
     }
 
     #[test]
