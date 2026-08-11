@@ -41,7 +41,15 @@ pub use interaction::{InteractionState, ScrollAxis, ScrollOffset, ScrollState, T
 pub use keymap::{
     Action, ActionAvailability, ActionDescriptor, ActionEvent, ActionId, BindingConflict,
     BindingConflictKind, BindingSupport, KeyBinding, KeyMap, KeyMapError, KeyScope,
-    KeyScopePropagation, KeyStroke, RepeatPolicy, ResolvedAction, ResolvedActions, resolve_actions,
+    KeyScopePropagation, KeyStroke, RepeatPolicy, ResolvedAction, ResolvedActions,
+    TEXT_CURSOR_DOWN_ACTION_ID, TEXT_CURSOR_LEFT_ACTION_ID, TEXT_CURSOR_LINE_END_ACTION_ID,
+    TEXT_CURSOR_LINE_START_ACTION_ID, TEXT_CURSOR_RIGHT_ACTION_ID, TEXT_CURSOR_UP_ACTION_ID,
+    TEXT_DELETE_BACKWARD_ACTION_ID, TEXT_DELETE_FORWARD_ACTION_ID,
+    TEXT_INSERT_LINE_BREAK_ACTION_ID, TEXT_REDO_ACTION_ID, TEXT_SELECT_ALL_ACTION_ID,
+    TEXT_SELECTION_EXTEND_DOWN_ACTION_ID, TEXT_SELECTION_EXTEND_LEFT_ACTION_ID,
+    TEXT_SELECTION_EXTEND_LINE_END_ACTION_ID, TEXT_SELECTION_EXTEND_LINE_START_ACTION_ID,
+    TEXT_SELECTION_EXTEND_RIGHT_ACTION_ID, TEXT_SELECTION_EXTEND_UP_ACTION_ID, TEXT_UNDO_ACTION_ID,
+    resolve_actions,
 };
 pub use layout::Length;
 pub use nagi_surface::{Point, Rect, Size, Surface};

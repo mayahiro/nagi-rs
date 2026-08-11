@@ -8,6 +8,61 @@ use nagi_vt::{Event, KeyAction, KeyCode, Modifiers};
 
 use crate::{EventResult, NodeId};
 
+/// Stable Action ID for moving a text cursor left
+pub const TEXT_CURSOR_LEFT_ACTION_ID: &str = "nagi.text.cursor.left";
+
+/// Stable Action ID for moving a text cursor right
+pub const TEXT_CURSOR_RIGHT_ACTION_ID: &str = "nagi.text.cursor.right";
+
+/// Stable Action ID for moving a text cursor up
+pub const TEXT_CURSOR_UP_ACTION_ID: &str = "nagi.text.cursor.up";
+
+/// Stable Action ID for moving a text cursor down
+pub const TEXT_CURSOR_DOWN_ACTION_ID: &str = "nagi.text.cursor.down";
+
+/// Stable Action ID for moving a text cursor to the current line start
+pub const TEXT_CURSOR_LINE_START_ACTION_ID: &str = "nagi.text.cursor.line-start";
+
+/// Stable Action ID for moving a text cursor to the current line end
+pub const TEXT_CURSOR_LINE_END_ACTION_ID: &str = "nagi.text.cursor.line-end";
+
+/// Stable Action ID for extending text selection left
+pub const TEXT_SELECTION_EXTEND_LEFT_ACTION_ID: &str = "nagi.text.selection.extend-left";
+
+/// Stable Action ID for extending text selection right
+pub const TEXT_SELECTION_EXTEND_RIGHT_ACTION_ID: &str = "nagi.text.selection.extend-right";
+
+/// Stable Action ID for extending text selection up
+pub const TEXT_SELECTION_EXTEND_UP_ACTION_ID: &str = "nagi.text.selection.extend-up";
+
+/// Stable Action ID for extending text selection down
+pub const TEXT_SELECTION_EXTEND_DOWN_ACTION_ID: &str = "nagi.text.selection.extend-down";
+
+/// Stable Action ID for extending text selection to the current line start
+pub const TEXT_SELECTION_EXTEND_LINE_START_ACTION_ID: &str =
+    "nagi.text.selection.extend-line-start";
+
+/// Stable Action ID for extending text selection to the current line end
+pub const TEXT_SELECTION_EXTEND_LINE_END_ACTION_ID: &str = "nagi.text.selection.extend-line-end";
+
+/// Stable Action ID for selecting all editable text
+pub const TEXT_SELECT_ALL_ACTION_ID: &str = "nagi.text.select-all";
+
+/// Stable Action ID for deleting text backward
+pub const TEXT_DELETE_BACKWARD_ACTION_ID: &str = "nagi.text.delete.backward";
+
+/// Stable Action ID for deleting text forward
+pub const TEXT_DELETE_FORWARD_ACTION_ID: &str = "nagi.text.delete.forward";
+
+/// Stable Action ID for inserting a line break
+pub const TEXT_INSERT_LINE_BREAK_ACTION_ID: &str = "nagi.text.insert-line-break";
+
+/// Stable Action ID for undoing a text edit
+pub const TEXT_UNDO_ACTION_ID: &str = "nagi.text.undo";
+
+/// Stable Action ID for redoing a text edit
+pub const TEXT_REDO_ACTION_ID: &str = "nagi.text.redo";
+
 /// A stable, key-independent action identity
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ActionId(Arc<str>);
