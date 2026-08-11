@@ -2,8 +2,8 @@
 
 [日本語](README_ja.md)
 
-Nagi for Rust provides native Text, VT, Surface, TUI, Widget, CLI, and test
-support crates for terminal applications
+Nagi for Rust provides native Content, Text, VT, Surface, TUI, Widget, CLI, and
+test support crates for terminal applications
 
 ## Requirements
 
@@ -17,6 +17,7 @@ Add only the application framework and optional components that you use
 
 ```toml
 [dependencies]
+nagi-content = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Source-neutral structured content
 nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Optional
 nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # CLI applications
@@ -45,6 +46,7 @@ The complete source and behavior are documented with the examples below
 
 | Crate | Responsibility |
 | --- | --- |
+| `nagi-content` | Immutable source-neutral text structure, semantic projection, annotations, and resource validation |
 | `nagi-text` | Unicode 17 graphemes, terminal-width profiles, wrapping, truncation, and positions |
 | `nagi-vt` | Typed terminal input/output, Color, Attributes, and Style |
 | `nagi-surface` | Geometry, Cells, Surface drawing, composition, diffing, and snapshots |
@@ -86,6 +88,7 @@ Run commands from the Rust repository root
 
 | Example | Command |
 | --- | --- |
+| [Source-neutral content](crates/nagi-content/examples/content/README.md) | `cargo run -p nagi-content --example content` |
 | [Counter](crates/nagi-tui/examples/counter/README.md) | `cargo run -p nagi-tui --example counter` |
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |

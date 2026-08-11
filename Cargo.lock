@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nagi-content"
+version = "0.2.7"
+dependencies = [
+ "nagi-text",
+]
+
+[[package]]
 name = "nagi-surface"
 version = "0.2.7"
 dependencies = [

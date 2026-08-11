@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-Nagi Rust実装はterminal application向けのnative Text、VT、Surface、TUI、Widget、CLI、test support crateを提供します
+Nagi Rust実装はterminal application向けのnative Content、Text、VT、Surface、TUI、Widget、CLI、test support crateを提供します
 
 ## 要件
 
@@ -16,6 +16,7 @@ Nagi Rust実装はterminal application向けのnative Text、VT、Surface、TUI�
 
 ```toml
 [dependencies]
+nagi-content = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Source-neutral structured content
 nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Optional
 nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # CLI application
@@ -43,6 +44,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 
 | Crate | 責務 |
 | --- | --- |
+| `nagi-content` | Immutableなsource-neutral text構造、semantic projection、annotation、resource validation |
 | `nagi-text` | Unicode 17 grapheme、terminal幅profile、wrap、truncate、位置変換 |
 | `nagi-vt` | Typed terminal input／output、Color、Attributes、Style |
 | `nagi-surface` | Geometry、Cell、Surface描画、composition、diff、snapshot |
@@ -78,6 +80,7 @@ Rust repository rootから実行します
 
 | Example | Command |
 | --- | --- |
+| [Source-neutral Content](crates/nagi-content/examples/content/README.md) | `cargo run -p nagi-content --example content` |
 | [Counter](crates/nagi-tui/examples/counter/README.md) | `cargo run -p nagi-tui --example counter` |
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
