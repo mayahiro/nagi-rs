@@ -47,7 +47,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-vt` | Typed terminal input／output、Color、Attributes、Style |
 | `nagi-surface` | Geometry、Cell、Surface描画、composition、diff、snapshot |
 | `nagi-tui` | App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
-| `nagi-tui-widgets` | Public TUI APIから構築した25個の標準Widget |
+| `nagi-tui-widgets` | Public TUI APIから構築した27個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
 | `nagi-cli` | Command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、段階実行Runtime Policy、process統合 |
 | `nagi-cli-test` | ProcessなしのCLI input注入とoutput取得 |
@@ -83,6 +83,7 @@ Rust repository rootから実行します
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
+| [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
 | [Widget gallery](crates/nagi-tui-widgets/examples/widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example widget_gallery` |
 | [Extended widget gallery](crates/nagi-tui-widgets/examples/extended_widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example extended_widget_gallery` |
 | [Dashboard](crates/nagi-tui-widgets/examples/dashboard/README.md) | `cargo run -p nagi-tui-widgets --example dashboard` |
@@ -100,9 +101,13 @@ TUIのterminal inputとoutputはterminalへ接続されている必要があり�
 
 `ScrollViewport`はeagerなchild treeをclipしてscrollします。大規模dataでは`Node::virtual_scroll_viewport`を使用し、content全体のCell extentを宣言して現在表示する範囲または上限付きoverscanの`VirtualFragment`だけを構築できます。`Node::reveal_descendant`はfocusを移動せずstable descendant IDを表示範囲内に保ち、virtual targetは現在のfragment内に存在する必要があります
 
+`Node::virtual_flow`は可変item heightとstable anchorをappend、prepend、削除、streaming更新、幅変更にまたがって保持し、visible fragmentとCell単位の上限付きoverscanだけを構築します。Intrinsic高は0のためlayout `Length`を割り当てます。`VirtualFeed`はdomain stateを所有せず、末尾追従とApplication制御のempty、loading、unread slotを追加します
+
 `TextArea`はdefaultでno-wrap挙動を維持します。`soft_wrap`はvisual-line navigationを追加し、`boundary_navigation`はvisual boundaryのUpとDownをpass-throughへ切り替えられ、`viewport`はTab stopを増やさずapplication suppliedのcaret IDへ追従します
 
 `Composer`は`TextArea`へcontrolled submitとhistory recall、自動row境界、任意のvalidation content、挿入制限を加えます。Applicationはmessageの意味、history persistence、sensitive value policyを引き続き所有します
+
+`SelectableText`はimmutableなstyled contentへgrapheme境界に揃えたcontrolled keyboard selectionを加えます。Copy actionはApplication Messageを発行し、clipboard I/O、pointer selection、redaction policyはApplicationの責務として維持します
 
 `Disclosure`はexpanded stateをApplicationに維持し、expanded時だけbodyを構築します。Core Modal scopeはdefaultでentry時に最初のdescendantへfocusし、close時に以前のfocusへ戻り、両方のtargetを設定できます
 

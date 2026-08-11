@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use nagi_tui::{
     App, Effect, Node, NodeId, Runtime, ScrollAxis, ScrollOffset, ScrollViewportOptions, Size,
-    Subscription, ViewContext, VirtualFragment,
+    Subscription, ViewContext, VirtualFlowItem, VirtualFlowItems, VirtualFlowSource,
+    VirtualFragment,
 };
 
 const ROWS: usize = 100_000;
@@ -144,6 +145,10 @@ struct IdentifiedVirtualViewportApp {
     row_ids: Arc<[NodeId]>,
 }
 
+struct VirtualFlowApp {
+    items: VirtualFlowItems,
+}
+
 impl IdentifiedVirtualViewportApp {
     fn new() -> Self {
         let row_ids = (0..ROWS)
@@ -151,6 +156,16 @@ impl IdentifiedVirtualViewportApp {
             .collect::<Vec<_>>()
             .into();
         Self { row_ids }
+    }
+}
+
+impl VirtualFlowApp {
+    fn new() -> Self {
+        let items = VirtualFlowItems::new(
+            (0..ROWS).map(|index| VirtualFlowItem::new(format!("flow-row-{index}"))),
+        )
+        .expect("benchmark item keys are unique");
+        Self { items }
     }
 }
 
@@ -246,6 +261,30 @@ impl App for IdentifiedVirtualViewportApp {
     }
 }
 
+impl App for VirtualFlowApp {
+    type Message = ();
+
+    fn update(&mut self, (): ()) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: ViewContext) -> Node<Self::Message> {
+        let source = VirtualFlowSource::new(self.items.clone(), |context| {
+            if context.index() % 2 == 0 {
+                Node::column([Node::text("row"), Node::text("row")])
+            } else {
+                Node::text("row")
+            }
+        })
+        .estimated_height(|context| if context.index() % 2 == 0 { 2 } else { 1 });
+        Node::virtual_flow("virtual-flow", source)
+    }
+
+    fn subscriptions(&self) -> Subscription<Self::Message> {
+        Subscription::none()
+    }
+}
+
 fn warm_runtime<Application>(runtime: &mut Runtime<Application>)
 where
     Application: App<Message = ()>,
@@ -318,6 +357,20 @@ fn sample_identified_virtual() -> Vec<Sample> {
     samples
 }
 
+fn sample_virtual_flow() -> Vec<Sample> {
+    let mut runtime = Runtime::new(VirtualFlowApp::new(), Size::new(80, 24)).expect("runtime");
+    warm_runtime(&mut runtime);
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        runtime.request_frame();
+        let baseline = reset_metrics();
+        let started = Instant::now();
+        black_box(runtime.render_if_dirty().expect("benchmark frame"));
+        samples.push(read_metrics(started.elapsed(), baseline));
+    }
+    samples
+}
+
 fn report(label: &str, samples: Vec<Sample>) {
     let mut elapsed: Vec<_> = samples.iter().map(|sample| sample.elapsed).collect();
     let mut allocations: Vec<_> = samples.iter().map(|sample| sample.allocations).collect();
@@ -352,4 +405,5 @@ fn main() {
     report("virtual", sample_virtual());
     report("virtual-stick-to-end-growth", sample_growing_virtual());
     report("virtual-identified", sample_identified_virtual());
+    report("virtual-flow-variable-height", sample_virtual_flow());
 }

@@ -1124,6 +1124,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             return Ok(());
         }
         let view = self.app.view(crate::ViewContext::new(self.size));
+        view.prepare_virtual_flows(self.size, &mut self.interaction);
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
         let mut action_index = std::mem::take(&mut self.next_action_index);
         if let Err(id) = view.build_tree_index_into(
@@ -1211,6 +1212,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
         }
         let view = self.app.view(crate::ViewContext::new(self.size));
+        view.prepare_virtual_flows(self.size, &mut self.interaction);
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
         let mut action_index = std::mem::take(&mut self.next_action_index);
         if let Err(id) = view.build_tree_index_into(
@@ -1369,9 +1371,9 @@ fn visible_axis_offset(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -2122,6 +2124,338 @@ mod tests {
         assert_eq!(
             runtime.interaction().scroll_offset(&NodeId::from("scroll")),
             ScrollOffset::new(0, 1)
+        );
+    }
+
+    #[derive(Clone)]
+    struct VirtualFlowEntry {
+        key: &'static str,
+        label: &'static str,
+        height: u32,
+    }
+
+    struct VirtualFlowApp {
+        entries: Vec<VirtualFlowEntry>,
+        items: crate::VirtualFlowItems,
+        update: crate::VirtualFlowUpdate,
+        stick_to_end: bool,
+        builds: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl VirtualFlowApp {
+        fn new(entries: Vec<VirtualFlowEntry>, stick_to_end: bool) -> Self {
+            let items = virtual_flow_items(&entries);
+            Self {
+                entries,
+                items,
+                update: crate::VirtualFlowUpdate::reset(1),
+                stick_to_end,
+                builds: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn replace_entries(
+            &mut self,
+            entries: Vec<VirtualFlowEntry>,
+            update: crate::VirtualFlowUpdate,
+        ) {
+            self.items = virtual_flow_items(&entries);
+            self.entries = entries;
+            self.update = update;
+        }
+    }
+
+    impl App for VirtualFlowApp {
+        type Message = ();
+
+        fn update(&mut self, (): ()) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            let estimates = self.entries.clone();
+            let entries = self.entries.clone();
+            let builds = Arc::clone(&self.builds);
+            let source = crate::VirtualFlowSource::new(self.items.clone(), move |context| {
+                builds
+                    .lock()
+                    .unwrap()
+                    .push(context.key().as_str().to_owned());
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.key == context.key().as_str())
+                    .expect("built virtual flow item exists");
+                virtual_flow_item_node(entry)
+            })
+            .estimated_height(move |context| {
+                estimates
+                    .iter()
+                    .find(|entry| entry.key == context.key().as_str())
+                    .expect("estimated virtual flow item exists")
+                    .height
+            })
+            .update(self.update.clone());
+            Node::virtual_flow_with_options(
+                "virtual-flow",
+                source,
+                crate::VirtualFlowOptions {
+                    overscan: 1,
+                    stick_to_end: self.stick_to_end,
+                    ..crate::VirtualFlowOptions::default()
+                },
+            )
+        }
+    }
+
+    fn virtual_flow_items(entries: &[VirtualFlowEntry]) -> crate::VirtualFlowItems {
+        crate::VirtualFlowItems::new(
+            entries
+                .iter()
+                .map(|entry| crate::VirtualFlowItem::new(entry.key)),
+        )
+        .unwrap()
+    }
+
+    fn virtual_flow_item_node(entry: &VirtualFlowEntry) -> Node<()> {
+        Node::column((0..entry.height).map(|_| Node::text(entry.label)))
+            .with_id(format!("item-{}", entry.key))
+    }
+
+    #[test]
+    fn virtual_flow_measures_once_and_preserves_prepend_anchor() {
+        let mut runtime = Runtime::with_clock(
+            VirtualFlowApp::new(
+                vec![
+                    VirtualFlowEntry {
+                        key: "a",
+                        label: "A",
+                        height: 2,
+                    },
+                    VirtualFlowEntry {
+                        key: "b",
+                        label: "B",
+                        height: 3,
+                    },
+                    VirtualFlowEntry {
+                        key: "c",
+                        label: "C",
+                        height: 1,
+                    },
+                    VirtualFlowEntry {
+                        key: "d",
+                        label: "D",
+                        height: 2,
+                    },
+                ],
+                false,
+            ),
+            RuntimeConfig::new(Size::new(4, 3)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+
+        let initial = runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(initial.surface().cell(0, 0).unwrap().content(), "A");
+        assert_eq!(initial.surface().cell(0, 2).unwrap().content(), "B");
+        assert_eq!(&*runtime.app().builds.lock().unwrap(), &["a", "b"]);
+        let state = runtime
+            .interaction()
+            .virtual_flow_state(&NodeId::from("virtual-flow"))
+            .unwrap();
+        assert_eq!(state.visible_range(), 0..2);
+
+        runtime.app().builds.lock().unwrap().clear();
+        assert!(runtime.set_scroll_offset(&NodeId::from("virtual-flow"), ScrollOffset::new(0, 2),));
+        runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(&*runtime.app().builds.lock().unwrap(), &["a", "b", "c"]);
+
+        runtime.app().builds.lock().unwrap().clear();
+        runtime.app_mut().replace_entries(
+            vec![
+                VirtualFlowEntry {
+                    key: "x",
+                    label: "X",
+                    height: 4,
+                },
+                VirtualFlowEntry {
+                    key: "a",
+                    label: "A",
+                    height: 2,
+                },
+                VirtualFlowEntry {
+                    key: "b",
+                    label: "B",
+                    height: 3,
+                },
+                VirtualFlowEntry {
+                    key: "c",
+                    label: "C",
+                    height: 1,
+                },
+                VirtualFlowEntry {
+                    key: "d",
+                    label: "D",
+                    height: 2,
+                },
+            ],
+            crate::VirtualFlowUpdate::changed(2, 1, 0..1),
+        );
+        runtime.request_frame();
+        let prepended = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(prepended.surface().cell(0, 0).unwrap().content(), "B");
+        let state = runtime
+            .interaction()
+            .virtual_flow_state(&NodeId::from("virtual-flow"))
+            .unwrap();
+        assert_eq!(state.scroll().offset, ScrollOffset::new(0, 6));
+        assert_eq!(state.anchor().unwrap().key().as_str(), "b");
+        assert_eq!(&*runtime.app().builds.lock().unwrap(), &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn virtual_flow_follows_streaming_tail_growth() {
+        let mut runtime = Runtime::with_clock(
+            VirtualFlowApp::new(
+                vec![
+                    VirtualFlowEntry {
+                        key: "a",
+                        label: "A",
+                        height: 2,
+                    },
+                    VirtualFlowEntry {
+                        key: "b",
+                        label: "B",
+                        height: 2,
+                    },
+                    VirtualFlowEntry {
+                        key: "c",
+                        label: "C",
+                        height: 1,
+                    },
+                ],
+                true,
+            ),
+            RuntimeConfig::new(Size::new(4, 3)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap().unwrap();
+
+        runtime.app_mut().replace_entries(
+            vec![
+                VirtualFlowEntry {
+                    key: "a",
+                    label: "A",
+                    height: 2,
+                },
+                VirtualFlowEntry {
+                    key: "b",
+                    label: "B",
+                    height: 2,
+                },
+                VirtualFlowEntry {
+                    key: "c",
+                    label: "C2",
+                    height: 4,
+                },
+            ],
+            crate::VirtualFlowUpdate::changed(2, 1, 2..3),
+        );
+        runtime.request_frame();
+        let streamed = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(streamed.surface().cell(0, 0).unwrap().content(), "C");
+        assert_eq!(streamed.surface().cell(1, 0).unwrap().content(), "2");
+        let state = runtime
+            .interaction()
+            .virtual_flow_state(&NodeId::from("virtual-flow"))
+            .unwrap();
+        assert_eq!(state.scroll().offset, ScrollOffset::new(0, 5));
+        assert_eq!(state.scroll().maximum, ScrollOffset::new(0, 5));
+        assert!(state.scroll().at_end);
+    }
+
+    enum VirtualFlowScrollMessage {
+        Scrolled(crate::ScrollState),
+    }
+
+    struct VirtualFlowScrollApp {
+        items: crate::VirtualFlowItems,
+        observed: Vec<crate::ScrollState>,
+    }
+
+    impl App for VirtualFlowScrollApp {
+        type Message = VirtualFlowScrollMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            match message {
+                VirtualFlowScrollMessage::Scrolled(state) => self.observed.push(state),
+            }
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            let source = crate::VirtualFlowSource::new(self.items.clone(), |context| {
+                Node::text(context.key().as_str().to_owned())
+            });
+            Node::virtual_flow_with_options(
+                "virtual-flow",
+                source,
+                crate::VirtualFlowOptions {
+                    on_scroll: Some(Box::new(VirtualFlowScrollMessage::Scrolled)),
+                    ..crate::VirtualFlowOptions::default()
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn virtual_flow_routes_core_scroll_actions_and_user_callback() {
+        let items = crate::VirtualFlowItems::new(
+            ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .map(crate::VirtualFlowItem::new),
+        )
+        .unwrap();
+        let mut runtime = Runtime::with_clock(
+            VirtualFlowScrollApp {
+                items,
+                observed: Vec::new(),
+            },
+            RuntimeConfig::new(Size::new(4, 2)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        runtime
+            .request_focus(&NodeId::from("virtual-flow"))
+            .unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        let dispatched = runtime
+            .dispatch_event(&Event::Key(KeyEvent {
+                code: KeyCode::PageDown,
+                modifiers: Modifiers::NONE,
+                action: KeyAction::Unknown,
+                text: None,
+                protocol: KeyProtocol::Legacy,
+            }))
+            .unwrap();
+        assert!(dispatched.consumed());
+        runtime.process_pending().unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        assert_eq!(runtime.app().observed.len(), 1);
+        assert_eq!(runtime.app().observed[0].offset, ScrollOffset::new(0, 2));
+        assert_eq!(
+            runtime
+                .interaction()
+                .virtual_flow_state(&NodeId::from("virtual-flow"))
+                .unwrap()
+                .scroll()
+                .offset,
+            ScrollOffset::new(0, 2)
         );
     }
 

@@ -34,6 +34,12 @@ pub const TEXT_CURSOR_LEFT_ACTION_ID: &str = "nagi.text.cursor.left";
 /// Stable Action ID for moving a text cursor right
 pub const TEXT_CURSOR_RIGHT_ACTION_ID: &str = "nagi.text.cursor.right";
 
+/// Stable Action ID for moving a text cursor to the previous word
+pub const TEXT_CURSOR_WORD_LEFT_ACTION_ID: &str = "nagi.text.cursor.word-left";
+
+/// Stable Action ID for moving a text cursor to the next word
+pub const TEXT_CURSOR_WORD_RIGHT_ACTION_ID: &str = "nagi.text.cursor.word-right";
+
 /// Stable Action ID for moving a text cursor up
 pub const TEXT_CURSOR_UP_ACTION_ID: &str = "nagi.text.cursor.up";
 
@@ -46,11 +52,24 @@ pub const TEXT_CURSOR_LINE_START_ACTION_ID: &str = "nagi.text.cursor.line-start"
 /// Stable Action ID for moving a text cursor to the current line end
 pub const TEXT_CURSOR_LINE_END_ACTION_ID: &str = "nagi.text.cursor.line-end";
 
+/// Stable Action ID for moving a text cursor to the document start
+pub const TEXT_CURSOR_DOCUMENT_START_ACTION_ID: &str = "nagi.text.cursor.document-start";
+
+/// Stable Action ID for moving a text cursor to the document end
+pub const TEXT_CURSOR_DOCUMENT_END_ACTION_ID: &str = "nagi.text.cursor.document-end";
+
 /// Stable Action ID for extending text selection left
 pub const TEXT_SELECTION_EXTEND_LEFT_ACTION_ID: &str = "nagi.text.selection.extend-left";
 
 /// Stable Action ID for extending text selection right
 pub const TEXT_SELECTION_EXTEND_RIGHT_ACTION_ID: &str = "nagi.text.selection.extend-right";
+
+/// Stable Action ID for extending text selection to the previous word
+pub const TEXT_SELECTION_EXTEND_WORD_LEFT_ACTION_ID: &str = "nagi.text.selection.extend-word-left";
+
+/// Stable Action ID for extending text selection to the next word
+pub const TEXT_SELECTION_EXTEND_WORD_RIGHT_ACTION_ID: &str =
+    "nagi.text.selection.extend-word-right";
 
 /// Stable Action ID for extending text selection up
 pub const TEXT_SELECTION_EXTEND_UP_ACTION_ID: &str = "nagi.text.selection.extend-up";
@@ -65,8 +84,22 @@ pub const TEXT_SELECTION_EXTEND_LINE_START_ACTION_ID: &str =
 /// Stable Action ID for extending text selection to the current line end
 pub const TEXT_SELECTION_EXTEND_LINE_END_ACTION_ID: &str = "nagi.text.selection.extend-line-end";
 
-/// Stable Action ID for selecting all editable text
+/// Stable Action ID for extending text selection to the document start
+pub const TEXT_SELECTION_EXTEND_DOCUMENT_START_ACTION_ID: &str =
+    "nagi.text.selection.extend-document-start";
+
+/// Stable Action ID for extending text selection to the document end
+pub const TEXT_SELECTION_EXTEND_DOCUMENT_END_ACTION_ID: &str =
+    "nagi.text.selection.extend-document-end";
+
+/// Stable Action ID for selecting one complete semantic text document
 pub const TEXT_SELECT_ALL_ACTION_ID: &str = "nagi.text.select-all";
+
+/// Stable Action ID for copying the current semantic text selection
+pub const TEXT_COPY_SELECTION_ACTION_ID: &str = "nagi.text.copy-selection";
+
+/// Stable Action ID for copying one complete semantic text document
+pub const TEXT_COPY_DOCUMENT_ACTION_ID: &str = "nagi.text.copy-document";
 
 /// Stable Action ID for deleting text backward
 pub const TEXT_DELETE_BACKWARD_ACTION_ID: &str = "nagi.text.delete.backward";

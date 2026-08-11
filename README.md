@@ -49,7 +49,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-vt` | Typed terminal input/output, Color, Attributes, and Style |
 | `nagi-surface` | Geometry, Cells, Surface drawing, composition, diffing, and snapshots |
 | `nagi-tui` | App lifecycle, semantic nodes, scoped key maps, layout, events, Effects, Subscriptions, and terminal loop |
-| `nagi-tui-widgets` | 25 standard widgets built from the public TUI API |
+| `nagi-tui-widgets` | 27 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
 | `nagi-cli` | Command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, staged Runtime Policy, and process integration |
 | `nagi-cli-test` | Process-free CLI input injection and output capture |
@@ -91,6 +91,7 @@ Run commands from the Rust repository root
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
+| [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
 | [Widget gallery](crates/nagi-tui-widgets/examples/widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example widget_gallery` |
 | [Extended widget gallery](crates/nagi-tui-widgets/examples/extended_widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example extended_widget_gallery` |
 | [Dashboard](crates/nagi-tui-widgets/examples/dashboard/README.md) | `cargo run -p nagi-tui-widgets --example dashboard` |
@@ -115,6 +116,13 @@ constructs only the current visible or bounded-overscan `VirtualFragment`.
 `Node::reveal_descendant` keeps a stable descendant ID visible without moving
 focus; virtual targets must be present in the current fragment
 
+`Node::virtual_flow` retains variable item heights and stable anchors across
+append, prepend, removal, streaming updates, and width changes while
+constructing only the visible fragment and Cell-bounded overscan. It has zero
+intrinsic height, so assign a layout `Length`. `VirtualFeed` adds end following
+and application-controlled empty, loading, and unread slots without owning
+domain state
+
 `TextArea` keeps no-wrap behavior by default. `soft_wrap` adds visual-line
 navigation, `boundary_navigation` can pass Up and Down through at visual
 boundaries, and `viewport` follows an application-identified caret without an
@@ -124,6 +132,10 @@ extra Tab stop
 optional validation content, and insertion limits over `TextArea`. Applications
 retain ownership of message meaning, history persistence, and sensitive-value
 policy
+
+`SelectableText` adds controlled grapheme-aligned keyboard selection over
+immutable styled content. Copy actions emit application messages; clipboard
+I/O, pointer selection, and redaction policy remain application concerns
 
 `Disclosure` keeps expanded state in the application and constructs its body
 only while expanded. Core Modal scopes focus their first descendant on entry

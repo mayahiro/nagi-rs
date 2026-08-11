@@ -2,12 +2,13 @@
 
 use nagi_tui::{
     App, Effect, Event, EventAction, KeyCode, Length, MouseTracking, Node, Style, Subscription,
-    TerminalOptions, run_terminal,
+    TerminalOptions, TextSpan, run_terminal,
 };
 use nagi_tui_widgets::{
     Button, Checkbox, Command, CommandPalette, Composer, ComposerOverflowPolicy, ComposerState,
-    Dialog, DialogAction, Disclosure, Radio, Scrollbar, ScrollbarOrientation, Select, TabItem,
-    Table, TableColumn, TableRow, Tabs, TextArea, TextAreaState, Tree, TreeItem,
+    Dialog, DialogAction, Disclosure, Radio, Scrollbar, ScrollbarOrientation, Select,
+    SelectableText, SelectableTextContent, SelectableTextState, TabItem, Table, TableColumn,
+    TableRow, Tabs, TextArea, TextAreaState, TextCopyKind, TextCopyRequest, Tree, TreeItem,
 };
 
 enum Message {
@@ -22,6 +23,8 @@ enum Message {
     SelectTree(usize),
     ToggleTree(usize, bool),
     ToggleDetails(bool),
+    SelectText(SelectableTextState),
+    CopyText(TextCopyRequest),
     QueryChanged(String),
     SelectCommand(usize),
     ActivateCommand(usize),
@@ -42,6 +45,8 @@ struct Gallery {
     tree: usize,
     tree_expanded: bool,
     details_expanded: bool,
+    selectable_content: SelectableTextContent,
+    selectable: SelectableTextState,
     query: String,
     command: usize,
     last_action: String,
@@ -62,6 +67,17 @@ impl Default for Gallery {
             tree: 0,
             tree_expanded: true,
             details_expanded: false,
+            selectable_content: SelectableTextContent::styled([
+                TextSpan::new(
+                    "Selectable",
+                    Style {
+                        bold: true,
+                        ..Style::default()
+                    },
+                ),
+                TextSpan::new(" text keeps application-owned selection.", Style::default()),
+            ]),
+            selectable: SelectableTextState::with_selection(10, 0),
             query: String::new(),
             command: 0,
             last_action: "None".to_owned(),
@@ -100,6 +116,15 @@ impl App for Gallery {
                 }
             }
             Message::ToggleDetails(expanded) => self.details_expanded = expanded,
+            Message::SelectText(state) => self.selectable = state,
+            Message::CopyText(request) => {
+                let kind = match request.kind() {
+                    TextCopyKind::Selection => "selection",
+                    TextCopyKind::Document => "document",
+                };
+                self.last_action =
+                    format!("Copied {kind}: {}", request.text().replace('\n', " / "));
+            }
             Message::QueryChanged(query) => self.query = query,
             Message::SelectCommand(index) => self.command = index,
             Message::ActivateCommand(index) => {
@@ -300,6 +325,21 @@ impl Gallery {
                     .orientation(ScrollbarOrientation::Horizontal)
                     .into_node(),
             ]),
+            Node::text(
+                "SelectableText: Shift-arrows select, Ctrl-C copies, Ctrl-Shift-C copies all",
+            ),
+            Node::border(
+                SelectableText::new(
+                    "selectable-text",
+                    self.selectable_content.clone(),
+                    self.selectable,
+                    Message::SelectText,
+                )
+                .on_copy(Message::CopyText)
+                .into_node(),
+                Style::default(),
+            ),
+            Node::text(format!("Last action: {}", self.last_action)),
         ])
     }
 

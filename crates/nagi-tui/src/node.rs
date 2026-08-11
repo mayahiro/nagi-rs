@@ -1,4 +1,5 @@
 use std::cell::{Ref, RefCell};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use nagi_surface::{Cursor, Surface};
@@ -16,7 +17,7 @@ use crate::routing::{EventHandler, InteractiveKind, NodeRecord, TreeIndex};
 use crate::{
     Action, BorderKind, Event, EventResult, InteractionState, KeyScope, Length, NodeId,
     PanelOptions, ParagraphOptions, Rect, ScrollAxis, ScrollOffset, ScrollState, Size, TextSpan,
-    WrapMode,
+    VirtualFlowOptions, VirtualFlowSource, WrapMode,
 };
 
 /// Padding widths around a node
@@ -219,6 +220,7 @@ enum NodeKind<Message> {
         options: ScrollViewportOptions<Message>,
     },
     VirtualScrollViewport(Box<VirtualScrollViewportNode<Message>>),
+    VirtualFlow(Box<VirtualFlowNode<Message>>),
     Modal {
         child: Box<Node<Message>>,
         focus: ModalFocusOptions,
@@ -240,6 +242,27 @@ struct VirtualScrollViewportNode<Message> {
 struct VirtualCache<Message> {
     request: VirtualViewport,
     fragment: VirtualFragment<Message>,
+}
+
+struct VirtualFlowNode<Message> {
+    source: VirtualFlowSource<Message>,
+    options: VirtualFlowOptions<Message>,
+    cache: RefCell<Option<VirtualFlowFrame<Message>>>,
+}
+
+struct VirtualFlowFrame<Message> {
+    rect: Rect,
+    offset: u32,
+    content_height: u32,
+    generation: u64,
+    items: Vec<VirtualFlowBuiltItem<Message>>,
+}
+
+struct VirtualFlowBuiltItem<Message> {
+    index: usize,
+    origin: u32,
+    height: u32,
+    node: Node<Message>,
 }
 
 struct LinearNode<Message> {
@@ -537,6 +560,38 @@ impl<Message> Node<Message> {
         node
     }
 
+    /// Creates a vertical viewport for stable variable-height items
+    ///
+    /// Only items intersecting the visible range and bounded Cell overscan are
+    /// built. Item heights are measured from their Nodes and retained by the
+    /// runtime across semantic frames. The viewport has zero intrinsic height;
+    /// assign it a layout length or place it where the parent supplies a
+    /// rectangle
+    #[must_use]
+    pub fn virtual_flow(id: impl Into<NodeId>, source: VirtualFlowSource<Message>) -> Self {
+        Self::virtual_flow_with_options(id, source, VirtualFlowOptions::default())
+    }
+
+    /// Creates a variable-height flow with configured vertical scrolling
+    ///
+    /// The viewport has zero intrinsic height; assign it a layout length or
+    /// place it where the parent supplies a rectangle
+    #[must_use]
+    pub fn virtual_flow_with_options(
+        id: impl Into<NodeId>,
+        source: VirtualFlowSource<Message>,
+        options: VirtualFlowOptions<Message>,
+    ) -> Self {
+        let mut node = Self::new(NodeKind::VirtualFlow(Box::new(VirtualFlowNode {
+            source,
+            options,
+            cache: RefCell::new(None),
+        })));
+        node.id = Some(id.into());
+        node.focusable = true;
+        node
+    }
+
     /// Marks a subtree as the active modal routing and focus scope
     ///
     /// The default focus lifecycle selects the first focusable descendant on
@@ -638,7 +693,9 @@ impl<Message> Node<Message> {
     pub fn reveal_descendant(mut self, target: impl Into<NodeId>) -> Self {
         if matches!(
             &self.kind,
-            NodeKind::ScrollViewport { .. } | NodeKind::VirtualScrollViewport(_)
+            NodeKind::ScrollViewport { .. }
+                | NodeKind::VirtualScrollViewport(_)
+                | NodeKind::VirtualFlow(_)
         ) {
             self.key_interaction_mut().set_reveal_target(target.into());
         }
@@ -735,6 +792,7 @@ impl<Message> Node<Message> {
             | NodeKind::Modal { child, .. } => child.measure(constraints),
             NodeKind::ScrollViewport { child, .. } => child.measure(constraints),
             NodeKind::VirtualScrollViewport(virtual_node) => virtual_node.content_size,
+            NodeKind::VirtualFlow(_) => virtual_flow_intrinsic_size(constraints),
         };
         clamp_size(measured, constraints)
     }
@@ -839,6 +897,18 @@ impl<Message> Node<Message> {
                     );
                 }
             }
+            NodeKind::VirtualFlow(flow) => {
+                if let Some(frame) = flow.cache.borrow().as_ref() {
+                    for item in &frame.items {
+                        item.node.render(
+                            surface,
+                            virtual_flow_item_rect(rect, frame.offset, item.origin, item.height),
+                            clip.intersection(rect),
+                            interaction,
+                        );
+                    }
+                }
+            }
             NodeKind::Modal { child, .. } => child.render(surface, rect, clip, interaction),
             NodeKind::Panel {
                 title,
@@ -891,6 +961,11 @@ impl<Message> Node<Message> {
         self.prepare_at(bounds, interaction)
     }
 
+    pub(crate) fn prepare_virtual_flows(&self, size: Size, interaction: &mut InteractionState) {
+        let bounds = Rect::new(0, 0, size.width, size.height);
+        self.prepare_virtual_flows_at(bounds, interaction);
+    }
+
     pub(crate) fn handle_event(&self, id: &NodeId, event: &Event) -> Option<EventResult<Message>> {
         self.visit(id, &mut |node| {
             node.handler.as_ref().map(|handler| handler(event))
@@ -914,6 +989,12 @@ impl<Message> Node<Message> {
             let options = match &node.kind {
                 NodeKind::ScrollViewport { options, .. } => options,
                 NodeKind::VirtualScrollViewport(virtual_node) => &virtual_node.options,
+                NodeKind::VirtualFlow(flow) => {
+                    return Some(ScrollBehavior {
+                        axis: ScrollAxis::Vertical,
+                        ensure_focused_visible: flow.options.ensure_focused_visible,
+                    });
+                }
                 _ => return None,
             };
             Some(ScrollBehavior {
@@ -928,6 +1009,9 @@ impl<Message> Node<Message> {
             let options = match &node.kind {
                 NodeKind::ScrollViewport { options, .. } => options,
                 NodeKind::VirtualScrollViewport(virtual_node) => &virtual_node.options,
+                NodeKind::VirtualFlow(flow) => {
+                    return flow.options.on_scroll.as_ref().map(|map| map(state));
+                }
                 _ => return None,
             };
             options.on_scroll.as_ref().map(|map| map(state))
@@ -962,6 +1046,12 @@ impl<Message> Node<Message> {
                 .borrow()
                 .as_ref()
                 .and_then(|cached| cached.fragment.node.visit(id, operation)),
+            NodeKind::VirtualFlow(flow) => flow.cache.borrow().as_ref().and_then(|frame| {
+                frame
+                    .items
+                    .iter()
+                    .find_map(|item| item.node.visit(id, operation))
+            }),
             NodeKind::Text { .. }
             | NodeKind::RichText { .. }
             | NodeKind::Surface(_)
@@ -996,6 +1086,7 @@ impl<Message> Node<Message> {
                 NodeKind::VirtualScrollViewport(virtual_node) => {
                     scroll_interactive_kind(virtual_node.options.axis)
                 }
+                NodeKind::VirtualFlow(_) => scroll_interactive_kind(ScrollAxis::Vertical),
                 NodeKind::Modal { .. } => InteractiveKind::Modal,
                 _ => InteractiveKind::Generic,
             };
@@ -1178,6 +1269,22 @@ impl<Message> Node<Message> {
                     )?;
                 }
             }
+            NodeKind::VirtualFlow(flow) => {
+                if let Some(frame) = flow.cache.borrow().as_ref() {
+                    for item in &frame.items {
+                        item.node.build_index(
+                            virtual_flow_item_rect(rect, frame.offset, item.origin, item.height),
+                            clip.intersection(rect),
+                            parent,
+                            false,
+                            focus_fallback,
+                            interaction,
+                            index,
+                            actions,
+                        )?;
+                    }
+                }
+            }
             NodeKind::Modal { child, .. } => child.build_index(
                 rect,
                 clip,
@@ -1203,6 +1310,102 @@ impl<Message> Node<Message> {
             }
         }
         Ok(())
+    }
+
+    fn prepare_virtual_flows_at(&self, rect: Rect, interaction: &mut InteractionState) {
+        match &self.kind {
+            NodeKind::VirtualFlow(flow) => {
+                let id = self.id.as_ref().expect("VirtualFlow always has a NodeId");
+                prepare_virtual_flow_node(id, flow, rect, interaction);
+            }
+            NodeKind::Row(linear) => {
+                let layout = linear.layout(rect, true);
+                for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
+                    child.prepare_virtual_flows_at(child_rect, interaction);
+                }
+            }
+            NodeKind::Column(linear) => {
+                let layout = linear.layout(rect, false);
+                for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
+                    child.prepare_virtual_flows_at(child_rect, interaction);
+                }
+            }
+            NodeKind::Stack(children) => {
+                for child in children {
+                    child.prepare_virtual_flows_at(rect, interaction);
+                }
+            }
+            NodeKind::Padding { insets, child } => child.prepare_virtual_flows_at(
+                inset(rect, insets.left, insets.top, insets.right, insets.bottom),
+                interaction,
+            ),
+            NodeKind::Border { child, .. } => {
+                child.prepare_virtual_flows_at(inset(rect, 1, 1, 1, 1), interaction)
+            }
+            NodeKind::Align {
+                horizontal,
+                vertical,
+                child,
+            } => child.prepare_virtual_flows_at(
+                aligned_child_rect(rect, child, *horizontal, *vertical),
+                interaction,
+            ),
+            NodeKind::Clip(child) | NodeKind::Modal { child, .. } => {
+                child.prepare_virtual_flows_at(rect, interaction);
+            }
+            NodeKind::Panel { options, child, .. } => {
+                let insets = panel_content_insets(*options);
+                child.prepare_virtual_flows_at(
+                    inset(rect, insets.left, insets.top, insets.right, insets.bottom),
+                    interaction,
+                );
+            }
+            NodeKind::ScrollViewport { child, options } => {
+                let id = self
+                    .id
+                    .as_ref()
+                    .expect("ScrollViewport always has a NodeId");
+                child.prepare_virtual_flows_at(
+                    scroll_child_rect(rect, child, interaction.scroll_offset(id), options.axis),
+                    interaction,
+                );
+            }
+            NodeKind::VirtualScrollViewport(virtual_node) => {
+                let id = self
+                    .id
+                    .as_ref()
+                    .expect("VirtualScrollViewport always has a NodeId");
+                let state = interaction.preview_scroll(
+                    id,
+                    virtual_scroll_maximum(
+                        virtual_node.content_size,
+                        rect,
+                        virtual_node.options.axis,
+                    ),
+                    virtual_node.options.axis,
+                    virtual_node.options.stick_to_end,
+                );
+                if let Some(fragment) = virtual_fragment(
+                    virtual_node.content_size,
+                    virtual_node.options.axis,
+                    virtual_node.builder.as_ref(),
+                    &virtual_node.cache,
+                    rect,
+                    state.offset,
+                ) {
+                    fragment.fragment.node.prepare_virtual_flows_at(
+                        virtual_fragment_rect(rect, &fragment),
+                        interaction,
+                    );
+                }
+            }
+            NodeKind::Text { .. }
+            | NodeKind::RichText { .. }
+            | NodeKind::Surface(_)
+            | NodeKind::Spacer(_)
+            | NodeKind::Gap(_)
+            | NodeKind::TextInput { .. } => {}
+        }
     }
 
     fn prepare_at(&self, rect: Rect, interaction: &mut InteractionState) -> bool {
@@ -1275,6 +1478,10 @@ impl<Message> Node<Message> {
                 }
                 return previous_request.is_some();
             }
+            NodeKind::VirtualFlow(flow) => {
+                let id = self.id.as_ref().expect("VirtualFlow always has a NodeId");
+                return prepare_virtual_flow_node(id, flow, rect, interaction);
+            }
             _ => {}
         }
         match &self.kind {
@@ -1332,7 +1539,8 @@ impl<Message> Node<Message> {
             | NodeKind::Gap(_)
             | NodeKind::TextInput { .. }
             | NodeKind::ScrollViewport { .. }
-            | NodeKind::VirtualScrollViewport(_) => false,
+            | NodeKind::VirtualScrollViewport(_)
+            | NodeKind::VirtualFlow(_) => false,
         }
     }
 }
@@ -1851,6 +2059,134 @@ fn scroll_child_rect<Message>(
         clamp_i64_to_i32(i64::from(viewport.x) - i64::from(offset.x)),
         clamp_i64_to_i32(i64::from(viewport.y) - i64::from(offset.y)),
         width,
+        height,
+    )
+}
+
+fn virtual_flow_intrinsic_size(constraints: Constraints) -> Size {
+    let width = match constraints.width {
+        Limit::Bounded(width) => width,
+        Limit::Unbounded => 0,
+    };
+    Size::new(width, 0)
+}
+
+fn prepare_virtual_flow_node<Message>(
+    id: &NodeId,
+    flow: &VirtualFlowNode<Message>,
+    rect: Rect,
+    interaction: &mut InteractionState,
+) -> bool {
+    let previous = flow.cache.borrow_mut().take();
+    let previous_signature = previous.as_ref().map(|frame| {
+        (
+            frame.rect,
+            frame.offset,
+            frame.content_height,
+            frame.generation,
+            frame.items.first().map(|item| item.index),
+            frame.items.last().map(|item| item.index),
+        )
+    });
+    let mut reusable = HashMap::new();
+    if let Some(frame) = previous {
+        if frame.rect.width == rect.width {
+            reusable.extend(frame.items.into_iter().map(|item| (item.index, item.node)));
+        }
+    }
+
+    let mut window = interaction.prepare_virtual_flow(
+        id,
+        &flow.source,
+        rect.width,
+        rect.height,
+        flow.options.overscan,
+        flow.options.stick_to_end,
+    );
+    loop {
+        for index in window.built.clone() {
+            reusable
+                .entry(index)
+                .or_insert_with(|| flow.source.build(index, rect.width));
+        }
+        let mut measurements = Vec::new();
+        for index in window.built.clone() {
+            let Some((_, _, measured)) = interaction.virtual_flow_item_layout(id, index) else {
+                continue;
+            };
+            if measured {
+                continue;
+            }
+            let height = reusable
+                .get(&index)
+                .expect("a requested virtual flow item was built")
+                .measure(Constraints {
+                    width: Limit::Bounded(rect.width),
+                    height: Limit::Unbounded,
+                })
+                .height
+                .max(1);
+            measurements.push((index, height));
+        }
+        if measurements.is_empty() {
+            break;
+        }
+        let Some(next) = interaction.apply_virtual_flow_measurements(
+            id,
+            &measurements,
+            rect.height,
+            flow.options.overscan,
+            flow.options.stick_to_end,
+        ) else {
+            break;
+        };
+        window = next;
+    }
+
+    let mut items = Vec::with_capacity(window.built.len());
+    let mut child_changed = false;
+    for index in window.built.clone() {
+        let node = reusable
+            .remove(&index)
+            .unwrap_or_else(|| flow.source.build(index, rect.width));
+        let Some((origin, height, _)) = interaction.virtual_flow_item_layout(id, index) else {
+            continue;
+        };
+        child_changed |= node.prepare_at(
+            virtual_flow_item_rect(rect, window.offset, origin, height),
+            interaction,
+        );
+        items.push(VirtualFlowBuiltItem {
+            index,
+            origin,
+            height,
+            node,
+        });
+    }
+    let frame = VirtualFlowFrame {
+        rect,
+        offset: window.offset,
+        content_height: window.content_height,
+        generation: window.generation,
+        items,
+    };
+    let signature = (
+        frame.rect,
+        frame.offset,
+        frame.content_height,
+        frame.generation,
+        frame.items.first().map(|item| item.index),
+        frame.items.last().map(|item| item.index),
+    );
+    *flow.cache.borrow_mut() = Some(frame);
+    previous_signature != Some(signature) || child_changed
+}
+
+fn virtual_flow_item_rect(viewport: Rect, offset: u32, origin: u32, height: u32) -> Rect {
+    Rect::new(
+        viewport.x,
+        clamp_i64_to_i32(i64::from(viewport.y) + i64::from(origin) - i64::from(offset)),
+        viewport.width,
         height,
     )
 }

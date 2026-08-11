@@ -23,6 +23,7 @@ mod progress;
 mod radio;
 mod scrollbar;
 mod select;
+mod selectable_text;
 mod sparkline;
 mod spinner;
 mod table;
@@ -31,6 +32,7 @@ mod text_area;
 mod text_area_history;
 mod tree;
 mod tree_state;
+mod virtual_feed;
 
 #[cfg(test)]
 mod fixture_support;
@@ -64,6 +66,10 @@ pub use progress::{Progress, ProgressStyle};
 pub use radio::{Radio, RadioStyle};
 pub use scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarStyle};
 pub use select::{Select, SelectStyle};
+pub use selectable_text::{
+    SelectableText, SelectableTextContent, SelectableTextState, SelectableTextStyle, TextCopyKind,
+    TextCopyRequest,
+};
 pub use sparkline::Sparkline;
 pub use spinner::{SPINNER_FRAMES, Spinner, SpinnerStyle};
 pub use table::{Table, TableColumn, TableRow, TableStyle};
@@ -72,3 +78,4 @@ pub use text_area::{TextArea, TextAreaBoundaryNavigation, TextAreaState, TextAre
 pub use text_area_history::TextAreaHistory;
 pub use tree::{Tree, TreeItem, TreeStyle};
 pub use tree_state::TreeState;
+pub use virtual_feed::VirtualFeed;

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use nagi_text::{WidthProfile, grapheme_width, graphemes};
 use nagi_vt::Style;
 
@@ -18,7 +20,7 @@ pub enum WrapMode {
 /// One styled run of paragraph text
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextSpan {
-    text: String,
+    text: Arc<str>,
     style: Style,
 }
 
@@ -27,7 +29,7 @@ impl TextSpan {
     #[must_use]
     pub fn new(text: impl Into<String>, style: Style) -> Self {
         Self {
-            text: text.into(),
+            text: Arc::from(text.into()),
             style,
         }
     }
@@ -42,6 +44,13 @@ impl TextSpan {
     #[must_use]
     pub const fn style(&self) -> Style {
         self.style
+    }
+
+    /// Returns this span with a replacement style while sharing its text
+    #[must_use]
+    pub fn with_style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
     }
 }
 
@@ -90,6 +99,19 @@ struct ParagraphLayoutEntry {
     key: ParagraphLayoutKey,
     lines: Vec<ParagraphLine>,
     size: Size,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_span_clones_share_text_storage() {
+        let span = TextSpan::new("shared text", Style::default());
+        let clone = span.clone();
+        assert_eq!(span, clone);
+        assert!(std::ptr::eq(span.text().as_ptr(), clone.text().as_ptr()));
+    }
 }
 
 pub(crate) struct ParagraphLayout<'a> {
