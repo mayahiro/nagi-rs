@@ -429,9 +429,14 @@ mod tests {
 
         let groups = harness.active_action_groups().unwrap();
 
-        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].owner().as_str(), "owner");
         assert_eq!(groups[0].actions()[0].id().as_str(), "app.action");
+        assert_eq!(groups[1].owner().as_str(), "owner");
+        assert_eq!(
+            groups[1].actions()[0].id().as_str(),
+            nagi_tui::FOCUS_NEXT_ACTION_ID
+        );
     }
 
     struct ManualApp {

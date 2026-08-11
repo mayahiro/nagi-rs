@@ -7,7 +7,11 @@ use std::time::Duration;
 use nagi_surface::SurfaceError;
 use nagi_vt::{Event, KeyAction, KeyCode, MouseButton, MouseKind, TerminalOp};
 
-use crate::action_routing::{ActionIndex, ResolvedActionRoute, validate_action_owners};
+use crate::action_routing::{
+    ActionIndex, CoreActionMatch, ResolvedActionRoute, route_needs_action_resolution,
+    validate_action_owners,
+};
+use crate::core_action::{CoreAction, default_focus_action};
 use crate::effect::RuntimeCommand;
 use crate::renderer::operations;
 use crate::routing::{FocusChange, InteractiveKind, PointerChange, TreeIndex};
@@ -224,6 +228,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     action_index: ActionIndex<Application::Message>,
     next_action_index: ActionIndex<Application::Message>,
     resolved_action_route: Option<ResolvedActionRoute<Application::Message>>,
+    next_resolved_action_route: ResolvedActionRoute<Application::Message>,
     effects: EffectSupervisor<Application::Message>,
     subscriptions: SubscriptionSupervisor<Application::Message>,
     subscriptions_dirty: bool,
@@ -298,6 +303,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             action_index: ActionIndex::default(),
             next_action_index: ActionIndex::default(),
             resolved_action_route: None,
+            next_resolved_action_route: ResolvedActionRoute::default(),
             effects,
             subscriptions,
             subscriptions_dirty: false,
@@ -556,7 +562,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         for (id, offset) in self.pending_scroll.drain(..) {
             if index
                 .record(&id)
-                .is_some_and(|record| record.kind == InteractiveKind::ScrollViewport)
+                .is_some_and(|record| record.kind.is_scroll_viewport())
             {
                 self.interaction.request_scroll(&id, offset);
             }
@@ -633,11 +639,16 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     /// Returns resolved semantic action groups on the active target-to-root route
     ///
     /// Groups outside the nearest StopAtScope boundary are omitted. Each
-    /// projection contains the complete active root-to-target scope path
+    /// projection contains the complete active root-to-target scope path.
+    /// At one Node, a Node-declared group precedes a Core semantic group, so
+    /// the same owner may occur twice
     pub fn active_action_groups(&mut self) -> Result<Vec<ResolvedActions>, RuntimeError> {
         self.ensure_tree()?;
         let route = self.tree_index.route(self.interaction.focused.as_ref());
-        self.ensure_action_route(&route)?;
+        let focus_owner = self
+            .tree_index
+            .focus_action_owner(self.interaction.focused.as_ref());
+        self.ensure_action_route(&route, focus_owner.as_ref())?;
         Ok(self
             .resolved_action_route
             .as_ref()
@@ -647,26 +658,13 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     /// Routes one normalized event through focus, hit testing, and ancestors
     pub fn dispatch_event(&mut self, event: &Event) -> Result<EventDispatch, RuntimeEventError> {
         self.ensure_tree()?;
-        if let Event::Key(key) = event {
-            if key.action != KeyAction::Release
-                && key.code == KeyCode::Tab
-                && !key.modifiers.alt
-                && !key.modifiers.control
-                && !key.modifiers.meta
-            {
-                let focus_scope = self.tree_index.focus_scope();
-                self.interaction.focused = crate::interaction::traverse_focus(
-                    focus_scope.as_ref(),
-                    self.interaction.focused.as_ref(),
-                    !key.modifiers.shift,
-                );
-                self.dirty = true;
-                self.urgent_frame = true;
-                return Ok(EventDispatch {
-                    consumed: true,
-                    messages: 0,
-                    redraw: true,
-                });
+        if self
+            .tree_index
+            .focus_action_owner(self.interaction.focused.as_ref())
+            .is_none()
+        {
+            if let Some(action) = default_focus_action(event) {
+                return Ok(self.dispatch_legacy_focus_action(action));
             }
         }
 
@@ -690,14 +688,34 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         }
 
         let route = self.tree_index.route(target.as_ref());
-        self.ensure_action_route(&route)?;
+        let focus_owner = self
+            .tree_index
+            .focus_action_owner(self.interaction.focused.as_ref());
+        self.ensure_action_route(&route, focus_owner.as_ref())?;
         let mut dispatch = EventDispatch::default();
         for (index, id) in route.into_iter().enumerate() {
             let action_result = self
                 .resolved_action_route
                 .as_ref()
-                .and_then(|resolved| resolved.match_event(index, event).invoke());
+                .and_then(|resolved| resolved.match_declared_event(index, event).invoke());
             if let Some(result) = action_result {
+                self.apply_event_result(result, &mut dispatch)?;
+                if dispatch.consumed {
+                    break;
+                }
+            }
+            let core_match = self
+                .resolved_action_route
+                .as_ref()
+                .map_or(CoreActionMatch::None, |resolved| {
+                    resolved.match_core_event(index, event)
+                });
+            let core_result = match core_match {
+                CoreActionMatch::None => None,
+                CoreActionMatch::Consume => Some(EventResult::consumed()),
+                CoreActionMatch::Invoke(action) => self.handle_core_action(&id, action),
+            };
+            if let Some(result) = core_result {
                 self.apply_event_result(result, &mut dispatch)?;
                 if dispatch.consumed {
                     break;
@@ -709,7 +727,8 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 .map_or(InteractiveKind::Generic, |record| record.kind);
             let special = match kind {
                 InteractiveKind::TextInput if index == 0 => self.handle_text_input(&id, event),
-                InteractiveKind::ScrollViewport => self.handle_scroll(&id, event),
+                InteractiveKind::ScrollViewportVertical
+                | InteractiveKind::ScrollViewportHorizontal => self.handle_scroll_mouse(&id, event),
                 InteractiveKind::Generic | InteractiveKind::TextInput | InteractiveKind::Modal => {
                     None
                 }
@@ -734,21 +753,82 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         Ok(dispatch)
     }
 
-    fn ensure_action_route(&mut self, route: &[NodeId]) -> Result<(), RuntimeError> {
-        if !self.action_index.has_actions() {
-            self.resolved_action_route = None;
+    fn ensure_action_route(
+        &mut self,
+        route: &[NodeId],
+        focus_owner: Option<&NodeId>,
+    ) -> Result<(), RuntimeError> {
+        if !route_needs_action_resolution(route, &self.action_index, &self.tree_index, focus_owner)
+        {
+            self.publish_resolved_action_route(false);
             return Ok(());
         }
         if self
             .resolved_action_route
             .as_ref()
-            .is_some_and(|resolved| resolved.matches_route(route))
+            .is_some_and(|resolved| resolved.matches_route(route, focus_owner))
         {
             return Ok(());
         }
-        let resolved = ResolvedActionRoute::resolve(route, &self.action_index)?;
-        self.resolved_action_route = Some(resolved);
+        self.next_resolved_action_route.resolve_into(
+            route,
+            &self.action_index,
+            &self.tree_index,
+            focus_owner,
+        )?;
+        self.publish_resolved_action_route(true);
         Ok(())
+    }
+
+    fn publish_resolved_action_route(&mut self, active: bool) {
+        if active {
+            let previous = self.resolved_action_route.take().unwrap_or_default();
+            let current = std::mem::replace(&mut self.next_resolved_action_route, previous);
+            self.resolved_action_route = Some(current);
+        } else if let Some(previous) = self.resolved_action_route.take() {
+            self.next_resolved_action_route = previous;
+        }
+    }
+
+    fn dispatch_legacy_focus_action(&mut self, action: CoreAction) -> EventDispatch {
+        let forward = matches!(action, CoreAction::FocusNext);
+        let focus_scope = self.tree_index.focus_scope();
+        self.interaction.focused = crate::interaction::traverse_focus(
+            focus_scope.as_ref(),
+            self.interaction.focused.as_ref(),
+            forward,
+        );
+        self.dirty = true;
+        self.urgent_frame = true;
+        EventDispatch {
+            consumed: true,
+            messages: 0,
+            redraw: true,
+        }
+    }
+
+    fn handle_core_action(
+        &mut self,
+        id: &NodeId,
+        action: CoreAction,
+    ) -> Option<EventResult<Application::Message>> {
+        match action {
+            CoreAction::FocusNext | CoreAction::FocusPrevious => {
+                let focus_scope = self.tree_index.focus_scope();
+                self.interaction.focused = crate::interaction::traverse_focus(
+                    focus_scope.as_ref(),
+                    self.interaction.focused.as_ref(),
+                    action == CoreAction::FocusNext,
+                );
+                self.dirty = true;
+                self.urgent_frame = true;
+                Some(EventResult::consumed().redraw())
+            }
+            CoreAction::ScrollPageUp
+            | CoreAction::ScrollPageDown
+            | CoreAction::ScrollStart
+            | CoreAction::ScrollEnd => self.handle_scroll_action(id, action),
+        }
     }
 
     fn handle_text_input(
@@ -794,14 +874,13 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         Some(result)
     }
 
-    fn handle_scroll(
+    fn handle_scroll_mouse(
         &mut self,
         id: &NodeId,
         event: &Event,
     ) -> Option<EventResult<Application::Message>> {
         let state = self.interaction.scroll_state(id)?;
         let axis = self.view_tree.as_ref()?.scroll_options(id)?.axis;
-        let viewport = self.tree_index.record(id)?.rect;
         let current = state.offset;
         let next = match event {
             Event::Mouse(mouse) if mouse.kind == MouseKind::Scroll => match mouse.button {
@@ -819,24 +898,54 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 }
                 _ => return None,
             },
-            Event::Key(key) if key.action != KeyAction::Release => match key.code {
-                KeyCode::PageUp if axis.allows_vertical() => {
-                    ScrollOffset::new(current.x, current.y.saturating_sub(viewport.height.max(1)))
-                }
-                KeyCode::PageDown if axis.allows_vertical() => {
-                    ScrollOffset::new(current.x, current.y.saturating_add(viewport.height.max(1)))
-                }
-                KeyCode::Home if axis.allows_vertical() => ScrollOffset::new(current.x, 0),
-                KeyCode::End if axis.allows_vertical() => {
-                    ScrollOffset::new(current.x, state.maximum.y)
-                }
-                KeyCode::Home if axis.allows_horizontal() => ScrollOffset::new(0, current.y),
-                KeyCode::End if axis.allows_horizontal() => {
-                    ScrollOffset::new(state.maximum.x, current.y)
-                }
-                _ => return None,
-            },
             _ => return None,
+        };
+        let (state, changed) = self.interaction.request_scroll(id, next)?;
+        self.dirty = true;
+        self.urgent_frame = true;
+        let mut result = EventResult::consumed().redraw();
+        if changed {
+            if let Some(message) = self
+                .view_tree
+                .as_ref()
+                .and_then(|view| view.scroll_message(id, state))
+            {
+                result = result.emit(message);
+            }
+        }
+        Some(result)
+    }
+
+    fn handle_scroll_action(
+        &mut self,
+        id: &NodeId,
+        action: CoreAction,
+    ) -> Option<EventResult<Application::Message>> {
+        let state = self.interaction.scroll_state(id)?;
+        let axis = self.view_tree.as_ref()?.scroll_options(id)?.axis;
+        let viewport = self.tree_index.record(id)?.rect;
+        let current = state.offset;
+        let next = match action {
+            CoreAction::ScrollPageUp if axis.allows_vertical() => {
+                ScrollOffset::new(current.x, current.y.saturating_sub(viewport.height.max(1)))
+            }
+            CoreAction::ScrollPageDown if axis.allows_vertical() => {
+                ScrollOffset::new(current.x, current.y.saturating_add(viewport.height.max(1)))
+            }
+            CoreAction::ScrollStart if axis.allows_vertical() => ScrollOffset::new(current.x, 0),
+            CoreAction::ScrollEnd if axis.allows_vertical() => {
+                ScrollOffset::new(current.x, state.maximum.y)
+            }
+            CoreAction::ScrollStart if axis.allows_horizontal() => ScrollOffset::new(0, current.y),
+            CoreAction::ScrollEnd if axis.allows_horizontal() => {
+                ScrollOffset::new(state.maximum.x, current.y)
+            }
+            CoreAction::FocusNext
+            | CoreAction::FocusPrevious
+            | CoreAction::ScrollPageUp
+            | CoreAction::ScrollPageDown
+            | CoreAction::ScrollStart
+            | CoreAction::ScrollEnd => return None,
         };
         let (state, changed) = self.interaction.request_scroll(id, next)?;
         self.dirty = true;
@@ -1026,10 +1135,11 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.next_action_index = action_index;
             return Err(error);
         }
-        let resolved_action_route = match resolve_frame_actions(
+        let has_resolved_action_route = match resolve_frame_actions_into(
             &tree_index,
             &action_index,
             self.interaction.focused.as_ref(),
+            &mut self.next_resolved_action_route,
         ) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -1042,7 +1152,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.next_tree_index = previous;
         let previous = std::mem::replace(&mut self.action_index, action_index);
         self.next_action_index = previous;
-        self.resolved_action_route = resolved_action_route;
+        self.publish_resolved_action_route(has_resolved_action_route);
         self.view_tree = Some(view);
         Ok(())
     }
@@ -1109,10 +1219,11 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.next_action_index = action_index;
             return Err(error);
         }
-        let resolved_action_route = match resolve_frame_actions(
+        let has_resolved_action_route = match resolve_frame_actions_into(
             &tree_index,
             &action_index,
             self.interaction.focused.as_ref(),
+            &mut self.next_resolved_action_route,
         ) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -1152,7 +1263,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.next_tree_index = previous;
         let previous = std::mem::replace(&mut self.action_index, action_index);
         self.next_action_index = previous;
-        self.resolved_action_route = resolved_action_route;
+        self.publish_resolved_action_route(has_resolved_action_route);
         self.dirty = false;
         self.urgent_frame = false;
         self.last_frame = Some(now);
@@ -1170,17 +1281,15 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     }
 }
 
-fn resolve_frame_actions<Message>(
+fn resolve_frame_actions_into<Message>(
     tree: &TreeIndex,
     actions: &ActionIndex<Message>,
     target: Option<&NodeId>,
-) -> Result<Option<ResolvedActionRoute<Message>>, RuntimeError> {
+    resolved: &mut ResolvedActionRoute<Message>,
+) -> Result<bool, RuntimeError> {
     validate_action_owners(tree, actions)?;
-    if !actions.has_actions() {
-        return Ok(None);
-    }
-    let route = tree.route(target);
-    Ok(Some(ResolvedActionRoute::resolve(&route, actions)?))
+    let focus_owner = tree.focus_action_owner(target);
+    Ok(resolved.resolve_tree_route_into(target, actions, tree, focus_owner.as_ref())?)
 }
 
 fn visible_axis_offset(

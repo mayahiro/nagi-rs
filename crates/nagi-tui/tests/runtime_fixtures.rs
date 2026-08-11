@@ -4,9 +4,11 @@ mod support;
 
 use nagi_tui::{
     Action, ActionAvailability, ActionDescriptor, ActionId, App, BindingConflictKind, Capabilities,
-    Effect, Event, EventResult, Insets, KeyAction, KeyBinding, KeyCode, KeyEvent, KeyMap,
-    KeyProtocol, KeyScope, KeyScopePropagation, KeyStroke, Modifiers, Node, NodeId, Runtime,
-    RuntimeError, RuntimeEventError, Size, Style, Subscription, VirtualClock, encode,
+    Effect, Event, EventResult, FOCUS_NEXT_ACTION_ID, FOCUS_PREVIOUS_ACTION_ID, Insets, KeyAction,
+    KeyBinding, KeyCode, KeyEvent, KeyMap, KeyProtocol, KeyScope, KeyScopePropagation, KeyStroke,
+    Length, Modifiers, MouseButton, MouseEvent, MouseKind, Node, NodeId, Runtime, RuntimeError,
+    RuntimeEventError, SCROLL_PAGE_DOWN_ACTION_ID, ScrollAxis, ScrollOffset, ScrollViewportOptions,
+    Size, Style, Subscription, VirtualClock, encode,
 };
 
 #[derive(Default)]
@@ -319,6 +321,448 @@ fn scoped_key_routing_matches_shared_fixtures() {
             record.id
         );
     }
+}
+
+struct CoreNavigationApp {
+    scenario: String,
+    updates: Vec<String>,
+}
+
+impl App for CoreNavigationApp {
+    type Message = String;
+
+    fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+        self.updates.push(message);
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        if self.scenario.starts_with("focus-") {
+            focus_navigation_view(&self.scenario)
+        } else {
+            scroll_navigation_view(&self.scenario)
+        }
+    }
+}
+
+fn focus_navigation_view(scenario: &str) -> Node<String> {
+    let mut first = Node::text("a").focusable("a");
+    match scenario {
+        "focus-unbind-raw" => {
+            first = first.on_event("a", |_| EventResult::message("raw".to_owned()));
+        }
+        "focus-declared-shadow" => {
+            first = first.on_actions("a", [core_fixture_action(KeyCode::Tab, false)]);
+        }
+        "focus-declared-ignore" => {
+            first = first.on_actions("a", [core_fixture_action(KeyCode::Tab, true)]);
+        }
+        _ => {}
+    }
+    let content = Node::column([first, Node::text("b").focusable("b")]);
+    match scenario {
+        "focus-rebind" => {
+            let key_map = KeyMap::new()
+                .rebind(ActionId::from(FOCUS_NEXT_ACTION_ID), [binding('x')])
+                .unwrap();
+            content.with_key_scope(KeyScope::new("root", key_map))
+        }
+        "focus-unbind-raw" => {
+            let key_map = KeyMap::new()
+                .rebind(
+                    ActionId::from(FOCUS_NEXT_ACTION_ID),
+                    std::iter::empty::<KeyBinding>(),
+                )
+                .unwrap();
+            content.with_key_scope(KeyScope::new("root", key_map))
+        }
+        "focus-modal-no-focus" => Node::padding(Node::modal("modal", content), Insets::all(0)),
+        _ => content,
+    }
+}
+
+fn scroll_navigation_view(scenario: &str) -> Node<String> {
+    if matches!(
+        scenario,
+        "scroll-stop-boundary" | "scroll-wheel-through-stop"
+    ) {
+        let child = Node::text("child").focusable("child");
+        let scope = Node::padding(child, Insets::all(0))
+            .with_key_scope(
+                KeyScope::new("scope", KeyMap::new())
+                    .with_propagation(KeyScopePropagation::StopAtScope),
+            )
+            .with_length(Length::Fixed(2));
+        let content = Node::column([
+            scope,
+            Node::text("o0\no1\no2\no3").with_length(Length::Fixed(4)),
+        ]);
+        return Node::scroll_viewport_with_options(
+            "outer",
+            content,
+            core_scroll_options(ScrollAxis::Vertical, "outer-scroll"),
+        )
+        .on_event("outer", |_| EventResult::message("outer-raw".to_owned()));
+    }
+
+    let inner_axis = if scenario == "scroll-horizontal-pass" {
+        ScrollAxis::Horizontal
+    } else {
+        ScrollAxis::Vertical
+    };
+    let inner_content = if inner_axis == ScrollAxis::Horizontal {
+        Node::text("abcdefghijklmnop")
+    } else {
+        Node::text("i0\ni1\ni2\ni3\ni4\ni5")
+    };
+    let mut inner = Node::scroll_viewport_with_options(
+        "inner",
+        inner_content,
+        core_scroll_options(inner_axis, "inner-scroll"),
+    )
+    .with_length(Length::Fixed(2));
+    match scenario {
+        "scroll-unbind-raw" | "scroll-modified-raw" => {
+            inner = inner.on_event("inner", |_| EventResult::message("raw".to_owned()));
+        }
+        "scroll-declared-shadow" => {
+            inner = inner.on_actions("inner", [core_fixture_action(KeyCode::PageDown, false)]);
+        }
+        "scroll-declared-ignore" => {
+            inner = inner.on_actions("inner", [core_fixture_action(KeyCode::PageDown, true)]);
+        }
+        _ => {}
+    }
+    let content = Node::column([
+        inner,
+        Node::text("o0\no1\no2\no3").with_length(Length::Fixed(4)),
+    ]);
+    let mut outer = Node::scroll_viewport_with_options(
+        "outer",
+        content,
+        core_scroll_options(ScrollAxis::Vertical, "outer-scroll"),
+    );
+    match scenario {
+        "scroll-rebind" => {
+            let key_map = KeyMap::new()
+                .rebind(ActionId::from(SCROLL_PAGE_DOWN_ACTION_ID), [binding('x')])
+                .unwrap();
+            outer = outer.with_key_scope(KeyScope::new("outer", key_map));
+        }
+        "scroll-unbind-raw" => {
+            let key_map = KeyMap::new()
+                .rebind(
+                    ActionId::from(SCROLL_PAGE_DOWN_ACTION_ID),
+                    std::iter::empty::<KeyBinding>(),
+                )
+                .unwrap();
+            outer = outer.with_key_scope(KeyScope::new("outer", key_map));
+        }
+        _ => {}
+    }
+    outer
+}
+
+fn core_scroll_options(axis: ScrollAxis, message: &'static str) -> ScrollViewportOptions<String> {
+    ScrollViewportOptions {
+        axis,
+        on_scroll: Some(Box::new(move |_| message.to_owned())),
+        ..ScrollViewportOptions::default()
+    }
+}
+
+fn core_fixture_action(code: KeyCode, ignored: bool) -> Action<String> {
+    Action::new(
+        ActionDescriptor::new(
+            "app.declared",
+            "Declared",
+            [named_binding(code, Modifiers::NONE)],
+        ),
+        move |_| {
+            if ignored {
+                EventResult::ignored().emit("declared".to_owned())
+            } else {
+                EventResult::message("declared".to_owned())
+            }
+        },
+    )
+}
+
+#[test]
+fn core_navigation_actions_match_shared_fixtures() {
+    let Some(records) = support::load(
+        "interaction/core-navigation-runtime.txt",
+        "core-navigation-runtime",
+        &[
+            "event",
+            "focus",
+            "expected-focus",
+            "inner",
+            "outer",
+            "expected-inner",
+            "expected-outer",
+            "messages",
+            "consumed",
+            "groups",
+        ],
+    ) else {
+        return;
+    };
+    for record in records {
+        let mut runtime = Runtime::with_clock(
+            CoreNavigationApp {
+                scenario: record.id.clone(),
+                updates: Vec::new(),
+            },
+            nagi_tui::RuntimeConfig::new(Size::new(8, 3)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        if record.field("focus") != "none" {
+            assert!(
+                runtime
+                    .request_focus(&NodeId::from(record.field("focus")))
+                    .unwrap(),
+                "case {}",
+                record.id
+            );
+        }
+        for field in ["inner", "outer"] {
+            if let Some(offset) = optional_number(record.field(field)) {
+                assert!(
+                    runtime.set_scroll_offset(&NodeId::from(field), ScrollOffset::new(0, offset)),
+                    "case {} field {field}",
+                    record.id
+                );
+            }
+        }
+        runtime.render_if_dirty().unwrap();
+
+        let groups: Vec<_> = runtime
+            .active_action_groups()
+            .unwrap()
+            .iter()
+            .map(|group| group.owner().as_str().to_owned())
+            .collect();
+        assert_eq!(
+            groups,
+            fixture_list(record.field("groups")),
+            "case {}",
+            record.id
+        );
+
+        let dispatch = runtime
+            .dispatch_event(&core_navigation_event(record.field("event")))
+            .unwrap();
+        runtime.process_pending().unwrap();
+
+        assert_eq!(
+            dispatch.consumed(),
+            record.field("consumed") == "true",
+            "case {}",
+            record.id
+        );
+        assert_eq!(
+            runtime
+                .interaction()
+                .focused()
+                .map_or("none", NodeId::as_str),
+            record.field("expected-focus"),
+            "case {}",
+            record.id
+        );
+        for field in ["inner", "outer"] {
+            let expected_field = format!("expected-{field}");
+            if let Some(expected) = optional_number(record.field(&expected_field)) {
+                assert_eq!(
+                    runtime.interaction().scroll_offset(&NodeId::from(field)).y,
+                    expected,
+                    "case {} field {field}",
+                    record.id
+                );
+            }
+        }
+        assert_eq!(
+            runtime.app().updates,
+            fixture_list(record.field("messages")),
+            "case {}",
+            record.id
+        );
+    }
+}
+
+fn core_navigation_event(value: &str) -> Event {
+    match value {
+        "tab" => named_key_event(KeyCode::Tab, Modifiers::NONE),
+        "shift-tab" => named_key_event(
+            KeyCode::Tab,
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        ),
+        "repeat-tab" => key_event_with_action(KeyCode::Tab, Modifiers::NONE, KeyAction::Repeat),
+        "release-tab" => key_event_with_action(KeyCode::Tab, Modifiers::NONE, KeyAction::Release),
+        "ctrl-tab" => named_key_event(
+            KeyCode::Tab,
+            Modifiers {
+                control: true,
+                ..Modifiers::NONE
+            },
+        ),
+        "page-up" => named_key_event(KeyCode::PageUp, Modifiers::NONE),
+        "page-down" => named_key_event(KeyCode::PageDown, Modifiers::NONE),
+        "repeat-page-down" => {
+            key_event_with_action(KeyCode::PageDown, Modifiers::NONE, KeyAction::Repeat)
+        }
+        "unknown-page-down" => {
+            key_event_with_action(KeyCode::PageDown, Modifiers::NONE, KeyAction::Unknown)
+        }
+        "release-page-down" => {
+            key_event_with_action(KeyCode::PageDown, Modifiers::NONE, KeyAction::Release)
+        }
+        "home" => named_key_event(KeyCode::Home, Modifiers::NONE),
+        "end" => named_key_event(KeyCode::End, Modifiers::NONE),
+        "ctrl-page-down" => named_key_event(
+            KeyCode::PageDown,
+            Modifiers {
+                control: true,
+                ..Modifiers::NONE
+            },
+        ),
+        "key/x" => Event::Key(KeyEvent {
+            code: KeyCode::Character('x'),
+            modifiers: Modifiers::NONE,
+            action: KeyAction::Press,
+            text: Some("x".to_owned()),
+            protocol: KeyProtocol::Legacy,
+        }),
+        "wheel-down" => Event::Mouse(MouseEvent {
+            kind: MouseKind::Scroll,
+            button: MouseButton::WheelDown,
+            x: 0,
+            y: 0,
+            modifiers: Modifiers::NONE,
+        }),
+        _ => panic!("unknown core navigation event {value}"),
+    }
+}
+
+fn named_key_event(code: KeyCode, modifiers: Modifiers) -> Event {
+    key_event_with_action(code, modifiers, KeyAction::Press)
+}
+
+fn key_event_with_action(code: KeyCode, modifiers: Modifiers, action: KeyAction) -> Event {
+    Event::Key(KeyEvent {
+        code,
+        modifiers,
+        action,
+        text: None,
+        protocol: KeyProtocol::Legacy,
+    })
+}
+
+fn named_binding(code: KeyCode, modifiers: Modifiers) -> KeyBinding {
+    KeyBinding::new(KeyStroke::new(code, modifiers))
+}
+
+fn optional_number(value: &str) -> Option<u32> {
+    (value != "-").then(|| number(value))
+}
+
+struct ConflictingCoreActions;
+
+impl App for ConflictingCoreActions {
+    type Message = ();
+
+    fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        let key_map = KeyMap::new()
+            .rebind(ActionId::from(FOCUS_NEXT_ACTION_ID), [binding('x')])
+            .unwrap()
+            .rebind(ActionId::from(SCROLL_PAGE_DOWN_ACTION_ID), [binding('x')])
+            .unwrap();
+        Node::scroll_viewport("viewport", Node::text("a\nb\nc"))
+            .with_key_scope(KeyScope::new("viewport", key_map))
+    }
+}
+
+#[test]
+fn runtime_rejects_same_owner_core_action_conflicts() {
+    let mut runtime = Runtime::with_clock(
+        ConflictingCoreActions,
+        nagi_tui::RuntimeConfig::new(Size::new(8, 1)),
+        VirtualClock::new(),
+    )
+    .unwrap();
+    let error = runtime.render_if_dirty().unwrap_err();
+    let RuntimeError::BindingConflict(conflict) = error else {
+        panic!("unexpected error {error}");
+    };
+    assert_eq!(conflict.kind(), BindingConflictKind::AmbiguousBinding);
+    assert_eq!(conflict.owner().as_str(), "viewport");
+    assert_eq!(
+        conflict
+            .actions()
+            .iter()
+            .map(ActionId::as_str)
+            .collect::<Vec<_>>(),
+        [FOCUS_NEXT_ACTION_ID, SCROLL_PAGE_DOWN_ACTION_ID]
+    );
+}
+
+struct FutureFocusConflict;
+
+impl App for FutureFocusConflict {
+    type Message = ();
+
+    fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        let key_map = KeyMap::new()
+            .rebind(ActionId::from(FOCUS_NEXT_ACTION_ID), [binding('x')])
+            .unwrap()
+            .rebind(ActionId::from(FOCUS_PREVIOUS_ACTION_ID), [binding('x')])
+            .unwrap();
+        Node::column([
+            Node::text("a").focusable("a"),
+            Node::text("b")
+                .focusable("b")
+                .with_key_scope(KeyScope::new("b", key_map))
+                .on_event("b", |_| EventResult::message(())),
+        ])
+    }
+}
+
+#[test]
+fn newly_focused_core_route_is_resolved_before_the_next_handler() {
+    let mut runtime = Runtime::with_clock(
+        FutureFocusConflict,
+        nagi_tui::RuntimeConfig::new(Size::new(8, 2)),
+        VirtualClock::new(),
+    )
+    .unwrap();
+    runtime.render_if_dirty().unwrap();
+    assert!(runtime.request_focus(&NodeId::from("a")).unwrap());
+    runtime
+        .dispatch_event(&named_key_event(KeyCode::Tab, Modifiers::NONE))
+        .unwrap();
+    assert_eq!(runtime.interaction().focused(), Some(&NodeId::from("b")));
+
+    let error = runtime
+        .dispatch_event(&named_key_event(KeyCode::Character('z'), Modifiers::NONE))
+        .unwrap_err();
+    let RuntimeEventError::Runtime(RuntimeError::BindingConflict(conflict)) = error else {
+        panic!("unexpected error {error}");
+    };
+    assert_eq!(conflict.owner().as_str(), "b");
+    assert_eq!(runtime.queued_messages(), 0);
 }
 
 struct ConflictingActions;

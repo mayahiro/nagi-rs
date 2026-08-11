@@ -1,5 +1,6 @@
 //! Shared Tree semantic-action integration tests
 
+mod action_support;
 mod support;
 
 use nagi_tui::{
@@ -103,7 +104,8 @@ fn tree_actions_match_shared_fixtures() {
         let focused = runtime.request_focus(&NodeId::from("root")).unwrap();
         assert_eq!(focused, available, "case {}", record.id);
         let resolved = if available {
-            let groups = runtime.active_action_groups().unwrap();
+            let groups =
+                action_support::node_declared_groups(runtime.active_action_groups().unwrap());
             assert_eq!(groups.len(), 1, "case {}", record.id);
             assert_eq!(groups[0].owner().as_str(), "root", "case {}", record.id);
             groups[0].clone()

@@ -899,10 +899,11 @@ impl<Message> Node<Message> {
     ) -> Result<(), NodeId> {
         let mut child_parent = parent.cloned();
         if let Some(id) = &self.id {
-            let kind = match self.kind {
+            let kind = match &self.kind {
                 NodeKind::TextInput { .. } => InteractiveKind::TextInput,
-                NodeKind::ScrollViewport { .. } | NodeKind::VirtualScrollViewport(_) => {
-                    InteractiveKind::ScrollViewport
+                NodeKind::ScrollViewport { options, .. } => scroll_interactive_kind(options.axis),
+                NodeKind::VirtualScrollViewport(virtual_node) => {
+                    scroll_interactive_kind(virtual_node.options.axis)
                 }
                 NodeKind::Modal(_) => InteractiveKind::Modal,
                 _ => InteractiveKind::Generic,
@@ -1202,6 +1203,14 @@ impl<Message> Node<Message> {
             | NodeKind::ScrollViewport { .. }
             | NodeKind::VirtualScrollViewport(_) => false,
         }
+    }
+}
+
+const fn scroll_interactive_kind(axis: ScrollAxis) -> InteractiveKind {
+    if matches!(axis, ScrollAxis::Horizontal) {
+        InteractiveKind::ScrollViewportHorizontal
+    } else {
+        InteractiveKind::ScrollViewportVertical
     }
 }
 

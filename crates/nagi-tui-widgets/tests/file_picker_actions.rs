@@ -1,5 +1,6 @@
 //! Shared FilePicker semantic-action integration tests
 
+mod action_support;
 mod support;
 
 use nagi_tui::{
@@ -143,7 +144,8 @@ fn file_picker_actions_match_shared_fixtures() {
                 "case {}",
                 record.id
             );
-            let groups = runtime.active_action_groups().unwrap();
+            let groups =
+                action_support::node_declared_groups(runtime.active_action_groups().unwrap());
             assert_eq!(groups.len(), 1, "case {}", record.id);
             assert_eq!(groups[0].owner().as_str(), "files", "case {}", record.id);
         }

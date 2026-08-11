@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::core_action::{
+    CoreAction, action_group as core_action_group,
+    resolve_action_group as resolve_core_action_group,
+};
 use crate::keymap::{Action, ActionEvent};
 use crate::routing::TreeIndex;
 use crate::{
@@ -122,26 +126,61 @@ pub(crate) fn validate_action_owners<Message>(
 
 pub(crate) struct ResolvedActionRoute<Message> {
     route: Vec<NodeId>,
-    groups: Vec<Option<ResolvedActionGroup<Message>>>,
+    focus_owner: Option<NodeId>,
+    groups: Vec<ResolvedRouteGroups<Message>>,
+}
+
+impl<Message> Default for ResolvedActionRoute<Message> {
+    fn default() -> Self {
+        Self {
+            route: Vec::new(),
+            focus_owner: None,
+            groups: Vec::new(),
+        }
+    }
 }
 
 impl<Message> ResolvedActionRoute<Message> {
-    pub(crate) fn resolve(
+    pub(crate) fn resolve_into(
+        &mut self,
         route: &[NodeId],
         actions: &ActionIndex<Message>,
-    ) -> Result<Self, BindingConflict> {
-        let scopes = scopes_for_route(actions, route);
-        let stop = route.iter().position(|id| {
-            actions.record(id).is_some_and(|record| {
-                record
-                    .scope
-                    .as_ref()
-                    .is_some_and(|scope| scope.propagation == KeyScopePropagation::StopAtScope)
-            })
-        });
-        let allowed = stop.map_or(route.len(), |index| index + 1);
-        let mut groups: Vec<Option<ResolvedActionGroup<Message>>> =
-            std::iter::repeat_with(|| None).take(route.len()).collect();
+        tree: &TreeIndex,
+        focus_owner: Option<&NodeId>,
+    ) -> Result<(), BindingConflict> {
+        self.route.clear();
+        self.route.extend_from_slice(route);
+        self.resolve_groups(actions, tree, focus_owner)
+    }
+
+    pub(crate) fn resolve_tree_route_into(
+        &mut self,
+        target: Option<&NodeId>,
+        actions: &ActionIndex<Message>,
+        tree: &TreeIndex,
+        focus_owner: Option<&NodeId>,
+    ) -> Result<bool, BindingConflict> {
+        tree.route_into(target, &mut self.route);
+        if !route_needs_action_resolution(&self.route, actions, tree, focus_owner) {
+            self.focus_owner = None;
+            self.groups.clear();
+            return Ok(false);
+        }
+        self.resolve_groups(actions, tree, focus_owner)?;
+        Ok(true)
+    }
+
+    fn resolve_groups(
+        &mut self,
+        actions: &ActionIndex<Message>,
+        tree: &TreeIndex,
+        focus_owner: Option<&NodeId>,
+    ) -> Result<(), BindingConflict> {
+        let scopes = scopes_for_route(actions, &self.route);
+        let allowed = allowed_route_len(&self.route, actions);
+        self.groups.clear();
+        self.groups
+            .resize_with(self.route.len(), ResolvedRouteGroups::default);
 
         // Action records follow semantic tree order, which also fixes which
         // active-route conflict is returned when multiple groups are invalid
@@ -150,27 +189,48 @@ impl<Message> ResolvedActionRoute<Message> {
             .iter()
             .filter(|record| !record.actions.is_empty())
         {
-            let Some(route_index) = route[..allowed].iter().position(|id| id == &owner.id) else {
+            let Some(route_index) = self.route[..allowed].iter().position(|id| id == &owner.id)
+            else {
                 continue;
             };
             let resolved = resolve_actions(&owner.id, &owner.descriptors, &scopes)?;
-            groups[route_index] = Some(ResolvedActionGroup {
+            self.groups[route_index].declared = Some(ResolvedActionGroup {
                 actions: owner.actions.clone(),
                 resolved,
             });
         }
-        Ok(Self {
-            route: route.to_vec(),
-            groups,
-        })
+
+        for (route_index, owner) in self.route[..allowed].iter().enumerate() {
+            let includes_focus = focus_owner == Some(owner);
+            let scroll_axis = tree
+                .record(owner)
+                .and_then(|record| record.kind.scroll_axis());
+            let Some(group) = core_action_group(includes_focus, scroll_axis) else {
+                continue;
+            };
+            self.groups[route_index].core = Some(ResolvedCoreActionGroup {
+                actions: group.actions,
+                resolved: resolve_core_action_group(owner, &group, &scopes)?,
+            });
+        }
+        self.focus_owner.clone_from(&focus_owner.cloned());
+        Ok(())
     }
 
-    pub(crate) fn matches_route(&self, route: &[NodeId]) -> bool {
-        self.route == route
+    pub(crate) fn matches_route(&self, route: &[NodeId], focus_owner: Option<&NodeId>) -> bool {
+        self.route == route && self.focus_owner.as_ref() == focus_owner
     }
 
-    pub(crate) fn match_event(&self, route_index: usize, event: &Event) -> ActionMatch<Message> {
-        let Some(group) = self.groups.get(route_index).and_then(Option::as_ref) else {
+    pub(crate) fn match_declared_event(
+        &self,
+        route_index: usize,
+        event: &Event,
+    ) -> ActionMatch<Message> {
+        let Some(group) = self
+            .groups
+            .get(route_index)
+            .and_then(|groups| groups.declared.as_ref())
+        else {
             return ActionMatch::None;
         };
         let Some(stroke) = KeyStroke::from_event(event) else {
@@ -196,16 +256,83 @@ impl<Message> ResolvedActionRoute<Message> {
         ActionMatch::None
     }
 
+    pub(crate) fn match_core_event(&self, route_index: usize, event: &Event) -> CoreActionMatch {
+        let Some(group) = self
+            .groups
+            .get(route_index)
+            .and_then(|groups| groups.core.as_ref())
+        else {
+            return CoreActionMatch::None;
+        };
+        for (action, resolved) in group.actions.iter().zip(group.resolved.actions()) {
+            if !resolved
+                .bindings()
+                .iter()
+                .any(|binding| binding.matches(event))
+            {
+                continue;
+            }
+            return match resolved.availability() {
+                crate::ActionAvailability::Enabled => CoreActionMatch::Invoke(*action),
+                crate::ActionAvailability::DisabledConsume => CoreActionMatch::Consume,
+                crate::ActionAvailability::DisabledPassThrough => continue,
+            };
+        }
+        CoreActionMatch::None
+    }
+
     pub(crate) fn groups(&self) -> Vec<ResolvedActions> {
-        self.groups
-            .iter()
-            .filter_map(|group| group.as_ref().map(|group| group.resolved.clone()))
-            .collect()
+        let mut resolved = Vec::with_capacity(self.groups.len().saturating_mul(2));
+        for groups in &self.groups {
+            if let Some(group) = &groups.declared {
+                resolved.push(group.resolved.clone());
+            }
+            if let Some(group) = &groups.core {
+                resolved.push(group.resolved.clone());
+            }
+        }
+        resolved
+    }
+}
+
+pub(crate) fn route_needs_action_resolution<Message>(
+    route: &[NodeId],
+    actions: &ActionIndex<Message>,
+    tree: &TreeIndex,
+    focus_owner: Option<&NodeId>,
+) -> bool {
+    if actions.has_actions() {
+        return true;
+    }
+    route[..allowed_route_len(route, actions)].iter().any(|id| {
+        focus_owner == Some(id)
+            || tree
+                .record(id)
+                .is_some_and(|record| record.kind.is_scroll_viewport())
+    })
+}
+
+struct ResolvedRouteGroups<Message> {
+    declared: Option<ResolvedActionGroup<Message>>,
+    core: Option<ResolvedCoreActionGroup>,
+}
+
+impl<Message> Default for ResolvedRouteGroups<Message> {
+    fn default() -> Self {
+        Self {
+            declared: None,
+            core: None,
+        }
     }
 }
 
 struct ResolvedActionGroup<Message> {
     actions: Rc<[Action<Message>]>,
+    resolved: ResolvedActions,
+}
+
+struct ResolvedCoreActionGroup {
+    actions: &'static [CoreAction],
     resolved: ResolvedActions,
 }
 
@@ -216,6 +343,26 @@ pub(crate) enum ActionMatch<Message> {
         action: Action<Message>,
         event: ActionEvent,
     },
+}
+
+pub(crate) enum CoreActionMatch {
+    None,
+    Consume,
+    Invoke(CoreAction),
+}
+
+fn allowed_route_len<Message>(route: &[NodeId], actions: &ActionIndex<Message>) -> usize {
+    route
+        .iter()
+        .position(|id| {
+            actions.record(id).is_some_and(|record| {
+                record
+                    .scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.propagation == KeyScopePropagation::StopAtScope)
+            })
+        })
+        .map_or(route.len(), |index| index + 1)
 }
 
 impl<Message> ActionMatch<Message> {

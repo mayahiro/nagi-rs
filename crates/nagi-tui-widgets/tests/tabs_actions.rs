@@ -1,5 +1,6 @@
 //! Shared Tabs semantic-action integration tests
 
+mod action_support;
 mod support;
 
 use nagi_tui::{
@@ -86,7 +87,8 @@ fn tabs_actions_match_shared_fixtures() {
                 "case {}",
                 record.id
             );
-            let groups = runtime.active_action_groups().unwrap();
+            let groups =
+                action_support::node_declared_groups(runtime.active_action_groups().unwrap());
             assert_eq!(groups.len(), 2, "case {}", record.id);
             assert_eq!(
                 groups[0].owner(),

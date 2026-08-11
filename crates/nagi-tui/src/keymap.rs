@@ -2,11 +2,31 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use nagi_vt::{Event, KeyAction, KeyCode, Modifiers};
 
 use crate::{EventResult, NodeId};
+
+static EMPTY_SCOPE_PATH: LazyLock<Arc<[NodeId]>> = LazyLock::new(Arc::default);
+
+/// Stable Action ID for moving focus to the next focusable node
+pub const FOCUS_NEXT_ACTION_ID: &str = "nagi.focus.next";
+
+/// Stable Action ID for moving focus to the previous focusable node
+pub const FOCUS_PREVIOUS_ACTION_ID: &str = "nagi.focus.previous";
+
+/// Stable Action ID for scrolling one visible page toward the start
+pub const SCROLL_PAGE_UP_ACTION_ID: &str = "nagi.scroll.page-up";
+
+/// Stable Action ID for scrolling one visible page toward the end
+pub const SCROLL_PAGE_DOWN_ACTION_ID: &str = "nagi.scroll.page-down";
+
+/// Stable Action ID for scrolling to the beginning of the enabled axis
+pub const SCROLL_START_ACTION_ID: &str = "nagi.scroll.start";
+
+/// Stable Action ID for scrolling to the end of the enabled axis
+pub const SCROLL_END_ACTION_ID: &str = "nagi.scroll.end";
 
 /// Stable Action ID for moving a text cursor left
 pub const TEXT_CURSOR_LEFT_ACTION_ID: &str = "nagi.text.cursor.left";
@@ -615,6 +635,16 @@ pub struct ResolvedAction {
 }
 
 impl ResolvedAction {
+    pub(crate) fn from_descriptor_defaults(descriptor: &ActionDescriptor) -> Self {
+        Self {
+            id: descriptor.id.clone(),
+            label: descriptor.label.clone(),
+            bindings: descriptor.default_bindings.clone(),
+            availability: descriptor.availability,
+            help_visible: descriptor.help_visible,
+        }
+    }
+
     /// Returns the stable Action ID
     #[must_use]
     pub const fn id(&self) -> &ActionId {
@@ -655,6 +685,23 @@ pub struct ResolvedActions {
 }
 
 impl ResolvedActions {
+    pub(crate) fn from_shared_defaults(
+        owner: &NodeId,
+        scopes: &[KeyScope],
+        actions: Arc<[ResolvedAction]>,
+    ) -> Self {
+        let scope_path = if scopes.is_empty() {
+            Arc::clone(&EMPTY_SCOPE_PATH)
+        } else {
+            scopes.iter().map(|scope| scope.id.clone()).collect()
+        };
+        Self {
+            owner: owner.clone(),
+            scope_path,
+            actions,
+        }
+    }
+
     /// Returns the semantic owner identity
     #[must_use]
     pub const fn owner(&self) -> &NodeId {

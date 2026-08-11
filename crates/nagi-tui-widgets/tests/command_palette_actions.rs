@@ -1,5 +1,6 @@
 //! Shared CommandPalette semantic-action integration tests
 
+mod action_support;
 mod support;
 
 use nagi_tui::{
@@ -137,7 +138,7 @@ fn command_palette_actions_match_shared_fixtures() {
                 record.id
             ),
         }
-        let groups = runtime.active_action_groups().unwrap();
+        let groups = action_support::node_declared_groups(runtime.active_action_groups().unwrap());
         assert_eq!(
             groups
                 .iter()

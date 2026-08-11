@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use crate::{Event, NodeId, Point, Rect};
+use crate::{Event, NodeId, Point, Rect, ScrollAxis};
 
 #[cfg(test)]
 use crate::fixture_support;
@@ -142,8 +142,26 @@ impl EventDispatch {
 pub(crate) enum InteractiveKind {
     Generic,
     TextInput,
-    ScrollViewport,
+    ScrollViewportVertical,
+    ScrollViewportHorizontal,
     Modal,
+}
+
+impl InteractiveKind {
+    pub(crate) const fn scroll_axis(self) -> Option<ScrollAxis> {
+        match self {
+            Self::ScrollViewportVertical => Some(ScrollAxis::Vertical),
+            Self::ScrollViewportHorizontal => Some(ScrollAxis::Horizontal),
+            Self::Generic | Self::TextInput | Self::Modal => None,
+        }
+    }
+
+    pub(crate) const fn is_scroll_viewport(self) -> bool {
+        matches!(
+            self,
+            Self::ScrollViewportVertical | Self::ScrollViewportHorizontal
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -202,16 +220,28 @@ impl TreeIndex {
     }
 
     pub(crate) fn route(&self, target: Option<&NodeId>) -> Vec<NodeId> {
+        let mut route = Vec::new();
+        self.route_into(target, &mut route);
+        route
+    }
+
+    pub(crate) fn route_into(&self, target: Option<&NodeId>, route: &mut Vec<NodeId>) {
         let target = match (&self.active_modal, target) {
             (Some(modal), Some(target)) if self.is_within(target, modal) => Some(target),
             (Some(modal), _) => Some(modal),
             (None, target) => target,
         };
-        self.raw_route(target)
+        self.raw_route_into(target, route);
     }
 
     pub(crate) fn raw_route(&self, target: Option<&NodeId>) -> Vec<NodeId> {
         let mut route = Vec::new();
+        self.raw_route_into(target, &mut route);
+        route
+    }
+
+    fn raw_route_into(&self, target: Option<&NodeId>, route: &mut Vec<NodeId>) {
+        route.clear();
         let mut current = target.cloned();
         let mut remaining = self.records.len().saturating_add(1);
         while let Some(id) = current {
@@ -227,7 +257,6 @@ impl TreeIndex {
                 route.push(root.clone());
             }
         }
-        route
     }
 
     pub(crate) fn hit_test(&self, point: Point) -> Option<NodeId> {
@@ -258,6 +287,13 @@ impl TreeIndex {
             ),
             None => Cow::Borrowed(&self.focus_order),
         }
+    }
+
+    pub(crate) fn focus_action_owner(&self, focused: Option<&NodeId>) -> Option<NodeId> {
+        focused
+            .cloned()
+            .or_else(|| self.active_modal.clone())
+            .or_else(|| self.root.clone())
     }
 
     pub(crate) fn allows_focus(&self, id: &NodeId) -> bool {

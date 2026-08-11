@@ -1,5 +1,6 @@
 //! Shared Modal semantic-action integration tests
 
+mod action_support;
 mod support;
 
 use nagi_tui::{
@@ -101,7 +102,7 @@ fn modal_actions_match_shared_fixtures() {
             );
         }
 
-        let groups = runtime.active_action_groups().unwrap();
+        let groups = action_support::node_declared_groups(runtime.active_action_groups().unwrap());
         assert_eq!(
             groups
                 .iter()
