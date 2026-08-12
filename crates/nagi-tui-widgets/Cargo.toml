@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "code_view"
 harness = false
+
+[[bench]]
+name = "diff_view"
+harness = false

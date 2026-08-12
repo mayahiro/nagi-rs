@@ -13,6 +13,8 @@ mod code_view;
 mod command_palette;
 mod composer;
 mod dialog;
+mod diff;
+mod diff_view;
 mod disclosure;
 mod event;
 mod file_picker;
@@ -74,6 +76,14 @@ pub use code_view::{CodeCopyKind, CodeCopyRequest, CodeView, CodeViewState, Code
 pub use command_palette::{Command, CommandPalette, CommandPaletteStyle};
 pub use composer::{Composer, ComposerOverflowPolicy, ComposerState};
 pub use dialog::{ConfirmDialog, ConfirmDialogDefault, Dialog, DialogAction, DialogStyle};
+pub use diff::{
+    DEFAULT_DIFF_DOCUMENT_MAX_LINES, DEFAULT_DIFF_DOCUMENT_MAX_SPANS,
+    DEFAULT_DIFF_DOCUMENT_MAX_TEXT_BYTES, DiffDocument, DiffDocumentError, DiffDocumentErrorKind,
+    DiffDocumentLimits, DiffHunk, DiffLayout, DiffLayoutCache, DiffLayoutError,
+    DiffLayoutErrorKind, DiffLayoutLimits, DiffLayoutOptions, DiffLine, DiffLineKind, DiffRange,
+    DiffSide, InvalidDiffLineNumber, InvalidDiffRange, InvalidDiffRangeKind,
+};
+pub use diff_view::{DiffCopyKind, DiffCopyRequest, DiffView, DiffViewState, DiffViewStyle};
 pub use disclosure::{Disclosure, DisclosureStyle};
 pub use file_picker::{FilePicker, FilePickerEntry, FilePickerStyle};
 pub use help::{Help, HelpBinding, HelpMode, HelpStyle};

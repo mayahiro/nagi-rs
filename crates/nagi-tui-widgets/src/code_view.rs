@@ -290,7 +290,7 @@ impl<Message: 'static> CodeView<Message> {
 }
 
 #[derive(Clone, Copy)]
-enum CodeViewAction {
+pub(crate) enum CodeViewAction {
     Previous,
     Next,
     First,
@@ -306,7 +306,7 @@ enum CodeViewAction {
     CopyDocument,
 }
 
-const CODE_VIEW_ACTIONS: [CodeViewAction; 13] = [
+pub(crate) const CODE_VIEW_ACTIONS: [CodeViewAction; 13] = [
     CodeViewAction::Previous,
     CodeViewAction::Next,
     CodeViewAction::First,
@@ -322,97 +322,98 @@ const CODE_VIEW_ACTIONS: [CodeViewAction; 13] = [
     CodeViewAction::CopyDocument,
 ];
 
-const CODE_VIEW_ACTION_COUNT: usize = CODE_VIEW_ACTIONS.len();
+pub(crate) const CODE_VIEW_ACTION_COUNT: usize = CODE_VIEW_ACTIONS.len();
 
-static CODE_VIEW_ACTION_DESCRIPTORS: LazyLock<[ActionDescriptor; CODE_VIEW_ACTION_COUNT]> =
-    LazyLock::new(|| {
-        let shift = Modifiers {
-            shift: true,
-            ..Modifiers::NONE
-        };
-        let control = Modifiers {
-            control: true,
-            ..Modifiers::NONE
-        };
-        let control_shift = Modifiers {
-            control: true,
-            shift: true,
-            ..Modifiers::NONE
-        };
-        [
-            repeatable_descriptor(
-                SELECTION_PREVIOUS_ACTION_ID,
-                "Previous line",
-                KeyCode::Up,
-                Modifiers::NONE,
-            ),
-            repeatable_descriptor(
-                SELECTION_NEXT_ACTION_ID,
-                "Next line",
-                KeyCode::Down,
-                Modifiers::NONE,
-            ),
-            repeatable_descriptor(
-                SELECTION_FIRST_ACTION_ID,
-                "First line",
-                KeyCode::Home,
-                control,
-            ),
-            repeatable_descriptor(SELECTION_LAST_ACTION_ID, "Last line", KeyCode::End, control),
-            repeatable_descriptor(
-                SELECTION_EXTEND_PREVIOUS_ACTION_ID,
-                "Extend to previous line",
-                KeyCode::Up,
-                shift,
-            ),
-            repeatable_descriptor(
-                SELECTION_EXTEND_NEXT_ACTION_ID,
-                "Extend to next line",
-                KeyCode::Down,
-                shift,
-            ),
-            repeatable_descriptor(
-                SELECTION_EXTEND_FIRST_ACTION_ID,
-                "Extend to first line",
-                KeyCode::Home,
-                control_shift,
-            ),
-            repeatable_descriptor(
-                SELECTION_EXTEND_LAST_ACTION_ID,
-                "Extend to last line",
-                KeyCode::End,
-                control_shift,
-            ),
-            repeatable_descriptor(
-                HORIZONTAL_SCROLL_PREVIOUS_ACTION_ID,
-                "Scroll left",
-                KeyCode::Left,
-                Modifiers::NONE,
-            ),
-            repeatable_descriptor(
-                HORIZONTAL_SCROLL_NEXT_ACTION_ID,
-                "Scroll right",
-                KeyCode::Right,
-                Modifiers::NONE,
-            ),
-            ActionDescriptor::new(
-                TEXT_SELECT_ALL_ACTION_ID,
-                "Select all lines",
-                [KeyBinding::new(KeyStroke::character('a', control))
-                    .with_repeat_policy(RepeatPolicy::AllowRepeat)],
-            ),
-            ActionDescriptor::new(
-                TEXT_COPY_SELECTION_ACTION_ID,
-                "Copy selected lines",
-                [KeyBinding::new(KeyStroke::character('c', control))],
-            ),
-            ActionDescriptor::new(
-                TEXT_COPY_DOCUMENT_ACTION_ID,
-                "Copy document",
-                [KeyBinding::new(KeyStroke::character('c', control_shift))],
-            ),
-        ]
-    });
+pub(crate) static CODE_VIEW_ACTION_DESCRIPTORS: LazyLock<
+    [ActionDescriptor; CODE_VIEW_ACTION_COUNT],
+> = LazyLock::new(|| {
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    let control = Modifiers {
+        control: true,
+        ..Modifiers::NONE
+    };
+    let control_shift = Modifiers {
+        control: true,
+        shift: true,
+        ..Modifiers::NONE
+    };
+    [
+        repeatable_descriptor(
+            SELECTION_PREVIOUS_ACTION_ID,
+            "Previous line",
+            KeyCode::Up,
+            Modifiers::NONE,
+        ),
+        repeatable_descriptor(
+            SELECTION_NEXT_ACTION_ID,
+            "Next line",
+            KeyCode::Down,
+            Modifiers::NONE,
+        ),
+        repeatable_descriptor(
+            SELECTION_FIRST_ACTION_ID,
+            "First line",
+            KeyCode::Home,
+            control,
+        ),
+        repeatable_descriptor(SELECTION_LAST_ACTION_ID, "Last line", KeyCode::End, control),
+        repeatable_descriptor(
+            SELECTION_EXTEND_PREVIOUS_ACTION_ID,
+            "Extend to previous line",
+            KeyCode::Up,
+            shift,
+        ),
+        repeatable_descriptor(
+            SELECTION_EXTEND_NEXT_ACTION_ID,
+            "Extend to next line",
+            KeyCode::Down,
+            shift,
+        ),
+        repeatable_descriptor(
+            SELECTION_EXTEND_FIRST_ACTION_ID,
+            "Extend to first line",
+            KeyCode::Home,
+            control_shift,
+        ),
+        repeatable_descriptor(
+            SELECTION_EXTEND_LAST_ACTION_ID,
+            "Extend to last line",
+            KeyCode::End,
+            control_shift,
+        ),
+        repeatable_descriptor(
+            HORIZONTAL_SCROLL_PREVIOUS_ACTION_ID,
+            "Scroll left",
+            KeyCode::Left,
+            Modifiers::NONE,
+        ),
+        repeatable_descriptor(
+            HORIZONTAL_SCROLL_NEXT_ACTION_ID,
+            "Scroll right",
+            KeyCode::Right,
+            Modifiers::NONE,
+        ),
+        ActionDescriptor::new(
+            TEXT_SELECT_ALL_ACTION_ID,
+            "Select all lines",
+            [KeyBinding::new(KeyStroke::character('a', control))
+                .with_repeat_policy(RepeatPolicy::AllowRepeat)],
+        ),
+        ActionDescriptor::new(
+            TEXT_COPY_SELECTION_ACTION_ID,
+            "Copy selected lines",
+            [KeyBinding::new(KeyStroke::character('c', control))],
+        ),
+        ActionDescriptor::new(
+            TEXT_COPY_DOCUMENT_ACTION_ID,
+            "Copy document",
+            [KeyBinding::new(KeyStroke::character('c', control_shift))],
+        ),
+    ]
+});
 
 fn repeatable_descriptor(
     id: &'static str,
@@ -655,7 +656,7 @@ fn emit_code_view_change<Message>(
     }
 }
 
-fn state_for_action(
+pub(crate) fn state_for_action(
     layout: &CodeLayout,
     state: CodeViewState,
     action: CodeViewAction,
@@ -696,7 +697,7 @@ fn state_for_action(
     }
 }
 
-fn normalize_state(layout: &CodeLayout, state: CodeViewState) -> CodeViewState {
+pub(crate) fn normalize_state(layout: &CodeLayout, state: CodeViewState) -> CodeViewState {
     let lines = layout.document().line_count();
     let last = lines.saturating_sub(1);
     let mut next = if state.has_selection {
@@ -715,7 +716,11 @@ fn normalize_state(layout: &CodeLayout, state: CodeViewState) -> CodeViewState {
     next
 }
 
-fn visible_row_window(layout: &CodeLayout, selected_line: usize, height: usize) -> Range<usize> {
+pub(crate) fn visible_row_window(
+    layout: &CodeLayout,
+    selected_line: usize,
+    height: usize,
+) -> Range<usize> {
     if height == 0 || height >= layout.visual_row_count() {
         return 0..layout.visual_row_count();
     }
@@ -797,7 +802,7 @@ fn row_overlay(
     result
 }
 
-fn slice_spans_by_cells(
+pub(crate) fn slice_spans_by_cells(
     spans: &[TextSpan],
     checkpoints: &[CodeRowCheckpoint],
     offset: u32,
@@ -864,7 +869,7 @@ fn copy_actions_enabled(
     )
 }
 
-fn is_blocked_copy_repeat(
+pub(crate) fn is_blocked_copy_repeat(
     event: &Event,
     selection_copy_enabled: bool,
     document_copy_enabled: bool,
