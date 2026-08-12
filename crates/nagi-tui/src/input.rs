@@ -60,6 +60,12 @@ impl<C: Clock> TimedInputDecoder<C> {
         self.decoder.flush_pending()
     }
 
+    /// Discards incomplete terminal input without emitting an Event
+    pub fn reset(&mut self) {
+        self.decoder = Decoder::new();
+        self.escape_deadline = None;
+    }
+
     /// Reports whether incomplete input is buffered
     #[must_use]
     pub fn has_pending(&self) -> bool {
@@ -109,5 +115,18 @@ mod tests {
             events.as_slice(),
             [Event::Key(key)] if key.code == KeyCode::Escape
         ));
+    }
+
+    #[test]
+    fn reset_discards_incomplete_input() {
+        let clock = VirtualClock::new();
+        let mut decoder = TimedInputDecoder::new(clock.clone(), Duration::from_millis(25));
+        assert!(decoder.feed(b"\x1B").is_empty());
+
+        decoder.reset();
+        clock.advance(Duration::from_millis(25));
+
+        assert!(decoder.poll().is_empty());
+        assert!(!decoder.has_pending());
     }
 }

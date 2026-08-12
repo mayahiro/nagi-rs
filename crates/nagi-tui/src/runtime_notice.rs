@@ -6,7 +6,7 @@ use crate::{SubscriptionKey, TaskKey};
 /// An asynchronous lifecycle event that does not produce an application message
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeNoticeKind {
-    /// An Effect task panicked and the worker boundary recovered it
+    /// An Effect task panicked and its execution boundary recovered it
     EffectPanicked,
     /// The operating system refused to start an Effect worker
     EffectSpawnFailed,

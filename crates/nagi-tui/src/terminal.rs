@@ -211,6 +211,9 @@ where
     }
     runtime.process_pending()?;
     handle_runtime_notices(&mut runtime, handle_notice);
+    if !runtime.exit_requested() {
+        run_pending_terminal_tasks(session, &mut runtime, &mut decoder, handle_notice)?;
+    }
     if options.focus_first {
         runtime.focus_first()?;
     }
@@ -258,9 +261,15 @@ where
             if exit || runtime.exit_requested() {
                 break;
             }
+            if run_pending_terminal_tasks(session, &mut runtime, &mut decoder, handle_notice)? {
+                break;
+            }
         }
         runtime.process_pending()?;
         handle_runtime_notices(&mut runtime, handle_notice);
+        if !exit && !runtime.exit_requested() {
+            run_pending_terminal_tasks(session, &mut runtime, &mut decoder, handle_notice)?;
+        }
         write_pending_output(
             session,
             &mut runtime,
@@ -272,6 +281,37 @@ where
         }
     }
     Ok(runtime.into_app())
+}
+
+fn run_pending_terminal_tasks<Application, Handler>(
+    session: &mut TerminalSession,
+    runtime: &mut Runtime<Application, SystemClock>,
+    decoder: &mut TimedInputDecoder<SystemClock>,
+    handle_notice: &mut Handler,
+) -> Result<bool, RunError>
+where
+    Application: App,
+    Handler: FnMut(&RuntimeNotice),
+{
+    let mut ran = false;
+    while !runtime.exit_requested() && runtime.pending_terminal_tasks() > 0 {
+        session.suspend().map_err(run_terminal_error)?;
+        let ran_task = runtime.run_terminal_task();
+        session.resume().map_err(run_terminal_error)?;
+        debug_assert!(ran_task);
+        if !ran_task {
+            break;
+        }
+
+        decoder.reset();
+        runtime.invalidate_terminal_surface();
+        let (columns, rows) = session.size().map_err(run_terminal_error)?;
+        runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
+        runtime.process_pending()?;
+        handle_runtime_notices(runtime, handle_notice);
+        ran = true;
+    }
+    Ok(ran)
 }
 
 fn handle_runtime_notices<Application, C, Handler>(

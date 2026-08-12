@@ -70,13 +70,15 @@ nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
-`nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、pending clipboard request、Runtime notice、frame、activeなresolved actionを操作できます
+`nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、pending terminal taskとclipboard request、Runtime notice、frame、activeなresolved actionを操作できます
 
 `nagi-cli-test`はprocess起動やsignal handler設定を行わず、argvとprocess serviceを注入してoutputとExit Statusを取得します
 
 共有の[event-driven application architecture](https://github.com/mayahiro/nagi/blob/main/docs/EVENT_DRIVEN_APPLICATIONS_ja.md)では、第2のUI loopを作らずprocess outputとtimerをNagiへ渡す方法を説明します
 
 `RuntimeConfig::width_profile`と`TerminalOptions::width_profile`はCoreのmeasure、render、hit geometry、cursor配置で使うcell幅policyを1個選択します。幅計算を行うWidget builderには`ViewContext::width_profile`を渡します。予期しないasync lifecycle transitionは上限付きRuntime notice queueまたはterminal notice-handler entry pointから観測できます
+
+`Effect::suspend_terminal`は標準runnerが通常terminalを復元してalternate screenを離れた後にApplication所有のblocking taskを実行します。Task return後は設定済みmodeを再開し、pending inputをresetしてfull redrawを強制します
 
 ## Example
 
@@ -94,6 +96,7 @@ Rust repository rootから実行します
 | [Code view](crates/nagi-tui-widgets/examples/code_view/README.md) | `cargo run -p nagi-tui-widgets --example code_view` |
 | [Diff view](crates/nagi-tui-widgets/examples/diff_view/README.md) | `cargo run -p nagi-tui-widgets --example diff_view` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
+| [Terminal suspendとresume](crates/nagi-tui/examples/terminal_suspend/README.md) | `cargo run -p nagi-tui --example terminal_suspend` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
 | [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
 | [Widget gallery](crates/nagi-tui-widgets/examples/widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example widget_gallery` |
@@ -111,7 +114,7 @@ Rust repository rootから実行します
 
 ## 制約
 
-TUIのterminal inputとoutputはterminalへ接続されている必要があります。Mouse reportは既定で無効です。Raw modeとscreen stateは正常return、error、panic経路でbest effortとして復元します。Process abort、nested terminal session、suspendとresume、`/dev/tty`取得には対応していません
+TUIのterminal inputとoutputはterminalへ接続されている必要があります。Mouse reportは既定で無効です。Raw modeとscreen stateは正常return、error、panic経路でbest effortとして復元します。Applicationが要求する一時的なterminal suspendには対応します。Process abort、nested terminal session、Nagi processのjob-control suspend、`/dev/tty`取得には対応していません
 
 `ScrollViewport`はeagerなchild treeをclipしてscrollします。大規模dataでは`Node::virtual_scroll_viewport`を使用し、content全体のCell extentを宣言して現在表示する範囲または上限付きoverscanの`VirtualFragment`だけを構築できます。`Node::reveal_descendant`はfocusを移動せずstable descendant IDを表示範囲内に保ち、virtual targetは現在のfragment内に存在する必要があります
 

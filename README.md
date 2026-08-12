@@ -75,8 +75,8 @@ nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
 `nagi-tui-test` drives messages, terminal input, resize, virtual time, Effects,
-Subscriptions, pending clipboard requests, Runtime notices, frame inspection,
-and active resolved action queries without a real terminal
+Subscriptions, pending terminal tasks and clipboard requests, Runtime notices,
+frame inspection, and active resolved action queries without a real terminal
 
 `nagi-cli-test` injects argv and process services, then captures output and Exit
 Status without starting a process or installing a signal handler
@@ -89,6 +89,11 @@ cell width policy for Core measurement, rendering, hit geometry, and cursor
 placement. Pass `ViewContext::width_profile` to width-sensitive widget builders.
 Unexpected asynchronous lifecycle transitions are available through the
 bounded Runtime notice queue or the terminal notice-handler entry point
+
+`Effect::suspend_terminal` runs an application-owned blocking task after the
+standard runner restores the ordinary terminal and leaves the alternate screen.
+Returning from the task resumes configured modes, resets pending input, and
+forces a full redraw
 
 ## Examples
 
@@ -106,6 +111,7 @@ Run commands from the Rust repository root
 | [Code view](crates/nagi-tui-widgets/examples/code_view/README.md) | `cargo run -p nagi-tui-widgets --example code_view` |
 | [Diff view](crates/nagi-tui-widgets/examples/diff_view/README.md) | `cargo run -p nagi-tui-widgets --example diff_view` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
+| [Terminal suspend and resume](crates/nagi-tui/examples/terminal_suspend/README.md) | `cargo run -p nagi-tui --example terminal_suspend` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
 | [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
 | [Widget gallery](crates/nagi-tui-widgets/examples/widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example widget_gallery` |
@@ -125,8 +131,9 @@ Run commands from the Rust repository root
 
 TUI terminal input and output must be connected to a terminal. Mouse reporting
 is disabled by default. Raw mode and screen restoration are best effort on
-normal return, error, and panic paths. Process abort, nested terminal sessions,
-suspend and resume, and `/dev/tty` acquisition are not supported
+normal return, error, and panic paths. Application-requested temporary terminal
+suspension is supported. Process abort, nested terminal sessions, job-control
+suspension of the Nagi process, and `/dev/tty` acquisition are not supported
 
 `ScrollViewport` clips and scrolls an eager child tree. Large data sets can use
 `Node::virtual_scroll_viewport`, which declares the complete cell extent and

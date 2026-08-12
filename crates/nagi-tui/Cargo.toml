@@ -33,3 +33,7 @@ harness = false
 [[bench]]
 name = "pointer_selection"
 harness = false
+
+[[bench]]
+name = "terminal_task"
+harness = false

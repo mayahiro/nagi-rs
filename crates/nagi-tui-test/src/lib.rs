@@ -200,6 +200,28 @@ where
         self.runtime.pending_tasks()
     }
 
+    /// Returns terminal-suspending tasks waiting for the virtual driver
+    #[must_use]
+    pub fn pending_terminal_tasks(&self) -> usize {
+        self.runtime.pending_terminal_tasks()
+    }
+
+    /// Runs one terminal-suspending task and simulates a restored terminal
+    /// boundary
+    ///
+    /// Incomplete terminal input is discarded, the terminal diff baseline is
+    /// invalidated, the task result is processed, and at most one frame is
+    /// captured
+    pub fn run_terminal_task(&mut self) -> Result<bool, HarnessError> {
+        if !self.runtime.run_terminal_task() {
+            return Ok(false);
+        }
+        self.decoder.reset();
+        self.runtime.invalidate_terminal_surface();
+        self.step()?;
+        Ok(true)
+    }
+
     /// Returns completed effect messages waiting for queue capacity
     #[must_use]
     pub fn pending_effect_messages(&self) -> usize {
@@ -463,6 +485,63 @@ mod tests {
             Some("copy".to_owned())
         );
         assert!(harness.take_clipboard_request().is_none());
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum TerminalMessage {
+        Open,
+        Returned,
+    }
+
+    #[derive(Default)]
+    struct TerminalApp {
+        returned: bool,
+    }
+
+    impl App for TerminalApp {
+        type Message = TerminalMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            match message {
+                TerminalMessage::Open => Effect::suspend_terminal(|_| TerminalMessage::Returned),
+                TerminalMessage::Returned => {
+                    self.returned = true;
+                    Effect::none()
+                }
+            }
+        }
+
+        fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+            Node::text(if self.returned { "returned" } else { "ready" })
+        }
+    }
+
+    #[test]
+    fn terminal_task_boundary_is_deterministic_and_discards_pending_input() {
+        let mut harness = Harness::new(
+            TerminalApp::default(),
+            Size::new(8, 1),
+            |event| match event {
+                Event::Key(key) if key.code == KeyCode::Escape => EventAction::Exit,
+                _ => EventAction::Ignore,
+            },
+        )
+        .unwrap();
+        harness.send(TerminalMessage::Open).unwrap();
+        harness.input(b"\x1B").unwrap();
+
+        assert_eq!(harness.pending_terminal_tasks(), 1);
+        assert!(harness.run_terminal_task().unwrap());
+        assert!(harness.app().returned);
+        assert_eq!(harness.pending_terminal_tasks(), 0);
+        assert!(!harness.run_terminal_task().unwrap());
+
+        harness.advance(Duration::from_millis(25)).unwrap();
+        assert!(!harness.exit_requested());
+        assert_eq!(
+            harness.message_history(),
+            [TerminalMessage::Open, TerminalMessage::Returned]
+        );
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]

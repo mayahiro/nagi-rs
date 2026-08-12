@@ -427,13 +427,17 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.effects.poll(self.clock.now());
         self.apply_effect_commands();
         let available = self.queue_capacity.saturating_sub(self.queue.len());
-        let messages = self.effects.take_ready(available);
-        let count = messages.len();
-        self.queue
-            .extend(messages.into_iter().map(|message| QueuedMessage {
+        let mut count = 0;
+        while count < available {
+            let Some(message) = self.effects.pop_ready() else {
+                break;
+            };
+            self.queue.push_back(QueuedMessage {
                 message,
                 subscription: None,
-            }));
+            });
+            count += 1;
+        }
         count
     }
 
@@ -473,6 +477,26 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     #[must_use]
     pub fn pending_tasks(&self) -> usize {
         self.effects.pending_tasks()
+    }
+
+    /// Returns terminal-suspending tasks waiting for the Runtime driver
+    #[must_use]
+    pub fn pending_terminal_tasks(&self) -> usize {
+        self.effects.pending_terminal_tasks()
+    }
+
+    /// Runs the oldest terminal-suspending task on the current thread
+    ///
+    /// A full-screen terminal driver MUST suspend its terminal session before
+    /// calling this method and resume it afterwards. Task panics are recovered
+    /// as Runtime notices. The returned message becomes available to the next
+    /// pending-message processing boundary
+    pub fn run_terminal_task(&mut self) -> bool {
+        let ran = self.effects.run_terminal_task(self.clock.now());
+        if ran {
+            self.apply_effect_commands();
+        }
+        ran
     }
 
     /// Returns completed effect messages waiting for queue capacity
@@ -666,6 +690,21 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
 
     /// Schedules a frame even when application state has not changed
     pub fn request_frame(&mut self) {
+        self.dirty = true;
+        self.urgent_frame = true;
+        self.subscriptions_dirty = true;
+    }
+
+    /// Discards the terminal diff baseline and requests one full redraw
+    ///
+    /// Drivers call this after an external process may have changed terminal
+    /// contents while the Runtime was suspended
+    pub fn invalidate_terminal_surface(&mut self) {
+        if let Some(previous) = self.previous_surface.take() {
+            if let Ok(surface) = Arc::try_unwrap(previous) {
+                self.spare_surface = Some(surface);
+            }
+        }
         self.dirty = true;
         self.urgent_frame = true;
         self.subscriptions_dirty = true;
@@ -1206,6 +1245,10 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             return Ok(());
         }
         let declared = self.app.subscriptions();
+        if declared.is_none() && self.subscriptions.active_subscriptions() == 0 {
+            self.subscriptions_dirty = false;
+            return Ok(());
+        }
         let SubscriptionReconciliation { stopped } = self
             .subscriptions
             .reconcile(declared, self.clock.now())
@@ -1729,6 +1772,75 @@ mod tests {
         let spare = runtime.spare_surface.as_ref().expect("reclaimed surface");
         assert_eq!(spare.width(), 3);
         assert_eq!(spare.height(), 1);
+    }
+
+    struct TerminalTaskApp {
+        messages: Vec<&'static str>,
+    }
+
+    impl App for TerminalTaskApp {
+        type Message = &'static str;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            self.messages.push(message);
+            if message == "start" {
+                return Effect::sequence([
+                    Effect::suspend_terminal(|_| "first"),
+                    Effect::suspend_terminal(|_| "second"),
+                ]);
+            }
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::text(self.messages.join(","))
+        }
+    }
+
+    #[test]
+    fn terminal_tasks_complete_on_the_driver_thread_and_preserve_sequence_order() {
+        let mut runtime = Runtime::new(
+            TerminalTaskApp {
+                messages: Vec::new(),
+            },
+            Size::new(32, 1),
+        )
+        .unwrap();
+        runtime.enqueue("start").unwrap();
+        runtime.process_pending().unwrap();
+
+        assert_eq!(runtime.pending_terminal_tasks(), 1);
+        assert!(runtime.run_terminal_task());
+        runtime.process_pending().unwrap();
+        assert_eq!(runtime.app().messages, ["start", "first"]);
+        assert_eq!(runtime.pending_terminal_tasks(), 1);
+
+        assert!(runtime.run_terminal_task());
+        runtime.process_pending().unwrap();
+        assert_eq!(runtime.app().messages, ["start", "first", "second"]);
+        assert_eq!(runtime.pending_terminal_tasks(), 0);
+        assert!(!runtime.run_terminal_task());
+    }
+
+    #[test]
+    fn invalidated_terminal_surface_produces_a_full_redraw() {
+        let mut runtime = Runtime::new(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            Size::new(3, 1),
+        )
+        .unwrap();
+        let first = runtime.render_if_dirty().unwrap().unwrap();
+        runtime.request_frame();
+        let unchanged = runtime.render_if_dirty().unwrap().unwrap();
+        assert!(unchanged.operations().is_empty());
+
+        runtime.invalidate_terminal_surface();
+        let redrawn = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(redrawn.operations(), first.operations());
     }
 
     #[test]

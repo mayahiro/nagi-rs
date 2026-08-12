@@ -95,7 +95,10 @@ impl CancelToken {
     }
 }
 
-/// One standard-thread task producing an application message
+/// One Effect task producing an application message
+///
+/// Run Effects execute this task on a supervised standard thread. Terminal-
+/// suspending Effects execute it on the terminal driver thread
 pub type Task<Message> = Box<dyn FnOnce(CancelToken) -> Message + Send + 'static>;
 
 /// One application-requested semantic text write to a clipboard backend
@@ -139,6 +142,7 @@ pub(crate) enum EffectKind<Message> {
         offset: ScrollOffset,
     },
     SetClipboard(ClipboardRequest),
+    SuspendTerminal(Task<Message>),
     Run(Task<Message>),
     Latest {
         key: TaskKey,
@@ -214,6 +218,20 @@ impl<Message> Effect<Message> {
     pub fn set_clipboard(text: impl Into<String>) -> Self {
         Self {
             kind: EffectKind::SetClipboard(ClipboardRequest::new(text)),
+            without_redraw: false,
+        }
+    }
+
+    /// Runs one blocking task on the terminal driver thread while the standard
+    /// full-screen terminal session is suspended
+    ///
+    /// The task receives cooperative cancellation state and produces one
+    /// application message. Process selection, command execution, and domain
+    /// error mapping remain application responsibilities
+    #[must_use]
+    pub fn suspend_terminal(task: impl FnOnce(CancelToken) -> Message + Send + 'static) -> Self {
+        Self {
+            kind: EffectKind::SuspendTerminal(Box::new(task)),
             without_redraw: false,
         }
     }
@@ -332,6 +350,7 @@ impl<Message> fmt::Debug for Effect<Message> {
             EffectKind::Focus(_) => "Focus",
             EffectKind::ScrollTo { .. } => "ScrollTo",
             EffectKind::SetClipboard(_) => "SetClipboard",
+            EffectKind::SuspendTerminal(_) => "SuspendTerminal",
             EffectKind::Run(_) => "Run",
             EffectKind::Latest { .. } => "Latest",
             EffectKind::Cancel(_) => "Cancel",

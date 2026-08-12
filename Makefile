@@ -5,6 +5,7 @@ bench:
 	cargo bench -p nagi-tui --bench content_projection
 	cargo bench -p nagi-tui --bench clipboard
 	cargo bench -p nagi-tui --bench pointer_selection
+	cargo bench -p nagi-tui --bench terminal_task
 	cargo bench -p nagi-tui-widgets --bench suggestion_popup
 	cargo bench -p nagi-tui-widgets --bench json_inspector
 	cargo bench -p nagi-tui-widgets --bench code_view

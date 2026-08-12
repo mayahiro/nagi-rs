@@ -221,6 +221,9 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
     }
 
     pub(crate) fn take_ready(&mut self, maximum: usize) -> Vec<SubscriptionMessage<Message>> {
+        if maximum == 0 || self.order.is_empty() {
+            return Vec::new();
+        }
         let mut ready = Vec::with_capacity(maximum.min(64));
         while ready.len() < maximum {
             let candidate = self

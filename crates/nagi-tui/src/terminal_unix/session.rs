@@ -87,6 +87,8 @@ pub(crate) struct Session<B: Backend> {
     original_state: Option<B::State>,
     signal_guard: Option<B::SignalGuard>,
     wake: Arc<WakePipe>,
+    mouse_tracking: Option<MouseTracking>,
+    raw_mode_active: bool,
     lifecycle_started: bool,
     output_buffer: Vec<u8>,
 }
@@ -117,13 +119,6 @@ impl<B: Backend> Session<B> {
             .install_resize_handler(wake.write_fd())
             .map_err(|error| TerminalError::new("install SIGWINCH handler", error))?;
 
-        let mut raw_state = original_state.clone();
-        backend.make_raw(&mut raw_state);
-        if let Err(error) = backend.set_state(input_fd, &raw_state) {
-            let _ = backend.restore_resize_handler(signal_guard);
-            return Err(TerminalError::new("enable terminal raw mode", error));
-        }
-
         let mut session = Self {
             backend,
             input_fd,
@@ -131,19 +126,12 @@ impl<B: Backend> Session<B> {
             original_state: Some(original_state),
             signal_guard: Some(signal_guard),
             wake,
-            lifecycle_started: true,
+            mouse_tracking,
+            raw_mode_active: false,
+            lifecycle_started: false,
             output_buffer: Vec::new(),
         };
-        let mut operations = vec![
-            TerminalOp::EnterAlternateScreen,
-            TerminalOp::HideCursor,
-            TerminalOp::EnableBracketedPaste,
-        ];
-        if let Some(tracking) = mouse_tracking {
-            operations.push(TerminalOp::EnableMouse(tracking));
-        }
-        operations.push(TerminalOp::EnableFocus);
-        if let Err(error) = session.write_operations(&operations, Capabilities::BASELINE) {
+        if let Err(error) = session.activate("enable terminal raw mode") {
             let _ = session.restore();
             return Err(error);
         }
@@ -229,15 +217,58 @@ impl<B: Backend> Session<B> {
         self.backend.resize_pending()
     }
 
+    pub(crate) fn suspend(&mut self) -> Result<()> {
+        self.deactivate("suspend terminal mode")
+    }
+
+    pub(crate) fn resume(&mut self) -> Result<()> {
+        self.activate("resume terminal raw mode")
+    }
+
     pub(crate) fn finish(mut self) -> Result<()> {
         self.restore()
     }
 
-    fn restore(&mut self) -> Result<()> {
+    fn activate(&mut self, mode_operation: &'static str) -> Result<()> {
+        if self.lifecycle_started && self.raw_mode_active {
+            return Ok(());
+        }
+        if !self.raw_mode_active {
+            let Some(original_state) = self.original_state.as_ref() else {
+                return Err(TerminalError::new(
+                    "resume terminal session",
+                    io::Error::new(io::ErrorKind::NotConnected, "terminal session is closed"),
+                ));
+            };
+            let mut raw_state = original_state.clone();
+            self.backend.make_raw(&mut raw_state);
+            self.backend
+                .set_state(self.input_fd, &raw_state)
+                .map_err(|error| TerminalError::new(mode_operation, error))?;
+            self.raw_mode_active = true;
+        }
+
+        self.lifecycle_started = true;
+        let mut operations = vec![
+            TerminalOp::EnterAlternateScreen,
+            TerminalOp::HideCursor,
+            TerminalOp::EnableBracketedPaste,
+        ];
+        if let Some(tracking) = self.mouse_tracking {
+            operations.push(TerminalOp::EnableMouse(tracking));
+        }
+        operations.push(TerminalOp::EnableFocus);
+        if let Err(error) = self.write_operations(&operations, Capabilities::BASELINE) {
+            let _ = self.deactivate("restore terminal mode");
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn deactivate(&mut self, mode_operation: &'static str) -> Result<()> {
         let mut first_error = None;
 
         if self.lifecycle_started {
-            self.lifecycle_started = false;
             let operations = [
                 TerminalOp::DisableMouse,
                 TerminalOp::DisableFocus,
@@ -246,17 +277,35 @@ impl<B: Backend> Session<B> {
                 TerminalOp::ShowCursor,
                 TerminalOp::LeaveAlternateScreen,
             ];
-            if let Err(error) = self.write_operations(&operations, Capabilities::BASELINE) {
-                first_error = Some(error);
+            match self.write_operations(&operations, Capabilities::BASELINE) {
+                Ok(()) => self.lifecycle_started = false,
+                Err(error) => first_error = Some(error),
             }
         }
 
-        if let Some(original_state) = self.original_state.take() {
-            if let Err(error) = self.backend.set_state(self.input_fd, &original_state) {
-                first_error
-                    .get_or_insert_with(|| TerminalError::new("restore terminal mode", error));
+        if self.raw_mode_active {
+            if let Some(original_state) = self.original_state.as_ref() {
+                match self.backend.set_state(self.input_fd, original_state) {
+                    Ok(()) => self.raw_mode_active = false,
+                    Err(error) => {
+                        first_error
+                            .get_or_insert_with(|| TerminalError::new(mode_operation, error));
+                    }
+                }
             }
         }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let mut first_error = self.deactivate("restore terminal mode").err();
+        self.lifecycle_started = false;
+        self.raw_mode_active = false;
+        self.original_state.take();
 
         if let Some(signal_guard) = self.signal_guard.take() {
             if let Err(error) = self.backend.restore_resize_handler(signal_guard) {
@@ -293,6 +342,8 @@ mod tests {
         writes: Vec<Vec<u8>>,
         fail_write: Option<usize>,
         write_count: usize,
+        fail_set: Option<usize>,
+        set_count: usize,
         resize: bool,
     }
 
@@ -314,11 +365,13 @@ mod tests {
         }
 
         fn set_state(&mut self, fd: i32, state: &Self::State) -> io::Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .calls
-                .push(format!("set:{fd}:{state}"));
+            let mut fake = self.0.lock().unwrap();
+            let call = fake.set_count;
+            fake.set_count += 1;
+            fake.calls.push(format!("set:{fd}:{state}"));
+            if fake.fail_set == Some(call) {
+                return Err(io::Error::other("injected set-state failure"));
+            }
             Ok(())
         }
 
@@ -493,6 +546,107 @@ mod tests {
             Capabilities::BASELINE,
         );
         assert_eq!(state.lock().unwrap().writes[1], expected_restore);
+    }
+
+    #[test]
+    fn suspend_and_resume_restore_configured_terminal_lifecycle() {
+        let (backend, state) = fake();
+        let mut session = Session::start(backend, 0, 1, Some(MouseTracking::Press)).unwrap();
+
+        session.suspend().unwrap();
+        let writes_after_suspend = state.lock().unwrap().writes.len();
+        session.suspend().unwrap();
+        assert_eq!(state.lock().unwrap().writes.len(), writes_after_suspend);
+
+        session.resume().unwrap();
+        let writes_after_resume = state.lock().unwrap().writes.len();
+        session.resume().unwrap();
+        assert_eq!(state.lock().unwrap().writes.len(), writes_after_resume);
+
+        let expected_enter = encode(
+            &[
+                TerminalOp::EnterAlternateScreen,
+                TerminalOp::HideCursor,
+                TerminalOp::EnableBracketedPaste,
+                TerminalOp::EnableMouse(MouseTracking::Press),
+                TerminalOp::EnableFocus,
+            ],
+            Capabilities::BASELINE,
+        );
+        let expected_leave = encode(
+            &[
+                TerminalOp::DisableMouse,
+                TerminalOp::DisableFocus,
+                TerminalOp::DisableBracketedPaste,
+                TerminalOp::ResetStyle,
+                TerminalOp::ShowCursor,
+                TerminalOp::LeaveAlternateScreen,
+            ],
+            Capabilities::BASELINE,
+        );
+        let state_guard = state.lock().unwrap();
+        assert_eq!(
+            state_guard.writes,
+            [expected_enter.clone(), expected_leave, expected_enter,]
+        );
+        assert_eq!(state_guard.calls.last().unwrap(), "set:0:1");
+        drop(state_guard);
+
+        session.finish().unwrap();
+        assert_eq!(state.lock().unwrap().calls.last().unwrap(), "signal:off");
+    }
+
+    #[test]
+    fn failed_resume_output_rolls_back_to_original_mode() {
+        let (backend, state) = fake();
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+        session.suspend().unwrap();
+        state.lock().unwrap().fail_write = Some(2);
+
+        let error = session.resume().unwrap_err();
+
+        assert_eq!(error.operation(), "write terminal output");
+        assert_eq!(state.lock().unwrap().calls.last().unwrap(), "set:0:7");
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn close_retries_mode_restoration_after_failed_suspend() {
+        let (backend, state) = fake();
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+        state.lock().unwrap().fail_set = Some(1);
+
+        let error = session.suspend().unwrap_err();
+        assert_eq!(error.operation(), "suspend terminal mode");
+
+        session.finish().unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.calls.last().unwrap(), "signal:off");
+        assert!(
+            state
+                .calls
+                .iter()
+                .rev()
+                .take(2)
+                .any(|call| call == "set:0:7")
+        );
+    }
+
+    #[test]
+    fn close_retries_screen_cleanup_after_failed_suspend_write() {
+        let (backend, state) = fake();
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+        state.lock().unwrap().fail_write = Some(1);
+
+        assert_eq!(
+            session.suspend().unwrap_err().operation(),
+            "write terminal output"
+        );
+        session.finish().unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.writes.len(), 2);
+        assert_eq!(state.calls.last().unwrap(), "signal:off");
     }
 
     #[test]
