@@ -1,17 +1,19 @@
-//! Resolves source-neutral Content metadata through Terminal Presentation Rules
+//! Resolves Terminal Presentation Rules and projects source-neutral Content
 
 use std::error::Error;
 
-use nagi_content::{Element, ElementKind, Role};
+use nagi_content::{Content, Element, ElementKind, Role};
 use nagi_tui::{
-    Color, DeclarationValue, PresentationDeclaration, PresentationDisplay, PresentationRule,
-    PresentationSelector, PresentationSheet, PresentationState, Style, TextStyleDeclaration,
+    Color, ContentProjectionOptions, DeclarationValue, Node, PresentationDeclaration,
+    PresentationDisplay, PresentationRule, PresentationSelector, PresentationSheet,
+    PresentationState, Style, TextStyleDeclaration, project_content_with_states,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
     let heading = Role::new("heading")?;
     let muted = PresentationState::new("muted")?;
-    let element = Element::new(ElementKind::Paragraph, []).with_roles([heading.clone()])?;
+    let element = Element::new(ElementKind::Paragraph, [Content::text("Nagi")])
+        .with_roles([heading.clone()])?;
 
     let heading_rule = PresentationRule::new(
         PresentationSelector::Role(heading.clone()),
@@ -33,11 +35,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     .with_required_states([muted.clone()])?;
     let sheet = PresentationSheet::new([heading_rule, muted_rule]);
 
-    let computed = sheet.resolve(&element, Style::default(), &[muted]);
+    let active_states = [muted];
+    let computed = sheet.resolve(&element, Style::default(), &active_states);
     let style = computed.style();
     println!("display={}", display_name(computed.display()));
     println!("foreground={}", color_name(style.foreground));
     println!("bold={} dim={}", style.bold, style.dim);
+    let _node: Node<()> = project_content_with_states(
+        &element.into_content(),
+        &sheet,
+        ContentProjectionOptions::default(),
+        |_| active_states.as_slice(),
+    )?;
+    println!("projection=ok");
     Ok(())
 }
 

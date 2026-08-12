@@ -21,3 +21,7 @@ nagi-vt = { path = "../nagi-vt", version = "0.2.7" }
 [[bench]]
 name = "scroll_viewport"
 harness = false
+
+[[bench]]
+name = "content_projection"
+harness = false

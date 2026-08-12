@@ -2,6 +2,7 @@
 
 bench:
 	cargo bench -p nagi-tui --bench scroll_viewport
+	cargo bench -p nagi-tui --bench content_projection
 
 build:
 	cargo build --workspace --all-targets

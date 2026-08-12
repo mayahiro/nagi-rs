@@ -1,6 +1,6 @@
-//! Terminal Presentation Rules, application, semantic view, scoped key maps,
-//! interaction, effects, subscriptions, and terminal runtime facade for Nagi
-//! TUI
+//! Terminal Presentation Rules, bounded Content-to-Node projection,
+//! application, semantic view, scoped key maps, interaction, effects,
+//! subscriptions, and terminal runtime facade for Nagi TUI
 
 #![deny(unsafe_code)]
 
@@ -8,6 +8,7 @@ mod action_routing;
 mod ansi_text;
 mod app;
 mod clock;
+mod content_projection;
 mod core_action;
 mod effect;
 mod identity;
@@ -39,6 +40,13 @@ mod fixture_support;
 pub use ansi_text::AnsiTextOptions;
 pub use app::{App, ViewContext};
 pub use clock::{Clock, SystemClock, Timestamp, VirtualClock};
+pub use content_projection::{
+    ContentProjectionError, ContentProjectionErrorKind, ContentProjectionLimits,
+    ContentProjectionOptions, DEFAULT_CONTENT_PROJECTION_MAX_CONTENT_NODES,
+    DEFAULT_CONTENT_PROJECTION_MAX_DEPTH, DEFAULT_CONTENT_PROJECTION_MAX_OUTPUT_NODES,
+    DEFAULT_CONTENT_PROJECTION_MAX_SPANS, DEFAULT_CONTENT_PROJECTION_MAX_VISUAL_BYTES,
+    MAX_CONTENT_PROJECTION_DEPTH, project_content, project_content_with_states,
+};
 pub use effect::{CancelToken, Effect, ScopeId, Task, TaskKey};
 pub use identity::NodeId;
 pub use input::{EventAction, TimedInputDecoder};

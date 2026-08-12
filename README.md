@@ -50,7 +50,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-text` | Unicode 17 graphemes, terminal-width profiles, wrapping, truncation, and positions |
 | `nagi-vt` | Typed terminal input/output, Color, Attributes, and Style |
 | `nagi-surface` | Geometry, Cells, Surface drawing, composition, diffing, and snapshots |
-| `nagi-tui` | Terminal Presentation Rules, App lifecycle, semantic nodes, scoped key maps, layout, events, Effects, Subscriptions, and terminal loop |
+| `nagi-tui` | Terminal Presentation Rules, bounded Content-to-Node projection, App lifecycle, semantic nodes, scoped key maps, layout, events, Effects, Subscriptions, and terminal loop |
 | `nagi-tui-widgets` | 27 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
 | `nagi-cli` | Command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, staged Runtime Policy, and process integration |
@@ -95,7 +95,7 @@ Run commands from the Rust repository root
 | Example | Command |
 | --- | --- |
 | [Source-neutral content](crates/nagi-content/examples/content/README.md) | `cargo run -p nagi-content --example content` |
-| [Terminal Presentation Rules](crates/nagi-tui/examples/presentation/README.md) | `cargo run -p nagi-tui --example presentation` |
+| [Presentation Rules and Content projection](crates/nagi-tui/examples/presentation/README.md) | `cargo run -p nagi-tui --example presentation` |
 | [Counter](crates/nagi-tui/examples/counter/README.md) | `cargo run -p nagi-tui --example counter` |
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
