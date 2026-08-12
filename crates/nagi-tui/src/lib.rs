@@ -78,8 +78,9 @@ pub use nagi_vt::{
     Style, TerminalOp, encode,
 };
 pub use node::{
-    HorizontalAlignment, Insets, ModalFocusOptions, ModalInitialFocus, ModalReturnFocus, Node,
-    ScrollViewportOptions, VerticalAlignment, VirtualFragment, VirtualViewport,
+    AnchoredOverlayFallback, AnchoredOverlayOptions, AnchoredOverlaySide, HorizontalAlignment,
+    Insets, ModalFocusOptions, ModalInitialFocus, ModalReturnFocus, Node, ScrollViewportOptions,
+    VerticalAlignment, VirtualFragment, VirtualViewport,
 };
 pub use panel::{BorderKind, PanelOptions, PanelStyle};
 pub use presentation::{

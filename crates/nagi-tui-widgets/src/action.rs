@@ -75,6 +75,12 @@ pub const HISTORY_PREVIOUS_ACTION_ID: &str = "nagi.history.previous";
 /// Stable Action ID for recalling the next history entry
 pub const HISTORY_NEXT_ACTION_ID: &str = "nagi.history.next";
 
+/// Stable Action ID for accepting the selected suggestion
+pub const SUGGESTION_ACCEPT_ACTION_ID: &str = "nagi.suggestion.accept";
+
+/// Stable Action ID for dismissing an open suggestion popup
+pub const SUGGESTION_DISMISS_ACTION_ID: &str = "nagi.suggestion.dismiss";
+
 pub(crate) const ACTIVATE_ACTION_LABEL: &str = "Activate";
 pub(crate) const SELECTION_PREVIOUS_ACTION_LABEL: &str = "Previous";
 pub(crate) const SELECTION_NEXT_ACTION_LABEL: &str = "Next";

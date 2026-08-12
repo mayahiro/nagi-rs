@@ -76,6 +76,43 @@ pub enum VerticalAlignment {
     End,
 }
 
+/// Preferred vertical side of an anchored overlay
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum AnchoredOverlaySide {
+    /// Place the overlay after the anchor row
+    #[default]
+    Below,
+    /// Place the overlay before the anchor row
+    Above,
+}
+
+/// Fallback used when an anchored overlay does not fit on its preferred side
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum AnchoredOverlayFallback {
+    /// Use the opposite side when it has more available rows
+    #[default]
+    Flip,
+    /// Keep the preferred side and clip to its available rows
+    Clip,
+}
+
+/// Placement and size limits for an anchored overlay
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct AnchoredOverlayOptions {
+    /// Preferred vertical side of the anchor
+    pub side: AnchoredOverlaySide,
+    /// Horizontal alignment relative to the anchor
+    pub alignment: HorizontalAlignment,
+    /// Empty rows inserted between the anchor and overlay
+    pub gap: u32,
+    /// Fallback when the preferred side cannot contain the natural height
+    pub fallback: AnchoredOverlayFallback,
+    /// Greatest overlay width, or zero for the available boundary width
+    pub maximum_width: u32,
+    /// Greatest overlay height, or zero for the available boundary height
+    pub maximum_height: u32,
+}
+
 /// Behavior of a ScrollViewport
 pub struct ScrollViewportOptions<Message> {
     /// Axes controlled by user and programmatic scrolling
@@ -206,6 +243,13 @@ enum NodeKind<Message> {
     Row(LinearNode<Message>),
     Column(LinearNode<Message>),
     Stack(Vec<Node<Message>>),
+    AnchoredOverlay {
+        base: Box<Node<Message>>,
+        anchor: NodeId,
+        overlay: Box<Node<Message>>,
+        options: AnchoredOverlayOptions,
+        cache: RefCell<Option<AnchoredOverlayFrame>>,
+    },
     Padding {
         insets: Insets,
         child: Box<Node<Message>>,
@@ -268,6 +312,13 @@ struct VirtualFlowBuiltItem<Message> {
     origin: u32,
     height: u32,
     node: Node<Message>,
+}
+
+#[derive(Clone, Copy)]
+struct AnchoredOverlayFrame {
+    rect: Rect,
+    clip: Rect,
+    overlay: Option<Rect>,
 }
 
 struct LinearNode<Message> {
@@ -401,6 +452,40 @@ impl<Message> Node<Message> {
     #[must_use]
     pub fn stack(children: impl IntoIterator<Item = Self>) -> Self {
         Self::new(NodeKind::Stack(children.into_iter().collect()))
+    }
+
+    /// Places a front layer relative to an identified descendant of `base`
+    ///
+    /// The default prefers below-start placement, flips above when that side
+    /// has more room, and constrains the layer to this node's visible boundary
+    #[must_use]
+    pub fn anchored_overlay(base: Self, anchor: impl Into<NodeId>, overlay: Self) -> Self {
+        Self::anchored_overlay_with_options(
+            base,
+            anchor,
+            overlay,
+            AnchoredOverlayOptions::default(),
+        )
+    }
+
+    /// Places a configured front layer relative to an identified descendant
+    ///
+    /// The overlay does not affect measurement. It is omitted from rendering,
+    /// hit testing, and routing while the anchor is absent or not visible
+    #[must_use]
+    pub fn anchored_overlay_with_options(
+        base: Self,
+        anchor: impl Into<NodeId>,
+        overlay: Self,
+        options: AnchoredOverlayOptions,
+    ) -> Self {
+        Self::new(NodeKind::AnchoredOverlay {
+            base: Box::new(base),
+            anchor: anchor.into(),
+            overlay: Box::new(overlay),
+            options,
+            cache: RefCell::new(None),
+        })
     }
 
     /// Wraps a child in fixed padding
@@ -831,6 +916,7 @@ impl<Message> Node<Message> {
                 let child = child.measure(constraints, profile);
                 Size::new(size.width.max(child.width), size.height.max(child.height))
             }),
+            NodeKind::AnchoredOverlay { base, .. } => base.measure(constraints, profile),
             NodeKind::Padding { insets, child } => add_size(
                 child.measure(shrink_constraints(constraints, *insets), profile),
                 insets.left.saturating_add(insets.right),
@@ -910,6 +996,34 @@ impl<Message> Node<Message> {
             NodeKind::Stack(children) => {
                 for child in children {
                     child.render(surface, rect, clip, interaction, profile);
+                }
+            }
+            NodeKind::AnchoredOverlay {
+                base,
+                anchor,
+                overlay,
+                options,
+                cache,
+            } => {
+                base.render(surface, rect, clip, interaction, profile);
+                if let Some(overlay_rect) = anchored_overlay_rect(
+                    base,
+                    anchor,
+                    overlay,
+                    *options,
+                    cache,
+                    rect,
+                    clip,
+                    interaction,
+                    profile,
+                ) {
+                    overlay.render(
+                        surface,
+                        overlay_rect,
+                        clip.intersection(rect),
+                        interaction,
+                        profile,
+                    );
                 }
             }
             NodeKind::Padding { insets, child } => {
@@ -1163,6 +1277,9 @@ impl<Message> Node<Message> {
             NodeKind::Stack(children) => {
                 children.iter().find_map(|child| child.visit(id, operation))
             }
+            NodeKind::AnchoredOverlay { base, overlay, .. } => base
+                .visit(id, operation)
+                .or_else(|| overlay.visit(id, operation)),
             NodeKind::Padding { child, .. }
             | NodeKind::Border { child, .. }
             | NodeKind::Align { child, .. }
@@ -1181,6 +1298,171 @@ impl<Message> Node<Message> {
                     .iter()
                     .find_map(|item| item.node.visit(id, operation))
             }),
+            NodeKind::Text { .. }
+            | NodeKind::RichText { .. }
+            | NodeKind::Surface(_)
+            | NodeKind::Spacer(_)
+            | NodeKind::Gap(_)
+            | NodeKind::CursorAnchor { .. }
+            | NodeKind::TextInput { .. } => None,
+        }
+    }
+
+    fn find_node_geometry(
+        &self,
+        id: &NodeId,
+        rect: Rect,
+        clip: Rect,
+        interaction: &InteractionState,
+        profile: WidthProfile<'static>,
+    ) -> Option<(Rect, Rect)> {
+        if self.id.as_ref() == Some(id) {
+            return Some((rect, clip));
+        }
+        match &self.kind {
+            NodeKind::Row(linear) => linear
+                .children
+                .iter()
+                .zip(linear.layout(rect, true, profile).rects(rect))
+                .find_map(|(child, child_rect)| {
+                    child.find_node_geometry(id, child_rect, clip, interaction, profile)
+                }),
+            NodeKind::Column(linear) => linear
+                .children
+                .iter()
+                .zip(linear.layout(rect, false, profile).rects(rect))
+                .find_map(|(child, child_rect)| {
+                    child.find_node_geometry(id, child_rect, clip, interaction, profile)
+                }),
+            NodeKind::Stack(children) => children
+                .iter()
+                .find_map(|child| child.find_node_geometry(id, rect, clip, interaction, profile)),
+            NodeKind::AnchoredOverlay {
+                base,
+                anchor,
+                overlay,
+                options,
+                cache,
+            } => base
+                .find_node_geometry(id, rect, clip, interaction, profile)
+                .or_else(|| {
+                    let overlay_rect = anchored_overlay_rect(
+                        base,
+                        anchor,
+                        overlay,
+                        *options,
+                        cache,
+                        rect,
+                        clip,
+                        interaction,
+                        profile,
+                    )?;
+                    overlay.find_node_geometry(
+                        id,
+                        overlay_rect,
+                        clip.intersection(rect),
+                        interaction,
+                        profile,
+                    )
+                }),
+            NodeKind::Padding { insets, child } => child.find_node_geometry(
+                id,
+                inset(rect, insets.left, insets.top, insets.right, insets.bottom),
+                clip,
+                interaction,
+                profile,
+            ),
+            NodeKind::Border { child, .. } => {
+                child.find_node_geometry(id, inset(rect, 1, 1, 1, 1), clip, interaction, profile)
+            }
+            NodeKind::Align {
+                horizontal,
+                vertical,
+                child,
+            } => child.find_node_geometry(
+                id,
+                aligned_child_rect(rect, child, *horizontal, *vertical, profile),
+                clip,
+                interaction,
+                profile,
+            ),
+            NodeKind::Clip(child) => {
+                child.find_node_geometry(id, rect, clip.intersection(rect), interaction, profile)
+            }
+            NodeKind::ScrollViewport { child, options } => child.find_node_geometry(
+                id,
+                scroll_child_rect(
+                    rect,
+                    child,
+                    interaction.scroll_offset(
+                        self.id
+                            .as_ref()
+                            .expect("ScrollViewport always has a NodeId"),
+                    ),
+                    options.axis,
+                    profile,
+                ),
+                clip.intersection(rect),
+                interaction,
+                profile,
+            ),
+            NodeKind::VirtualScrollViewport(virtual_node) => {
+                let id_owner = self
+                    .id
+                    .as_ref()
+                    .expect("VirtualScrollViewport always has a NodeId");
+                let state = interaction.preview_scroll(
+                    id_owner,
+                    virtual_scroll_maximum(
+                        virtual_node.content_size,
+                        rect,
+                        virtual_node.options.axis,
+                    ),
+                    virtual_node.options.axis,
+                    virtual_node.options.stick_to_end,
+                );
+                virtual_fragment(
+                    virtual_node.content_size,
+                    virtual_node.options.axis,
+                    virtual_node.builder.as_ref(),
+                    &virtual_node.cache,
+                    rect,
+                    state.offset,
+                )
+                .and_then(|fragment| {
+                    fragment.fragment.node.find_node_geometry(
+                        id,
+                        virtual_fragment_rect(rect, &fragment, profile),
+                        clip.intersection(rect),
+                        interaction,
+                        profile,
+                    )
+                })
+            }
+            NodeKind::VirtualFlow(flow) => flow.cache.borrow().as_ref().and_then(|frame| {
+                frame.items.iter().find_map(|item| {
+                    item.node.find_node_geometry(
+                        id,
+                        virtual_flow_item_rect(rect, frame.offset, item.origin, item.height),
+                        clip.intersection(rect),
+                        interaction,
+                        profile,
+                    )
+                })
+            }),
+            NodeKind::Modal { child, .. } => {
+                child.find_node_geometry(id, rect, clip, interaction, profile)
+            }
+            NodeKind::Panel { options, child, .. } => {
+                let insets = panel_content_insets(*options);
+                child.find_node_geometry(
+                    id,
+                    inset(rect, insets.left, insets.top, insets.right, insets.bottom),
+                    clip,
+                    interaction,
+                    profile,
+                )
+            }
             NodeKind::Text { .. }
             | NodeKind::RichText { .. }
             | NodeKind::Surface(_)
@@ -1300,6 +1582,49 @@ impl<Message> Node<Message> {
                     child.build_index(
                         rect,
                         clip,
+                        parent,
+                        false,
+                        focus_fallback,
+                        interaction,
+                        index,
+                        actions,
+                        profile,
+                    )?;
+                }
+            }
+            NodeKind::AnchoredOverlay {
+                base,
+                anchor,
+                overlay,
+                options,
+                cache,
+            } => {
+                base.build_index(
+                    rect,
+                    clip,
+                    parent,
+                    false,
+                    focus_fallback,
+                    interaction,
+                    index,
+                    actions,
+                    profile,
+                )?;
+                *cache.borrow_mut() = None;
+                if let Some(overlay_rect) = anchored_overlay_rect(
+                    base,
+                    anchor,
+                    overlay,
+                    *options,
+                    cache,
+                    rect,
+                    clip,
+                    interaction,
+                    profile,
+                ) {
+                    overlay.build_index(
+                        overlay_rect,
+                        clip.intersection(rect),
                         parent,
                         false,
                         focus_fallback,
@@ -1489,6 +1814,29 @@ impl<Message> Node<Message> {
             NodeKind::Stack(children) => {
                 for child in children {
                     child.prepare_virtual_flows_at(rect, interaction, profile);
+                }
+            }
+            NodeKind::AnchoredOverlay {
+                base,
+                anchor,
+                overlay,
+                options,
+                cache,
+            } => {
+                base.prepare_virtual_flows_at(rect, interaction, profile);
+                *cache.borrow_mut() = None;
+                if let Some(overlay_rect) = anchored_overlay_rect(
+                    base,
+                    anchor,
+                    overlay,
+                    *options,
+                    cache,
+                    rect,
+                    rect,
+                    interaction,
+                    profile,
+                ) {
+                    overlay.prepare_virtual_flows_at(overlay_rect, interaction, profile);
                 }
             }
             NodeKind::Padding { insets, child } => child.prepare_virtual_flows_at(
@@ -1683,6 +2031,30 @@ impl<Message> Node<Message> {
                 }
                 changed
             }
+            NodeKind::AnchoredOverlay {
+                base,
+                anchor,
+                overlay,
+                options,
+                cache,
+            } => {
+                let mut changed = base.prepare_at(rect, interaction, profile);
+                *cache.borrow_mut() = None;
+                if let Some(overlay_rect) = anchored_overlay_rect(
+                    base,
+                    anchor,
+                    overlay,
+                    *options,
+                    cache,
+                    rect,
+                    rect,
+                    interaction,
+                    profile,
+                ) {
+                    changed |= overlay.prepare_at(overlay_rect, interaction, profile);
+                }
+                changed
+            }
             NodeKind::Padding { insets, child } => child.prepare_at(
                 inset(rect, insets.left, insets.top, insets.right, insets.bottom),
                 interaction,
@@ -1828,6 +2200,170 @@ fn clamp_size(mut size: Size, constraints: Constraints) -> Size {
         size.height = size.height.min(height);
     }
     size
+}
+
+#[allow(clippy::too_many_arguments)]
+fn anchored_overlay_rect<Message>(
+    base: &Node<Message>,
+    anchor: &NodeId,
+    overlay: &Node<Message>,
+    options: AnchoredOverlayOptions,
+    cache: &RefCell<Option<AnchoredOverlayFrame>>,
+    rect: Rect,
+    clip: Rect,
+    interaction: &InteractionState,
+    profile: WidthProfile<'static>,
+) -> Option<Rect> {
+    if let Some(frame) = cache.borrow().as_ref() {
+        if frame.rect == rect && frame.clip == clip {
+            return frame.overlay;
+        }
+    }
+    let boundary = rect.intersection(clip);
+    let anchor_geometry = base.find_node_geometry(anchor, rect, clip, interaction, profile);
+    let resolved = anchor_geometry.and_then(|(anchor_rect, anchor_clip)| {
+        resolve_anchored_overlay_rect(
+            anchor_rect,
+            anchor_clip,
+            boundary,
+            overlay,
+            options,
+            profile,
+        )
+    });
+    *cache.borrow_mut() = Some(AnchoredOverlayFrame {
+        rect,
+        clip,
+        overlay: resolved,
+    });
+    resolved
+}
+
+fn resolve_anchored_overlay_rect<Message>(
+    anchor: Rect,
+    anchor_clip: Rect,
+    boundary: Rect,
+    overlay: &Node<Message>,
+    options: AnchoredOverlayOptions,
+    profile: WidthProfile<'static>,
+) -> Option<Rect> {
+    if !anchored_overlay_anchor_visible(anchor, anchor_clip, boundary) {
+        return None;
+    }
+    let width_limit = if options.maximum_width == 0 {
+        boundary.width
+    } else {
+        boundary.width.min(options.maximum_width)
+    };
+    let height_limit = if options.maximum_height == 0 {
+        boundary.height
+    } else {
+        boundary.height.min(options.maximum_height)
+    };
+    let desired = overlay.measure(
+        Constraints::bounded(Size::new(width_limit, height_limit)),
+        profile,
+    );
+    if desired.is_empty() {
+        return None;
+    }
+
+    let boundary_top = i64::from(boundary.y);
+    let boundary_bottom = boundary_top.saturating_add(i64::from(boundary.height));
+    let anchor_top = i64::from(anchor.y);
+    let anchor_bottom = anchor_top.saturating_add(i64::from(anchor.height));
+    let gap = i64::from(options.gap);
+    let below_start = anchor_bottom.saturating_add(gap);
+    let above_end = anchor_top.saturating_sub(gap);
+    let below = extent_to_u32(below_start, boundary_bottom);
+    let above = extent_to_u32(boundary_top, above_end);
+    let preferred = match options.side {
+        AnchoredOverlaySide::Below => below,
+        AnchoredOverlaySide::Above => above,
+    };
+    let opposite = match options.side {
+        AnchoredOverlaySide::Below => above,
+        AnchoredOverlaySide::Above => below,
+    };
+    let side = if options.fallback == AnchoredOverlayFallback::Flip
+        && desired.height > preferred
+        && opposite > preferred
+    {
+        match options.side {
+            AnchoredOverlaySide::Below => AnchoredOverlaySide::Above,
+            AnchoredOverlaySide::Above => AnchoredOverlaySide::Below,
+        }
+    } else {
+        options.side
+    };
+    let available_height = match side {
+        AnchoredOverlaySide::Below => below,
+        AnchoredOverlaySide::Above => above,
+    };
+    let height = desired.height.min(available_height);
+    let width = desired.width.min(boundary.width);
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let anchor_left = i64::from(anchor.x);
+    let anchor_right = anchor_left.saturating_add(i64::from(anchor.width));
+    let candidate_x = match options.alignment {
+        HorizontalAlignment::Start => anchor_left,
+        HorizontalAlignment::Center => anchor_left
+            .saturating_add(i64::from(anchor.width) / 2)
+            .saturating_sub(i64::from(width) / 2),
+        HorizontalAlignment::End => anchor_right.saturating_sub(i64::from(width)),
+    };
+    let boundary_left = i64::from(boundary.x);
+    let boundary_right = boundary_left.saturating_add(i64::from(boundary.width));
+    let maximum_x = boundary_right.saturating_sub(i64::from(width));
+    let x = candidate_x.clamp(boundary_left, maximum_x);
+    let y = match side {
+        AnchoredOverlaySide::Below => below_start.max(boundary_top),
+        AnchoredOverlaySide::Above => above_end
+            .saturating_sub(i64::from(height))
+            .max(boundary_top),
+    };
+    Some(Rect::new(
+        clamp_i64_to_i32(x),
+        clamp_i64_to_i32(y),
+        width,
+        height,
+    ))
+}
+
+fn anchored_overlay_anchor_visible(anchor: Rect, anchor_clip: Rect, boundary: Rect) -> bool {
+    if anchor.height == 0 || anchor_clip.is_empty() || boundary.is_empty() {
+        return false;
+    }
+    let anchor_top = i64::from(anchor.y);
+    let anchor_bottom = anchor_top.saturating_add(i64::from(anchor.height));
+    let visible_top = anchor_top
+        .max(i64::from(anchor_clip.y))
+        .max(i64::from(boundary.y));
+    let visible_bottom = anchor_bottom
+        .min(i64::from(anchor_clip.y).saturating_add(i64::from(anchor_clip.height)))
+        .min(i64::from(boundary.y).saturating_add(i64::from(boundary.height)));
+    if visible_bottom <= visible_top {
+        return false;
+    }
+    if anchor.width != 0 {
+        return !anchor
+            .intersection(anchor_clip)
+            .intersection(boundary)
+            .is_empty();
+    }
+    let anchor_x = i64::from(anchor.x);
+    let visible_left = i64::from(anchor_clip.x).max(i64::from(boundary.x));
+    let visible_right = i64::from(anchor_clip.x)
+        .saturating_add(i64::from(anchor_clip.width))
+        .min(i64::from(boundary.x).saturating_add(i64::from(boundary.width)));
+    anchor_x >= visible_left && anchor_x < visible_right
+}
+
+fn extent_to_u32(start: i64, end: i64) -> u32 {
+    u32::try_from(end.saturating_sub(start).max(0)).unwrap_or(u32::MAX)
 }
 
 fn merge_node_style(surface: &mut Surface, rect: Rect, overlay: Style) {
@@ -2836,6 +3372,81 @@ mod tests {
     enum Message {}
 
     #[test]
+    fn anchored_overlay_placement_matches_shared_fixtures() {
+        let Some(records) = crate::fixture_support::load(
+            "layout/anchored-overlay.txt",
+            "anchored-overlay-placement",
+            &[
+                "boundary",
+                "anchor",
+                "anchor-clip",
+                "overlay",
+                "side",
+                "alignment",
+                "gap",
+                "fallback",
+                "max-width",
+                "max-height",
+                "expected",
+            ],
+        ) else {
+            return;
+        };
+
+        for record in records {
+            let overlay = fixture_size(record.field("overlay"));
+            let actual = resolve_anchored_overlay_rect(
+                fixture_rect(record.field("anchor")),
+                fixture_rect(record.field("anchor-clip")),
+                fixture_rect(record.field("boundary")),
+                &Node::<Message>::spacer(overlay.width, overlay.height),
+                AnchoredOverlayOptions {
+                    side: match record.field("side") {
+                        "below" => AnchoredOverlaySide::Below,
+                        "above" => AnchoredOverlaySide::Above,
+                        value => panic!("case {} has invalid side {value}", record.id),
+                    },
+                    alignment: match record.field("alignment") {
+                        "start" => HorizontalAlignment::Start,
+                        "center" => HorizontalAlignment::Center,
+                        "end" => HorizontalAlignment::End,
+                        value => panic!("case {} has invalid alignment {value}", record.id),
+                    },
+                    gap: fixture_number(record.field("gap")),
+                    fallback: match record.field("fallback") {
+                        "flip" => AnchoredOverlayFallback::Flip,
+                        "clip" => AnchoredOverlayFallback::Clip,
+                        value => panic!("case {} has invalid fallback {value}", record.id),
+                    },
+                    maximum_width: fixture_number(record.field("max-width")),
+                    maximum_height: fixture_number(record.field("max-height")),
+                },
+                WidthProfile::MODERN,
+            );
+            let expected = (record.field("expected") != "none")
+                .then(|| fixture_rect(record.field("expected")));
+            assert_eq!(actual, expected, "case {}", record.id);
+        }
+    }
+
+    #[test]
+    fn anchored_overlay_measurement_is_exactly_the_base_measurement() {
+        let base = Node::<()>::spacer(2, 3);
+        let overlay = Node::<()>::spacer(20, 30);
+        let anchored = Node::anchored_overlay(base, "anchor", overlay);
+        assert_eq!(
+            anchored.measure(
+                Constraints {
+                    width: Limit::Unbounded,
+                    height: Limit::Unbounded,
+                },
+                WidthProfile::MODERN,
+            ),
+            Size::new(2, 3)
+        );
+    }
+
+    #[test]
     fn virtual_scroll_requests_match_shared_fixtures() {
         let Some(records) = crate::fixture_support::load(
             "interaction/virtual-scroll.txt",
@@ -3150,5 +3761,23 @@ mod tests {
         value
             .parse()
             .unwrap_or_else(|error| panic!("invalid fixture number {value}: {error}"))
+    }
+
+    fn fixture_rect(value: &str) -> Rect {
+        let mut parts = value.split(':');
+        let x = parts.next().unwrap().parse().unwrap();
+        let y = parts.next().unwrap().parse().unwrap();
+        let width = parts.next().unwrap().parse().unwrap();
+        let height = parts.next().unwrap().parse().unwrap();
+        assert!(parts.next().is_none(), "invalid fixture Rect {value}");
+        Rect::new(x, y, width, height)
+    }
+
+    fn fixture_size(value: &str) -> Size {
+        let mut parts = value.split(':');
+        let width = parts.next().unwrap().parse().unwrap();
+        let height = parts.next().unwrap().parse().unwrap();
+        assert!(parts.next().is_none(), "invalid fixture Size {value}");
+        Size::new(width, height)
     }
 }

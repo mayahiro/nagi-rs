@@ -26,6 +26,7 @@ mod select;
 mod selectable_text;
 mod sparkline;
 mod spinner;
+mod suggestion_popup;
 mod table;
 mod tabs;
 mod text_area;
@@ -45,8 +46,8 @@ pub use action::{
     SELECTION_NEXT_DAY_ACTION_ID, SELECTION_NEXT_MONTH_ACTION_ID, SELECTION_NEXT_PAGE_ACTION_ID,
     SELECTION_NEXT_WEEK_ACTION_ID, SELECTION_PREVIOUS_ACTION_ID, SELECTION_PREVIOUS_DAY_ACTION_ID,
     SELECTION_PREVIOUS_MONTH_ACTION_ID, SELECTION_PREVIOUS_PAGE_ACTION_ID,
-    SELECTION_PREVIOUS_WEEK_ACTION_ID, activate_action_descriptor, confirm_action_descriptor,
-    dismiss_action_descriptor,
+    SELECTION_PREVIOUS_WEEK_ACTION_ID, SUGGESTION_ACCEPT_ACTION_ID, SUGGESTION_DISMISS_ACTION_ID,
+    activate_action_descriptor, confirm_action_descriptor, dismiss_action_descriptor,
 };
 pub use bar_chart::{BarChart, BarChartBar, BarChartStyle};
 pub use button::{Button, ButtonStyle};
@@ -72,6 +73,10 @@ pub use selectable_text::{
 };
 pub use sparkline::Sparkline;
 pub use spinner::{SPINNER_FRAMES, Spinner, SpinnerStyle};
+pub use suggestion_popup::{
+    DuplicateSuggestionId, SuggestionId, SuggestionItems, SuggestionPopup, SuggestionPopupStatus,
+    SuggestionPopupStyle, SuggestionRowContext,
+};
 pub use table::{Table, TableColumn, TableRow, TableStyle};
 pub use tabs::{TabItem, Tabs, TabsStyle};
 pub use text_area::{TextArea, TextAreaBoundaryNavigation, TextAreaState, TextAreaStyle};

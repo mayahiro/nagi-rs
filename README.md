@@ -101,6 +101,7 @@ Run commands from the Rust repository root
 | [Counter](crates/nagi-tui/examples/counter/README.md) | `cargo run -p nagi-tui --example counter` |
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
+| [Suggestion popup](crates/nagi-tui-widgets/examples/suggestion_popup/README.md) | `cargo run -p nagi-tui-widgets --example suggestion_popup` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
 | [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
@@ -147,6 +148,12 @@ grapheme or shift following text
 optional validation content, and insertion limits over `TextArea`. Applications
 retain ownership of message meaning, history persistence, and sensitive-value
 policy
+
+`SuggestionPopup` composes a generic `AnchoredOverlay` with controlled stable
+candidate IDs, a bounded selected row window, replaceable loading and empty
+content, semantic actions, and focus-preserving pointer activation. The
+application owns query parsing, ranking, asynchronous Effects, cancellation,
+and acceptance meaning
 
 `SelectableText` adds controlled grapheme-aligned keyboard and left-button
 drag selection over immutable styled content. Stable-ID pointer capture
