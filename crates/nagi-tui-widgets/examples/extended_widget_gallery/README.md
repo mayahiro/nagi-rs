@@ -20,6 +20,7 @@ Tree expansion flags, dialog visibility, and query text in application state.
 Composer uses Enter to submit, Shift-Enter to insert a line, and Up or Down at
 a visual boundary to recall history. SelectableText keeps selection state in
 the application and turns selection or document copy actions into application
-messages without choosing a clipboard backend. The generic Dialog shows three
-application-defined actions. It is intended as an API survey rather than a
-production screen layout
+messages. The application returns a Clipboard Effect for that message, while
+the terminal options explicitly opt in to write-only OSC 52 output. The generic
+Dialog shows three application-defined actions. It is intended as an API survey
+rather than a production screen layout

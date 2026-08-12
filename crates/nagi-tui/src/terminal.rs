@@ -8,8 +8,21 @@ use nagi_text::WidthProfile;
 use crate::terminal_unix::{TerminalError, TerminalSession};
 use crate::{
     App, Capabilities, Event, EventAction, MouseTracking, QueueFull, Runtime, RuntimeConfig,
-    RuntimeError, RuntimeEventError, RuntimeNotice, Size, SystemClock, TimedInputDecoder,
+    RuntimeError, RuntimeEventError, RuntimeNotice, Size, SystemClock, TerminalOp,
+    TimedInputDecoder,
 };
+
+/// Standard terminal handling for application clipboard requests
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalClipboard {
+    /// Drop clipboard requests without terminal output
+    #[default]
+    Disabled,
+    /// Write clipboard requests through direct, write-only OSC 52 sequences
+    ///
+    /// The terminal runner does not detect support or add multiplexer wrapping
+    Osc52,
+}
 
 /// Settings for [`run_terminal`]
 #[derive(Clone, Copy, Debug)]
@@ -18,6 +31,8 @@ pub struct TerminalOptions {
     pub capabilities: Capabilities,
     /// SGR mouse tracking policy, or `None` to preserve terminal text selection
     pub mouse_tracking: Option<MouseTracking>,
+    /// Clipboard output policy, disabled by default
+    pub clipboard: TerminalClipboard,
     /// Whether to focus the first focusable node before the initial frame
     pub focus_first: bool,
     /// Maximum time to disambiguate a lone ESC from an escape sequence
@@ -46,6 +61,7 @@ impl Default for TerminalOptions {
         Self {
             capabilities: Capabilities::BASELINE,
             mouse_tracking: None,
+            clipboard: TerminalClipboard::Disabled,
             focus_first: false,
             escape_timeout: Duration::from_millis(25),
             queue_capacity: crate::DEFAULT_QUEUE_CAPACITY,
@@ -198,7 +214,12 @@ where
     if options.focus_first {
         runtime.focus_first()?;
     }
-    write_pending_frame(session, &mut runtime, options.capabilities)?;
+    write_pending_output(
+        session,
+        &mut runtime,
+        options.capabilities,
+        options.clipboard,
+    )?;
 
     while !runtime.exit_requested() {
         let timeout = nearest_terminal_deadline([
@@ -240,7 +261,12 @@ where
         }
         runtime.process_pending()?;
         handle_runtime_notices(&mut runtime, handle_notice);
-        write_pending_frame(session, &mut runtime, options.capabilities)?;
+        write_pending_output(
+            session,
+            &mut runtime,
+            options.capabilities,
+            options.clipboard,
+        )?;
         if exit || runtime.exit_requested() {
             break;
         }
@@ -265,17 +291,32 @@ fn nearest_terminal_deadline(deadlines: [Option<Duration>; 4]) -> Option<Duratio
     deadlines.into_iter().flatten().min()
 }
 
-fn write_pending_frame<Application: App>(
+fn write_pending_output<Application: App>(
     session: &mut TerminalSession,
     runtime: &mut Runtime<Application, SystemClock>,
     capabilities: Capabilities,
+    clipboard: TerminalClipboard,
 ) -> Result<(), RunError> {
-    if let Some(frame) = runtime.render_if_dirty()? {
-        session
-            .write_operations(frame.operations(), capabilities)
-            .map_err(run_terminal_error)?;
+    let frame = runtime.render_if_dirty()?;
+    let clipboard_operation = take_clipboard_operation(runtime, clipboard);
+    match (frame.as_ref(), clipboard_operation.as_ref()) {
+        (Some(frame), extra) => session
+            .write_operations_with_extra(frame.operations(), extra, capabilities)
+            .map_err(run_terminal_error)?,
+        (None, Some(operation)) => session
+            .write_operations(std::slice::from_ref(operation), capabilities)
+            .map_err(run_terminal_error)?,
+        (None, None) => {}
     }
     Ok(())
+}
+
+fn take_clipboard_operation<Application: App, C: crate::Clock>(
+    runtime: &mut Runtime<Application, C>,
+    clipboard: TerminalClipboard,
+) -> Option<TerminalOp> {
+    let request = runtime.take_clipboard_request()?;
+    (clipboard == TerminalClipboard::Osc52).then(|| TerminalOp::SetClipboard(request.into_text()))
 }
 
 fn run_terminal_error(error: TerminalError) -> RunError {
@@ -287,12 +328,31 @@ fn run_terminal_error(error: TerminalError) -> RunError {
 mod tests {
     use std::time::Duration;
 
-    use super::{TerminalOptions, nearest_terminal_deadline};
+    use crate::{App, Effect, Node, Runtime, RuntimeConfig, Size, ViewContext, VirtualClock};
+
+    use super::{
+        TerminalClipboard, TerminalOptions, nearest_terminal_deadline, take_clipboard_operation,
+    };
+
+    struct ClipboardApp;
+
+    impl App for ClipboardApp {
+        type Message = &'static str;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            Effect::set_clipboard(message).without_redraw()
+        }
+
+        fn view(&self, _context: ViewContext) -> Node<Self::Message> {
+            Node::text("view")
+        }
+    }
 
     #[test]
     fn defaults_preserve_unfocused_non_mouse_behavior() {
         let options = TerminalOptions::default();
         assert_eq!(options.mouse_tracking, None);
+        assert_eq!(options.clipboard, TerminalClipboard::Disabled);
         assert!(!options.focus_first);
         assert_eq!(
             options.minimum_frame_interval,
@@ -311,6 +371,31 @@ mod tests {
                 Some(Duration::from_millis(8)),
             ]),
             Some(Duration::from_millis(8))
+        );
+    }
+
+    #[test]
+    fn clipboard_output_is_explicit_and_does_not_require_a_frame() {
+        let mut runtime = Runtime::with_clock(
+            ClipboardApp,
+            RuntimeConfig::new(Size::new(8, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        runtime.enqueue("copy").unwrap();
+        runtime.process_pending().unwrap();
+        assert_eq!(
+            take_clipboard_operation(&mut runtime, TerminalClipboard::Disabled),
+            None
+        );
+
+        runtime.enqueue("copy").unwrap();
+        runtime.process_pending().unwrap();
+        assert_eq!(
+            take_clipboard_operation(&mut runtime, TerminalClipboard::Osc52),
+            Some(crate::TerminalOp::SetClipboard("copy".to_owned()))
         );
     }
 }

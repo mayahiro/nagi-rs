@@ -182,9 +182,21 @@ impl<B: Backend> Session<B> {
         operations: &[TerminalOp],
         capabilities: Capabilities,
     ) -> Result<()> {
+        self.write_operations_with_extra(operations, None, capabilities)
+    }
+
+    pub(crate) fn write_operations_with_extra(
+        &mut self,
+        operations: &[TerminalOp],
+        extra: Option<&TerminalOp>,
+        capabilities: Capabilities,
+    ) -> Result<()> {
         let mut output = std::mem::take(&mut self.output_buffer);
         output.clear();
         append_encoded(&mut output, operations, capabilities);
+        if let Some(operation) = extra {
+            append_encoded(&mut output, std::slice::from_ref(operation), capabilities);
+        }
         let result = self.write_all(&output);
         self.output_buffer = output;
         result
@@ -481,5 +493,29 @@ mod tests {
             Capabilities::BASELINE,
         );
         assert_eq!(state.lock().unwrap().writes[1], expected_restore);
+    }
+
+    #[test]
+    fn frame_and_clipboard_extra_share_one_serialized_write() {
+        let (backend, state) = fake();
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+        let clipboard = TerminalOp::SetClipboard("copy".to_owned());
+
+        session
+            .write_operations_with_extra(
+                &[TerminalOp::WriteText("view".to_owned())],
+                Some(&clipboard),
+                Capabilities::BASELINE,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().writes[1],
+            encode(
+                &[TerminalOp::WriteText("view".to_owned()), clipboard],
+                Capabilities::BASELINE,
+            )
+        );
+        session.finish().unwrap();
     }
 }

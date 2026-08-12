@@ -70,7 +70,7 @@ nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
-`nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、Runtime notice、frame、activeなresolved actionを操作できます
+`nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、pending clipboard request、Runtime notice、frame、activeなresolved actionを操作できます
 
 `nagi-cli-test`はprocess起動やsignal handler設定を行わず、argvとprocess serviceを注入してoutputとExit Statusを取得します
 
@@ -117,7 +117,7 @@ TUIのterminal inputとoutputはterminalへ接続されている必要があり�
 
 `Composer`は`TextArea`へcontrolled submitとhistory recall、自動row境界、任意のvalidation content、挿入制限を加えます。Applicationはmessageの意味、history persistence、sensitive value policyを引き続き所有します
 
-`SelectableText`はimmutableなstyled contentへgrapheme境界に揃えたcontrolled keyboard selectionを加えます。Copy actionはApplication Messageを発行し、clipboard I/O、pointer selection、redaction policyはApplicationの責務として維持します
+`SelectableText`はimmutableなstyled contentへgrapheme境界に揃えたcontrolled keyboard selectionを加えます。Copy actionはApplication Messageを発行します。Applicationは`Effect::set_clipboard`を返すことができ、`TerminalClipboard::Osc52`はwrite-only terminal backendを明示的に有効化します。Pointer selection、redaction policy、terminal support検出、OS固有clipboard commandはWidgetの外側に維持します
 
 `Disclosure`はexpanded stateをApplicationに維持し、expanded時だけbodyを構築します。Core Modal scopeはdefaultでentry時に最初のdescendantへfocusし、close時に以前のfocusへ戻り、両方のtargetを設定できます。Modalがunhandled raw Eventとterminal fallback mappingも止める必要がある場合は`Node::block_unhandled_events`でopt-inのhard input boundaryを追加します
 

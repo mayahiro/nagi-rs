@@ -75,8 +75,8 @@ nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
 `nagi-tui-test` drives messages, terminal input, resize, virtual time, Effects,
-Subscriptions, Runtime notices, frame inspection, and active resolved action
-queries without a real terminal
+Subscriptions, pending clipboard requests, Runtime notices, frame inspection,
+and active resolved action queries without a real terminal
 
 `nagi-cli-test` injects argv and process services, then captures output and Exit
 Status without starting a process or installing a signal handler
@@ -149,8 +149,11 @@ retain ownership of message meaning, history persistence, and sensitive-value
 policy
 
 `SelectableText` adds controlled grapheme-aligned keyboard selection over
-immutable styled content. Copy actions emit application messages; clipboard
-I/O, pointer selection, and redaction policy remain application concerns
+immutable styled content. Copy actions emit application messages. Applications
+may return `Effect::set_clipboard`, and `TerminalClipboard::Osc52` provides an
+explicit write-only terminal backend. Pointer selection, redaction policy,
+terminal support detection, and OS-specific clipboard commands remain outside
+the widget
 
 `Disclosure` keeps expanded state in the application and constructs its body
 only while expanded. Core Modal scopes focus their first descendant on entry

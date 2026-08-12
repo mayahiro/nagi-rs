@@ -13,7 +13,7 @@ use crate::action_routing::{
     validate_action_owners,
 };
 use crate::core_action::{CoreAction, default_focus_action};
-use crate::effect::RuntimeCommand;
+use crate::effect::{ClipboardRequest, RuntimeCommand};
 use crate::renderer::operations;
 use crate::routing::{FocusChange, InteractiveKind, PointerChange, TreeIndex};
 use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeDiagnostics, RuntimeNoticeQueue};
@@ -256,6 +256,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     exit_requested: bool,
     pending_focus: Option<NodeId>,
     pending_scroll: Vec<(NodeId, ScrollOffset)>,
+    pending_clipboard: Option<ClipboardRequest>,
 }
 
 struct QueuedMessage<Message> {
@@ -339,6 +340,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             exit_requested: false,
             pending_focus: None,
             pending_scroll: Vec::new(),
+            pending_clipboard: None,
         };
         runtime.apply_effect_commands();
         Ok(runtime)
@@ -374,6 +376,17 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     #[must_use]
     pub const fn size(&self) -> Size {
         self.size
+    }
+
+    /// Returns the latest clipboard request without clearing it
+    #[must_use]
+    pub const fn pending_clipboard_request(&self) -> Option<&ClipboardRequest> {
+        self.pending_clipboard.as_ref()
+    }
+
+    /// Takes and clears the latest pending clipboard request
+    pub fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
+        self.pending_clipboard.take()
     }
 
     /// Changes terminal size and schedules a frame when it differs
@@ -618,6 +631,10 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 RuntimeCommand::Focus(id) => self.pending_focus = Some(id),
                 RuntimeCommand::ScrollTo { id, offset } => {
                     self.pending_scroll.push((id, offset));
+                }
+                RuntimeCommand::SetClipboard(request) => {
+                    self.pending_clipboard = Some(request);
+                    continue;
                 }
             }
             self.dirty = true;

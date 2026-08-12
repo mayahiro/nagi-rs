@@ -122,8 +122,9 @@ impl App for Gallery {
                     TextCopyKind::Selection => "selection",
                     TextCopyKind::Document => "document",
                 };
-                self.last_action =
-                    format!("Copied {kind}: {}", request.text().replace('\n', " / "));
+                let copied = request.text().to_owned();
+                self.last_action = format!("Copied {kind}: {}", copied.replace('\n', " / "));
+                return Effect::set_clipboard(copied);
             }
             Message::QueryChanged(query) => self.query = query,
             Message::SelectCommand(index) => self.command = index,
@@ -374,6 +375,7 @@ impl Gallery {
 fn main() -> Result<(), nagi_tui::RunError> {
     let options = TerminalOptions {
         mouse_tracking: Some(MouseTracking::Press),
+        clipboard: nagi_tui::TerminalClipboard::Osc52,
         focus_first: true,
         ..TerminalOptions::default()
     };

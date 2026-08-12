@@ -47,7 +47,7 @@ pub use content_projection::{
     DEFAULT_CONTENT_PROJECTION_MAX_SPANS, DEFAULT_CONTENT_PROJECTION_MAX_VISUAL_BYTES,
     MAX_CONTENT_PROJECTION_DEPTH, project_content, project_content_with_states,
 };
-pub use effect::{CancelToken, Effect, ScopeId, Task, TaskKey};
+pub use effect::{CancelToken, ClipboardRequest, Effect, ScopeId, Task, TaskKey};
 pub use identity::NodeId;
 pub use input::{EventAction, TimedInputDecoder};
 pub use interaction::{InteractionState, ScrollAxis, ScrollOffset, ScrollState, TextInputState};
@@ -99,7 +99,9 @@ pub use subscription::{
 };
 pub use subscription_supervisor::SubscriptionDiagnostics;
 pub use supervisor::EffectDiagnostics;
-pub use terminal::{RunError, TerminalOptions, run_terminal, run_terminal_with_notice_handler};
+pub use terminal::{
+    RunError, TerminalClipboard, TerminalOptions, run_terminal, run_terminal_with_notice_handler,
+};
 pub use virtual_flow::{
     DuplicateVirtualFlowItemKey, VirtualFlowAnchor, VirtualFlowAnchorAffinity, VirtualFlowItem,
     VirtualFlowItemContext, VirtualFlowItems, VirtualFlowOptions, VirtualFlowSource,

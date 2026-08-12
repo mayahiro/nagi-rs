@@ -242,6 +242,11 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
                     .push_back(RuntimeCommand::ScrollTo { id, offset });
                 self.complete(continuation, now);
             }
+            EffectKind::SetClipboard(request) => {
+                self.commands
+                    .push_back(RuntimeCommand::SetClipboard(request));
+                self.complete(continuation, now);
+            }
             EffectKind::Run(task) => {
                 self.start_task(task, scopes, continuation, None, now);
             }

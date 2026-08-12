@@ -228,6 +228,8 @@ fn fixture_operations(value: &str) -> Vec<TerminalOp> {
                 ["disable-mouse"] => TerminalOp::DisableMouse,
                 ["enable-focus"] => TerminalOp::EnableFocus,
                 ["disable-focus"] => TerminalOp::DisableFocus,
+                ["set-clipboard", "-"] => TerminalOp::SetClipboard(String::new()),
+                ["set-clipboard", text] => TerminalOp::SetClipboard(fixture_scalar_text(text)),
                 ["begin-sync"] => TerminalOp::BeginSynchronizedUpdate,
                 ["end-sync"] => TerminalOp::EndSynchronizedUpdate,
                 _ => panic!("invalid terminal operation {operation}"),

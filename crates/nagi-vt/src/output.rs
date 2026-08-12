@@ -171,6 +171,8 @@ pub enum TerminalOp {
     EnableFocus,
     /// Disable terminal focus reports
     DisableFocus,
+    /// Set the standard terminal clipboard through write-only OSC 52
+    SetClipboard(String),
     /// Begin a synchronized update when supported
     BeginSynchronizedUpdate,
     /// End a synchronized update when supported
@@ -249,6 +251,7 @@ fn encode_operation(output: &mut Vec<u8>, operation: &TerminalOp, capabilities: 
         }
         TerminalOp::EnableFocus => output.extend_from_slice(b"\x1B[?1004h"),
         TerminalOp::DisableFocus => output.extend_from_slice(b"\x1B[?1004l"),
+        TerminalOp::SetClipboard(text) => write_clipboard(output, text),
         TerminalOp::BeginSynchronizedUpdate if capabilities.synchronized_updates => {
             output.extend_from_slice(b"\x1B[?2026h");
         }
@@ -256,6 +259,38 @@ fn encode_operation(output: &mut Vec<u8>, operation: &TerminalOp, capabilities: 
             output.extend_from_slice(b"\x1B[?2026l");
         }
         TerminalOp::BeginSynchronizedUpdate | TerminalOp::EndSynchronizedUpdate => {}
+    }
+}
+
+fn write_clipboard(output: &mut Vec<u8>, text: &str) {
+    output.extend_from_slice(b"\x1B]52;c;");
+    write_base64(output, text.as_bytes());
+    output.extend_from_slice(b"\x1B\\");
+}
+
+fn write_base64(output: &mut Vec<u8>, input: &[u8]) {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut chunks = input.chunks_exact(3);
+    for chunk in &mut chunks {
+        output.push(ALPHABET[usize::from(chunk[0] >> 2)]);
+        output.push(ALPHABET[usize::from((chunk[0] & 0x03) << 4 | chunk[1] >> 4)]);
+        output.push(ALPHABET[usize::from((chunk[1] & 0x0F) << 2 | chunk[2] >> 6)]);
+        output.push(ALPHABET[usize::from(chunk[2] & 0x3F)]);
+    }
+    match chunks.remainder() {
+        [first] => {
+            output.push(ALPHABET[usize::from(first >> 2)]);
+            output.push(ALPHABET[usize::from((first & 0x03) << 4)]);
+            output.extend_from_slice(b"==");
+        }
+        [first, second] => {
+            output.push(ALPHABET[usize::from(first >> 2)]);
+            output.push(ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)]);
+            output.push(ALPHABET[usize::from((second & 0x0F) << 2)]);
+            output.push(b'=');
+        }
+        [] => {}
+        _ => unreachable!("chunks_exact remainder is shorter than three bytes"),
     }
 }
 
@@ -439,5 +474,16 @@ mod tests {
             Capabilities::BASELINE,
         );
         assert_eq!(output, b"prefix:\x1B[4;3Hok");
+    }
+
+    #[test]
+    fn clipboard_uses_base64_without_exposing_raw_controls() {
+        assert_eq!(
+            encode(
+                &[TerminalOp::SetClipboard("a\x1B日".to_owned())],
+                Capabilities::BASELINE,
+            ),
+            b"\x1B]52;c;YRvml6U=\x1B\\"
+        );
     }
 }

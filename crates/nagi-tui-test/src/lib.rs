@@ -5,10 +5,10 @@ use std::fmt;
 use std::time::Duration;
 
 use nagi_tui::{
-    App, EffectDiagnostics, Event, EventAction, Frame, InteractionState, NodeId, QueueFull,
-    ResolvedActions, Runtime, RuntimeConfig, RuntimeError, RuntimeEventError, RuntimeNotice,
-    RuntimeNoticeDiagnostics, ScrollOffset, ScrollState, Size, SubscriptionDiagnostics,
-    SubscriptionKey, TaskKey, TimedInputDecoder, VirtualClock,
+    App, ClipboardRequest, EffectDiagnostics, Event, EventAction, Frame, InteractionState, NodeId,
+    QueueFull, ResolvedActions, Runtime, RuntimeConfig, RuntimeError, RuntimeEventError,
+    RuntimeNotice, RuntimeNoticeDiagnostics, ScrollOffset, ScrollState, Size,
+    SubscriptionDiagnostics, SubscriptionKey, TaskKey, TimedInputDecoder, VirtualClock,
 };
 
 mod manual_subscription;
@@ -138,6 +138,17 @@ where
     #[must_use]
     pub const fn interaction(&self) -> &InteractionState {
         self.runtime.interaction()
+    }
+
+    /// Returns the latest pending clipboard request without clearing it
+    #[must_use]
+    pub fn pending_clipboard_request(&self) -> Option<&ClipboardRequest> {
+        self.runtime.pending_clipboard_request()
+    }
+
+    /// Takes and clears the latest pending clipboard request
+    pub fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
+        self.runtime.take_clipboard_request()
     }
 
     /// Requests focus for a focusable ID in the current semantic tree
@@ -413,6 +424,45 @@ mod tests {
         assert_eq!(harness.frames().len(), 2);
         assert_eq!(harness.message_history().len(), 2);
         assert!(harness.exit_requested());
+    }
+
+    #[derive(Clone)]
+    struct ClipboardMessage(&'static str);
+
+    struct ClipboardApp;
+
+    impl App for ClipboardApp {
+        type Message = ClipboardMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            Effect::set_clipboard(message.0).without_redraw()
+        }
+
+        fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+            Node::text("clipboard")
+        }
+    }
+
+    #[test]
+    fn pending_clipboard_requests_are_observable_and_takeable() {
+        let mut harness =
+            Harness::new(ClipboardApp, Size::new(12, 1), |_| EventAction::Ignore).unwrap();
+
+        harness.send(ClipboardMessage("copy")).unwrap();
+
+        assert_eq!(
+            harness
+                .pending_clipboard_request()
+                .map(ClipboardRequest::text),
+            Some("copy")
+        );
+        assert_eq!(
+            harness
+                .take_clipboard_request()
+                .map(ClipboardRequest::into_text),
+            Some("copy".to_owned())
+        );
+        assert!(harness.take_clipboard_request().is_none());
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq)]

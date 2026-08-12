@@ -25,3 +25,7 @@ harness = false
 [[bench]]
 name = "content_projection"
 harness = false
+
+[[bench]]
+name = "clipboard"
+harness = false
