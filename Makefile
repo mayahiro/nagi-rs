@@ -9,6 +9,7 @@ bench:
 	cargo bench -p nagi-tui-widgets --bench json_inspector
 	cargo bench -p nagi-tui-widgets --bench code_view
 	cargo bench -p nagi-tui-widgets --bench diff_view
+	cargo bench -p nagi-tui-widgets --bench split_pane_drawer
 	cargo bench -p nagi-cli --bench inherited_options
 	cargo bench -p nagi-cli --bench completion
 	cargo bench -p nagi-cli-prompt --bench prompt

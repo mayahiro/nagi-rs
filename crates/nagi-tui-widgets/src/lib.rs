@@ -16,6 +16,7 @@ mod dialog;
 mod diff;
 mod diff_view;
 mod disclosure;
+mod drawer;
 mod event;
 mod file_picker;
 mod help;
@@ -32,6 +33,7 @@ mod select;
 mod selectable_text;
 mod sparkline;
 mod spinner;
+mod split_pane;
 mod suggestion_popup;
 mod table;
 mod tabs;
@@ -48,10 +50,11 @@ pub use action::{
     ACTIVATE_ACTION_ID, COLLAPSE_ACTION_ID, COMPOSER_SUBMIT_ACTION_ID, CONFIRM_ACTION_ID,
     DISMISS_ACTION_ID, EXPAND_ACTION_ID, HISTORY_NEXT_ACTION_ID, HISTORY_PREVIOUS_ACTION_ID,
     HORIZONTAL_SCROLL_NEXT_ACTION_ID, HORIZONTAL_SCROLL_PREVIOUS_ACTION_ID,
-    INSPECTOR_COPY_ACTION_ID, NAVIGATION_BACK_ACTION_ID, SELECTION_EXTEND_FIRST_ACTION_ID,
-    SELECTION_EXTEND_LAST_ACTION_ID, SELECTION_EXTEND_NEXT_ACTION_ID,
-    SELECTION_EXTEND_PREVIOUS_ACTION_ID, SELECTION_FIRST_ACTION_ID,
-    SELECTION_FIRST_DAY_OF_MONTH_ACTION_ID, SELECTION_LAST_ACTION_ID,
+    INSPECTOR_COPY_ACTION_ID, NAVIGATION_BACK_ACTION_ID, PANE_FOCUS_NEXT_ACTION_ID,
+    PANE_FOCUS_PREVIOUS_ACTION_ID, PANE_RESIZE_NEXT_ACTION_ID, PANE_RESIZE_PREVIOUS_ACTION_ID,
+    SELECTION_EXTEND_FIRST_ACTION_ID, SELECTION_EXTEND_LAST_ACTION_ID,
+    SELECTION_EXTEND_NEXT_ACTION_ID, SELECTION_EXTEND_PREVIOUS_ACTION_ID,
+    SELECTION_FIRST_ACTION_ID, SELECTION_FIRST_DAY_OF_MONTH_ACTION_ID, SELECTION_LAST_ACTION_ID,
     SELECTION_LAST_DAY_OF_MONTH_ACTION_ID, SELECTION_NEXT_ACTION_ID, SELECTION_NEXT_DAY_ACTION_ID,
     SELECTION_NEXT_MONTH_ACTION_ID, SELECTION_NEXT_PAGE_ACTION_ID, SELECTION_NEXT_WEEK_ACTION_ID,
     SELECTION_PREVIOUS_ACTION_ID, SELECTION_PREVIOUS_DAY_ACTION_ID,
@@ -85,6 +88,7 @@ pub use diff::{
 };
 pub use diff_view::{DiffCopyKind, DiffCopyRequest, DiffView, DiffViewState, DiffViewStyle};
 pub use disclosure::{Disclosure, DisclosureStyle};
+pub use drawer::{Drawer, DrawerSide, DrawerStyle};
 pub use file_picker::{FilePicker, FilePickerEntry, FilePickerStyle};
 pub use help::{Help, HelpBinding, HelpMode, HelpStyle};
 pub use json::{
@@ -111,6 +115,7 @@ pub use selectable_text::{
 };
 pub use sparkline::Sparkline;
 pub use spinner::{SPINNER_FRAMES, Spinner, SpinnerStyle};
+pub use split_pane::{SPLIT_PANE_RATIO_SCALE, SplitPane, SplitPaneState, SplitPaneStyle};
 pub use suggestion_popup::{
     DuplicateSuggestionId, SuggestionId, SuggestionItems, SuggestionPopup, SuggestionPopupStatus,
     SuggestionPopupStyle, SuggestionRowContext,

@@ -24,6 +24,7 @@ mod rich_text;
 mod routing;
 mod runtime;
 mod runtime_notice;
+mod split_pane;
 mod subscription;
 mod subscription_supervisor;
 mod supervisor;
@@ -95,6 +96,7 @@ pub use runtime::{
     DEFAULT_TASK_LIMIT, Frame, QueueFull, Runtime, RuntimeConfig, RuntimeError, RuntimeEventError,
 };
 pub use runtime_notice::{RuntimeNotice, RuntimeNoticeDiagnostics, RuntimeNoticeKind};
+pub use split_pane::{SplitPaneAxis, SplitPaneCollapse, SplitPaneOptions};
 pub use subscription::{
     DeliveryPolicy, Subscription, SubscriptionClosed, SubscriptionKey, SubscriptionSink,
 };

@@ -135,6 +135,10 @@ Copy actionはApplication Messageを発行します。Applicationは`Effect::set
 
 `DiffView`はimmutableなtyped metadata、hunk、context、addition、deletion lineを受け取ります。上限付きCode projectionを再利用しながらold／new line number、unified marker、semantic style、要求時のunified copyを追加します。Diff parse、repository access、patch apply、approval policy、clipboard I/OはApplicationが所有します
 
+Core `Node::split_pane`はhorizontalまたはverticalな二paneを1 Cellのdivider、paneごとのminimum、basis-point ratio、決定的なcollapse targetで割り当てます。省略されたpaneはrender、semantic routing、focus、lazy virtual preparationの対象外です。`SplitPane`はpaneの意味を定義せず、controlledなF6 focus移動、axisに対応するkeyboard resize、divider dragを追加します
+
+`Drawer`はcontrolledなopen stateがtrueの間だけbodyを構築してviewport edgeへ配置し、defaultではCore Modalのfocusとroutingを再利用します。Open stateの永続化、outside-click挙動、drawer contentの意味はApplicationが所有します
+
 `Disclosure`はexpanded stateをApplicationに維持し、expanded時だけbodyを構築します。Core Modal scopeはdefaultでentry時に最初のdescendantへfocusし、close時に以前のfocusへ戻り、両方のtargetを設定できます。Modalがunhandled raw Eventとterminal fallback mappingも止める必要がある場合は`Node::block_unhandled_events`でopt-inのhard input boundaryを追加します
 
 `Dialog`はapplication-defined action list、lazy controlled details、明示的なdefaultとcancel target、focus policy、Cell幅によるaction wrappingを構成します。`ConfirmDialog`はdefaultを明示する二action convenienceです

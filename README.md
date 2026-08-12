@@ -183,6 +183,18 @@ line numbers, unified markers, semantic styles, and on-demand unified copy.
 Diff parsing, repository access, patch application, approval policy, and
 clipboard I/O remain application-owned
 
+Core `Node::split_pane` allocates two horizontal or vertical panes with a
+one-Cell divider, per-pane minima, a basis-point ratio, and a deterministic
+collapse target. Omitted panes are absent from rendering, semantic routing,
+focus, and lazy virtual preparation. `SplitPane` adds controlled F6 focus
+movement, axis-aware keyboard resizing, and divider dragging without assigning
+pane meaning
+
+`Drawer` constructs its body only while its controlled open state is true,
+places it at a viewport edge, and reuses Core Modal focus and routing by
+default. Applications own open-state persistence, outside-click behavior, and
+the meaning of drawer content
+
 `Disclosure` keeps expanded state in the application and constructs its body
 only while expanded. Core Modal scopes focus their first descendant on entry
 and return to previous focus on close by default; both targets are configurable.

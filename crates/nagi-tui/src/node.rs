@@ -14,10 +14,12 @@ use crate::layout::{Track, add_size, allocate_into, horizontal_rect, inset, vert
 use crate::panel::{BorderGlyphs, content_insets as panel_content_insets, glyphs as border_glyphs};
 use crate::rich_text::ParagraphLayoutCache;
 use crate::routing::{EventHandler, InteractiveKind, NodeRecord, PointerEventHandler, TreeIndex};
+use crate::split_pane::resolve_split_pane_layout;
 use crate::{
     Action, BorderKind, Event, EventResult, InteractionState, KeyScope, Length, NodeId,
     PanelOptions, ParagraphOptions, PointerEventContext, Rect, ScrollAxis, ScrollOffset,
-    ScrollState, Size, TextSpan, VirtualFlowOptions, VirtualFlowSource, WrapMode,
+    ScrollState, Size, SplitPaneCollapse, SplitPaneOptions, TextSpan, VirtualFlowOptions,
+    VirtualFlowSource, WrapMode,
 };
 
 /// Padding widths around a node
@@ -242,6 +244,11 @@ enum NodeKind<Message> {
     },
     Row(LinearNode<Message>),
     Column(LinearNode<Message>),
+    SplitPane {
+        primary: Box<Node<Message>>,
+        secondary: Box<Node<Message>>,
+        options: SplitPaneOptions,
+    },
     Stack(Vec<Node<Message>>),
     AnchoredOverlay {
         base: Box<Node<Message>>,
@@ -446,6 +453,21 @@ impl<Message> Node<Message> {
     #[must_use]
     pub fn column(children: impl IntoIterator<Item = Self>) -> Self {
         Self::new(NodeKind::Column(LinearNode::new(children)))
+    }
+
+    /// Creates a responsive two-pane container with a one-Cell divider
+    ///
+    /// Both supplied Nodes are eager, but only panes present in the resolved
+    /// layout participate in preparation, semantic indexing, hit testing, and
+    /// rendering. The configured collapse pane is omitted when the assigned
+    /// main-axis extent cannot satisfy both normalized minima plus the divider
+    #[must_use]
+    pub fn split_pane(primary: Self, secondary: Self, options: SplitPaneOptions) -> Self {
+        Self::new(NodeKind::SplitPane {
+            primary: Box::new(primary),
+            secondary: Box::new(secondary),
+            options,
+        })
     }
 
     /// Creates a front-to-back overlay container
@@ -912,6 +934,11 @@ impl<Message> Node<Message> {
             NodeKind::Column(linear) => {
                 measure_linear(&linear.children, constraints, false, profile)
             }
+            NodeKind::SplitPane {
+                primary,
+                secondary,
+                options,
+            } => measure_split_pane(primary, secondary, constraints, *options, profile),
             NodeKind::Stack(children) => children.iter().fold(Size::default(), |size, child| {
                 let child = child.measure(constraints, profile);
                 Size::new(size.width.max(child.width), size.height.max(child.height))
@@ -993,6 +1020,20 @@ impl<Message> Node<Message> {
             NodeKind::Column(linear) => {
                 render_linear(surface, rect, clip, linear, false, interaction, profile)
             }
+            NodeKind::SplitPane {
+                primary,
+                secondary,
+                options,
+            } => render_split_pane(
+                surface,
+                rect,
+                clip,
+                primary,
+                secondary,
+                *options,
+                interaction,
+                profile,
+            ),
             NodeKind::Stack(children) => {
                 for child in children {
                     child.render(surface, rect, clip, interaction, profile);
@@ -1274,6 +1315,11 @@ impl<Message> Node<Message> {
                 .children
                 .iter()
                 .find_map(|child| child.visit(id, operation)),
+            NodeKind::SplitPane {
+                primary, secondary, ..
+            } => primary
+                .visit(id, operation)
+                .or_else(|| secondary.visit(id, operation)),
             NodeKind::Stack(children) => {
                 children.iter().find_map(|child| child.visit(id, operation))
             }
@@ -1334,6 +1380,31 @@ impl<Message> Node<Message> {
                 .find_map(|(child, child_rect)| {
                     child.find_node_geometry(id, child_rect, clip, interaction, profile)
                 }),
+            NodeKind::SplitPane {
+                primary,
+                secondary,
+                options,
+            } => {
+                let layout = resolve_split_pane_layout(rect, *options);
+                let primary_result = (layout.collapsed != Some(SplitPaneCollapse::Primary))
+                    .then(|| {
+                        primary.find_node_geometry(id, layout.primary, clip, interaction, profile)
+                    })
+                    .flatten();
+                primary_result.or_else(|| {
+                    (layout.collapsed != Some(SplitPaneCollapse::Secondary))
+                        .then(|| {
+                            secondary.find_node_geometry(
+                                id,
+                                layout.secondary,
+                                clip,
+                                interaction,
+                                profile,
+                            )
+                        })
+                        .flatten()
+                })
+            }
             NodeKind::Stack(children) => children
                 .iter()
                 .find_map(|child| child.find_node_geometry(id, rect, clip, interaction, profile)),
@@ -1566,6 +1637,39 @@ impl<Message> Node<Message> {
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
                     child.build_index(
                         child_rect,
+                        clip,
+                        parent,
+                        false,
+                        focus_fallback,
+                        interaction,
+                        index,
+                        actions,
+                        profile,
+                    )?;
+                }
+            }
+            NodeKind::SplitPane {
+                primary,
+                secondary,
+                options,
+            } => {
+                let layout = resolve_split_pane_layout(rect, *options);
+                if layout.collapsed != Some(SplitPaneCollapse::Primary) {
+                    primary.build_index(
+                        layout.primary,
+                        clip,
+                        parent,
+                        false,
+                        focus_fallback,
+                        interaction,
+                        index,
+                        actions,
+                        profile,
+                    )?;
+                }
+                if layout.collapsed != Some(SplitPaneCollapse::Secondary) {
+                    secondary.build_index(
+                        layout.secondary,
                         clip,
                         parent,
                         false,
@@ -1811,6 +1915,19 @@ impl<Message> Node<Message> {
                     child.prepare_virtual_flows_at(child_rect, interaction, profile);
                 }
             }
+            NodeKind::SplitPane {
+                primary,
+                secondary,
+                options,
+            } => {
+                let layout = resolve_split_pane_layout(rect, *options);
+                if layout.collapsed != Some(SplitPaneCollapse::Primary) {
+                    primary.prepare_virtual_flows_at(layout.primary, interaction, profile);
+                }
+                if layout.collapsed != Some(SplitPaneCollapse::Secondary) {
+                    secondary.prepare_virtual_flows_at(layout.secondary, interaction, profile);
+                }
+            }
             NodeKind::Stack(children) => {
                 for child in children {
                     child.prepare_virtual_flows_at(rect, interaction, profile);
@@ -2024,6 +2141,21 @@ impl<Message> Node<Message> {
                 }
                 changed
             }
+            NodeKind::SplitPane {
+                primary,
+                secondary,
+                options,
+            } => {
+                let layout = resolve_split_pane_layout(rect, *options);
+                let mut changed = false;
+                if layout.collapsed != Some(SplitPaneCollapse::Primary) {
+                    changed |= primary.prepare_at(layout.primary, interaction, profile);
+                }
+                if layout.collapsed != Some(SplitPaneCollapse::Secondary) {
+                    changed |= secondary.prepare_at(layout.secondary, interaction, profile);
+                }
+                changed
+            }
             NodeKind::Stack(children) => {
                 let mut changed = false;
                 for child in children {
@@ -2138,6 +2270,43 @@ fn measure_rich_text(
         .size
 }
 
+fn measure_split_pane<Message>(
+    primary: &Node<Message>,
+    secondary: &Node<Message>,
+    constraints: Constraints,
+    options: SplitPaneOptions,
+    profile: WidthProfile<'static>,
+) -> Size {
+    let child_constraints = match options.axis {
+        crate::SplitPaneAxis::Horizontal => Constraints {
+            width: Limit::Unbounded,
+            height: constraints.height,
+        },
+        crate::SplitPaneAxis::Vertical => Constraints {
+            width: constraints.width,
+            height: Limit::Unbounded,
+        },
+    };
+    let primary = primary.measure(child_constraints, profile);
+    let secondary = secondary.measure(child_constraints, profile);
+    match options.axis {
+        crate::SplitPaneAxis::Horizontal => Size::new(
+            primary
+                .width
+                .saturating_add(1)
+                .saturating_add(secondary.width),
+            primary.height.max(secondary.height),
+        ),
+        crate::SplitPaneAxis::Vertical => Size::new(
+            primary.width.max(secondary.width),
+            primary
+                .height
+                .saturating_add(1)
+                .saturating_add(secondary.height),
+        ),
+    }
+}
+
 fn measure_linear<Message>(
     children: &[Node<Message>],
     constraints: Constraints,
@@ -2176,6 +2345,61 @@ fn measure_linear<Message>(
             )
         }
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_split_pane<Message>(
+    surface: &mut Surface,
+    rect: Rect,
+    clip: Rect,
+    primary: &Node<Message>,
+    secondary: &Node<Message>,
+    options: SplitPaneOptions,
+    interaction: &InteractionState,
+    profile: WidthProfile<'static>,
+) {
+    let layout = resolve_split_pane_layout(rect, options);
+    if layout.collapsed != Some(SplitPaneCollapse::Primary) {
+        primary.render(surface, layout.primary, clip, interaction, profile);
+    }
+    if let Some(divider) = layout.divider {
+        let glyphs = profile_aware_border_glyphs(border_glyphs(BorderKind::Single), profile);
+        match options.axis {
+            crate::SplitPaneAxis::Horizontal => {
+                for y in i64::from(divider.y)
+                    ..i64::from(divider.y).saturating_add(i64::from(divider.height))
+                {
+                    write_border_cell(
+                        surface,
+                        clip,
+                        i64::from(divider.x),
+                        y,
+                        glyphs.vertical,
+                        options.divider_style,
+                        profile,
+                    );
+                }
+            }
+            crate::SplitPaneAxis::Vertical => {
+                for x in i64::from(divider.x)
+                    ..i64::from(divider.x).saturating_add(i64::from(divider.width))
+                {
+                    write_border_cell(
+                        surface,
+                        clip,
+                        x,
+                        i64::from(divider.y),
+                        glyphs.horizontal,
+                        options.divider_style,
+                        profile,
+                    );
+                }
+            }
+        }
+    }
+    if layout.collapsed != Some(SplitPaneCollapse::Secondary) {
+        secondary.render(surface, layout.secondary, clip, interaction, profile);
+    }
 }
 
 fn shrink_constraints(constraints: Constraints, insets: Insets) -> Constraints {

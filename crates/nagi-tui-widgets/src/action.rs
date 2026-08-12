@@ -102,6 +102,18 @@ pub const SUGGESTION_DISMISS_ACTION_ID: &str = "nagi.suggestion.dismiss";
 /// Stable Action ID for copying the selected inspector value
 pub const INSPECTOR_COPY_ACTION_ID: &str = "nagi.inspector.copy";
 
+/// Stable Action ID for moving focus to the previous pane
+pub const PANE_FOCUS_PREVIOUS_ACTION_ID: &str = "nagi.pane.focus-previous";
+
+/// Stable Action ID for moving focus to the next pane
+pub const PANE_FOCUS_NEXT_ACTION_ID: &str = "nagi.pane.focus-next";
+
+/// Stable Action ID for moving a split divider toward its main-axis start
+pub const PANE_RESIZE_PREVIOUS_ACTION_ID: &str = "nagi.pane.resize-previous";
+
+/// Stable Action ID for moving a split divider toward its main-axis end
+pub const PANE_RESIZE_NEXT_ACTION_ID: &str = "nagi.pane.resize-next";
+
 pub(crate) const ACTIVATE_ACTION_LABEL: &str = "Activate";
 pub(crate) const SELECTION_PREVIOUS_ACTION_LABEL: &str = "Previous";
 pub(crate) const SELECTION_NEXT_ACTION_LABEL: &str = "Next";
