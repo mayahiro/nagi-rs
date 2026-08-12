@@ -51,7 +51,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-vt` | Typed terminal input/output, Color, Attributes, and Style |
 | `nagi-surface` | Geometry, Cells, Surface drawing, composition, diffing, and snapshots |
 | `nagi-tui` | Terminal Presentation Rules, bounded Content-to-Node projection, App lifecycle, semantic nodes, scoped key maps, layout, events, Effects, Subscriptions, and terminal loop |
-| `nagi-tui-widgets` | 27 standard widgets built from the public TUI API |
+| `nagi-tui-widgets` | 29 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
 | `nagi-cli` | Local and inherited options, command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, handler-free completion resolution, staged Runtime Policy, and process integration |
 | `nagi-cli-completion` | Bash, Zsh, Fish, and PowerShell generators plus the reserved completion protocol |
@@ -102,6 +102,7 @@ Run commands from the Rust repository root
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
 | [Suggestion popup](crates/nagi-tui-widgets/examples/suggestion_popup/README.md) | `cargo run -p nagi-tui-widgets --example suggestion_popup` |
+| [JSON inspector](crates/nagi-tui-widgets/examples/json_inspector/README.md) | `cargo run -p nagi-tui-widgets --example json_inspector` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
 | [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
@@ -163,6 +164,11 @@ Applications may return `Effect::set_clipboard`, and
 `TerminalClipboard::Osc52` provides an explicit write-only terminal backend.
 Redaction policy, terminal support detection, and OS-specific clipboard
 commands remain outside the widget
+
+`JsonInspector` projects an immutable typed `JsonDocument` into a controlled
+tree with bounded row construction and grapheme-safe scalar previews. Copy
+requests retain the complete compact value. Parsing, schema validation,
+redaction, clipboard policy, and domain meaning remain application-owned
 
 `Disclosure` keeps expanded state in the application and constructs its body
 only while expanded. Core Modal scopes focus their first descendant on entry

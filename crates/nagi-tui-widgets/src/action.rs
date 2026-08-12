@@ -81,6 +81,9 @@ pub const SUGGESTION_ACCEPT_ACTION_ID: &str = "nagi.suggestion.accept";
 /// Stable Action ID for dismissing an open suggestion popup
 pub const SUGGESTION_DISMISS_ACTION_ID: &str = "nagi.suggestion.dismiss";
 
+/// Stable Action ID for copying the selected inspector value
+pub const INSPECTOR_COPY_ACTION_ID: &str = "nagi.inspector.copy";
+
 pub(crate) const ACTIVATE_ACTION_LABEL: &str = "Activate";
 pub(crate) const SELECTION_PREVIOUS_ACTION_LABEL: &str = "Previous";
 pub(crate) const SELECTION_NEXT_ACTION_LABEL: &str = "Next";

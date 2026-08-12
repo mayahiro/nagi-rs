@@ -49,7 +49,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-vt` | Typed terminal input／output、Color、Attributes、Style |
 | `nagi-surface` | Geometry、Cell、Surface描画、composition、diff、snapshot |
 | `nagi-tui` | Terminal Presentation Rules、上限付きContentからNodeへのprojection、App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
-| `nagi-tui-widgets` | Public TUI APIから構築した27個の標準Widget |
+| `nagi-tui-widgets` | Public TUI APIから構築した29個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
 | `nagi-cli` | Localと継承Option、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、handlerを含まないcompletion解決、段階実行Runtime Policy、process統合 |
 | `nagi-cli-completion` | Bash、Zsh、Fish、PowerShell generatorと予約済みcompletion protocol |
@@ -90,6 +90,7 @@ Rust repository rootから実行します
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
 | [Suggestion popup](crates/nagi-tui-widgets/examples/suggestion_popup/README.md) | `cargo run -p nagi-tui-widgets --example suggestion_popup` |
+| [JSON inspector](crates/nagi-tui-widgets/examples/json_inspector/README.md) | `cargo run -p nagi-tui-widgets --example json_inspector` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
 | [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
@@ -125,6 +126,8 @@ TUIのterminal inputとoutputはterminalへ接続されている必要があり�
 Stable IDによるpointer captureはcontrolled view再構築後も継続し、dragは最も近いviewportへ1 Cell単位のedge scrollを要求できます
 
 Copy actionはApplication Messageを発行します。Applicationは`Effect::set_clipboard`を返すことができ、`TerminalClipboard::Osc52`はwrite-only terminal backendを明示的に有効化します。Redaction policy、terminal support検出、OS固有clipboard commandはWidgetの外側に維持します
+
+`JsonInspector`はimmutableなtyped `JsonDocument`をbounded row構築とgrapheme境界を保つscalar previewを持つcontrolled treeへ投影します。Copy requestは完全なcompact valueを保持し、parser、schema validation、redaction、clipboard policy、domain上の意味はApplicationが所有します
 
 `Disclosure`はexpanded stateをApplicationに維持し、expanded時だけbodyを構築します。Core Modal scopeはdefaultでentry時に最初のdescendantへfocusし、close時に以前のfocusへ戻り、両方のtargetを設定できます。Modalがunhandled raw Eventとterminal fallback mappingも止める必要がある場合は`Node::block_unhandled_events`でopt-inのhard input boundaryを追加します
 
