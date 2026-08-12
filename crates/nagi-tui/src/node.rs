@@ -13,11 +13,11 @@ use crate::action_routing::{ActionIndex, NodeKeyInteraction};
 use crate::layout::{Track, add_size, allocate_into, horizontal_rect, inset, vertical_rect};
 use crate::panel::{BorderGlyphs, content_insets as panel_content_insets, glyphs as border_glyphs};
 use crate::rich_text::ParagraphLayoutCache;
-use crate::routing::{EventHandler, InteractiveKind, NodeRecord, TreeIndex};
+use crate::routing::{EventHandler, InteractiveKind, NodeRecord, PointerEventHandler, TreeIndex};
 use crate::{
     Action, BorderKind, Event, EventResult, InteractionState, KeyScope, Length, NodeId,
-    PanelOptions, ParagraphOptions, Rect, ScrollAxis, ScrollOffset, ScrollState, Size, TextSpan,
-    VirtualFlowOptions, VirtualFlowSource, WrapMode,
+    PanelOptions, ParagraphOptions, PointerEventContext, Rect, ScrollAxis, ScrollOffset,
+    ScrollState, Size, TextSpan, VirtualFlowOptions, VirtualFlowSource, WrapMode,
 };
 
 /// Padding widths around a node
@@ -175,6 +175,7 @@ pub struct Node<Message> {
     focusable: bool,
     focused_style: Option<Style>,
     handler: Option<Box<EventHandler<Message>>>,
+    pointer_handler: Option<Box<PointerEventHandler<Message>>>,
     key_interaction: Option<Box<NodeKeyInteraction<Message>>>,
     message: PhantomData<fn() -> Message>,
 }
@@ -636,7 +637,8 @@ impl<Message> Node<Message> {
     }
 
     /// Consumes routed events that remain unhandled after this identified node
-    /// has processed its actions, built-in behavior, and raw handler
+    /// has processed its actions, built-in behavior, pointer handler, and raw
+    /// handler
     ///
     /// The boundary prevents the event from reaching ancestors and
     /// terminal-level fallback mapping. It has no effect until the node has a
@@ -682,6 +684,23 @@ impl<Message> Node<Message> {
     ) -> Self {
         self.id = Some(id.into());
         self.handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Attaches a geometry-aware mouse event handler under a stable identity
+    ///
+    /// The handler receives Node-local coordinates, clipping, Runtime width
+    /// policy, paragraph text hit information, and the nearest ScrollViewport.
+    /// Raw [`Node::on_event`] handling remains independent and runs afterward
+    /// when this handler does not consume the event
+    #[must_use]
+    pub fn on_pointer_event(
+        mut self,
+        id: impl Into<NodeId>,
+        handler: impl Fn(&PointerEventContext) -> EventResult<Message> + 'static,
+    ) -> Self {
+        self.id = Some(id.into());
+        self.pointer_handler = Some(Box::new(handler));
         self
     }
 
@@ -758,6 +777,7 @@ impl<Message> Node<Message> {
             focusable: false,
             focused_style: None,
             handler: None,
+            pointer_handler: None,
             key_interaction: None,
             message: PhantomData,
         }
@@ -1053,6 +1073,34 @@ impl<Message> Node<Message> {
         })
     }
 
+    pub(crate) fn handle_pointer_event(
+        &self,
+        id: &NodeId,
+        context: PointerEventContext,
+    ) -> Option<EventResult<Message>> {
+        let mut context = Some(context);
+        self.visit(id, &mut |node| {
+            let handler = node.pointer_handler.as_ref()?;
+            let mut context = context.take().expect("a NodeId is unique within one view");
+            if let NodeKind::RichText {
+                spans,
+                options,
+                cache,
+            } = &node.kind
+            {
+                let hit = cache.borrow_mut().text_hit(
+                    spans,
+                    context.bounds().width,
+                    *options,
+                    context.width_profile(),
+                    context.local_position(),
+                );
+                context.set_text_hit(Some(hit));
+            }
+            Some(handler(&context))
+        })
+    }
+
     pub(crate) fn text_input_message(&self, id: &NodeId, value: String) -> Option<Message> {
         let mut value = Some(value);
         self.visit(id, &mut |node| {
@@ -1180,7 +1228,7 @@ impl<Message> Node<Message> {
                     rect,
                     clip,
                     focusable: self.focusable,
-                    has_handler: self.handler.is_some(),
+                    has_handler: self.handler.is_some() || self.pointer_handler.is_some(),
                     blocks_unhandled_events: self.blocks_unhandled_events,
                     kind,
                 },

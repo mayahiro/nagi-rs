@@ -148,12 +148,14 @@ optional validation content, and insertion limits over `TextArea`. Applications
 retain ownership of message meaning, history persistence, and sensitive-value
 policy
 
-`SelectableText` adds controlled grapheme-aligned keyboard selection over
-immutable styled content. Copy actions emit application messages. Applications
-may return `Effect::set_clipboard`, and `TerminalClipboard::Osc52` provides an
-explicit write-only terminal backend. Pointer selection, redaction policy,
-terminal support detection, and OS-specific clipboard commands remain outside
-the widget
+`SelectableText` adds controlled grapheme-aligned keyboard and left-button
+drag selection over immutable styled content. Stable-ID pointer capture
+survives controlled view rebuilds, and a drag can request one-Cell edge
+scrolling from its nearest viewport. Copy actions emit application messages.
+Applications may return `Effect::set_clipboard`, and
+`TerminalClipboard::Osc52` provides an explicit write-only terminal backend.
+Redaction policy, terminal support detection, and OS-specific clipboard
+commands remain outside the widget
 
 `Disclosure` keeps expanded state in the application and constructs its body
 only while expanded. Core Modal scopes focus their first descendant on entry

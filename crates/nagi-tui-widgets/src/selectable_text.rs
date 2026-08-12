@@ -4,16 +4,16 @@ use std::sync::{Arc, LazyLock};
 use nagi_text::graphemes;
 use nagi_tui::{
     Action, ActionAvailability, ActionDescriptor, EventResult, KeyBinding, KeyCode, KeyStroke,
-    Modifiers, Node, NodeId, ParagraphOptions, RepeatPolicy, Style, TEXT_COPY_DOCUMENT_ACTION_ID,
-    TEXT_COPY_SELECTION_ACTION_ID, TEXT_CURSOR_DOCUMENT_END_ACTION_ID,
-    TEXT_CURSOR_DOCUMENT_START_ACTION_ID, TEXT_CURSOR_LEFT_ACTION_ID,
-    TEXT_CURSOR_LINE_END_ACTION_ID, TEXT_CURSOR_LINE_START_ACTION_ID, TEXT_CURSOR_RIGHT_ACTION_ID,
-    TEXT_CURSOR_WORD_LEFT_ACTION_ID, TEXT_CURSOR_WORD_RIGHT_ACTION_ID, TEXT_SELECT_ALL_ACTION_ID,
-    TEXT_SELECTION_EXTEND_DOCUMENT_END_ACTION_ID, TEXT_SELECTION_EXTEND_DOCUMENT_START_ACTION_ID,
-    TEXT_SELECTION_EXTEND_LEFT_ACTION_ID, TEXT_SELECTION_EXTEND_LINE_END_ACTION_ID,
-    TEXT_SELECTION_EXTEND_LINE_START_ACTION_ID, TEXT_SELECTION_EXTEND_RIGHT_ACTION_ID,
-    TEXT_SELECTION_EXTEND_WORD_LEFT_ACTION_ID, TEXT_SELECTION_EXTEND_WORD_RIGHT_ACTION_ID,
-    TextSpan,
+    Modifiers, MouseButton, MouseKind, Node, NodeId, ParagraphOptions, PointerEventContext,
+    RepeatPolicy, Style, TEXT_COPY_DOCUMENT_ACTION_ID, TEXT_COPY_SELECTION_ACTION_ID,
+    TEXT_CURSOR_DOCUMENT_END_ACTION_ID, TEXT_CURSOR_DOCUMENT_START_ACTION_ID,
+    TEXT_CURSOR_LEFT_ACTION_ID, TEXT_CURSOR_LINE_END_ACTION_ID, TEXT_CURSOR_LINE_START_ACTION_ID,
+    TEXT_CURSOR_RIGHT_ACTION_ID, TEXT_CURSOR_WORD_LEFT_ACTION_ID, TEXT_CURSOR_WORD_RIGHT_ACTION_ID,
+    TEXT_SELECT_ALL_ACTION_ID, TEXT_SELECTION_EXTEND_DOCUMENT_END_ACTION_ID,
+    TEXT_SELECTION_EXTEND_DOCUMENT_START_ACTION_ID, TEXT_SELECTION_EXTEND_LEFT_ACTION_ID,
+    TEXT_SELECTION_EXTEND_LINE_END_ACTION_ID, TEXT_SELECTION_EXTEND_LINE_START_ACTION_ID,
+    TEXT_SELECTION_EXTEND_RIGHT_ACTION_ID, TEXT_SELECTION_EXTEND_WORD_LEFT_ACTION_ID,
+    TEXT_SELECTION_EXTEND_WORD_RIGHT_ACTION_ID, TextSpan,
 };
 
 /// Immutable semantic text and styled runs displayed by [`SelectableText`]
@@ -247,10 +247,11 @@ impl Default for SelectableTextStyle {
     }
 }
 
-/// Controlled keyboard selection and copy actions over one styled text document
+/// Controlled keyboard and pointer selection over one styled text document
 ///
 /// Copy requests are emitted as application messages. This widget does not
-/// access an OS or terminal clipboard and does not perform pointer selection
+/// access an OS or terminal clipboard. Left-button dragging requires the
+/// terminal driver to enable button-motion mouse tracking
 pub struct SelectableText<Message> {
     id: NodeId,
     content: SelectableTextContent,
@@ -355,16 +356,21 @@ impl<Message: 'static> SelectableText<Message> {
             on_change: self.on_change,
             on_copy: self.on_copy,
         });
+        let action_context = Arc::clone(&context);
         let actions = descriptors.into_iter().zip(SELECTABLE_TEXT_ACTIONS).map(
             move |(descriptor, action)| {
-                let context = Arc::clone(&context);
+                let context = Arc::clone(&action_context);
                 Action::new(descriptor, move |_| {
                     selectable_text_action_result(action, context.as_ref())
                 })
             },
         );
+        let pointer_context = Arc::clone(&context);
         node.focusable(id.clone())
             .with_focused_style(self.style.focused)
+            .on_pointer_event(id.clone(), move |pointer| {
+                selectable_text_pointer_result(pointer, pointer_context.as_ref())
+            })
             .on_actions(id, actions)
     }
 }
@@ -608,6 +614,82 @@ fn selectable_text_action_result<Message>(
         result
     } else {
         result.emit((context.on_change)(next))
+    }
+}
+
+fn selectable_text_pointer_result<Message>(
+    pointer: &PointerEventContext,
+    context: &SelectableTextActionContext<Message>,
+) -> EventResult<Message> {
+    let event = pointer.event();
+    if event.button != MouseButton::Left {
+        return EventResult::ignored();
+    }
+    let Some(hit) = pointer.text_hit() else {
+        return EventResult::ignored();
+    };
+    match event.kind {
+        MouseKind::Press => {
+            let next = if event.modifiers.shift {
+                let anchor = selectable_text_anchor(context.state);
+                SelectableTextState::with_selection(pointer_selection_offset(hit, anchor), anchor)
+            } else {
+                SelectableTextState::new(hit.start())
+            };
+            let result = EventResult::consumed()
+                .focus(context.id.clone())
+                .capture_pointer(context.id.clone());
+            emit_selectable_text_change(result, next, context)
+        }
+        MouseKind::Move => {
+            if !pointer.is_captured() {
+                return EventResult::ignored();
+            }
+            let anchor = selectable_text_anchor(context.state);
+            let next =
+                SelectableTextState::with_selection(pointer_selection_offset(hit, anchor), anchor);
+            let mut result = EventResult::consumed().focus(context.id.clone());
+            if let Some((viewport, offset)) = pointer.edge_scroll() {
+                result = result.scroll_to(viewport.clone(), offset);
+            }
+            emit_selectable_text_change(result, next, context)
+        }
+        MouseKind::Release => {
+            if !pointer.is_captured() {
+                return EventResult::ignored();
+            }
+            EventResult::consumed().release_pointer()
+        }
+        MouseKind::Scroll => EventResult::ignored(),
+    }
+}
+
+fn emit_selectable_text_change<Message>(
+    result: EventResult<Message>,
+    next: SelectableTextState,
+    context: &SelectableTextActionContext<Message>,
+) -> EventResult<Message> {
+    let next = context.content.normalize_state(next);
+    if next == context.state {
+        result
+    } else {
+        result.emit((context.on_change)(next))
+    }
+}
+
+const fn selectable_text_anchor(state: SelectableTextState) -> usize {
+    if state.has_selection {
+        state.selection_anchor
+    } else {
+        state.cursor
+    }
+}
+
+const fn pointer_selection_offset(hit: nagi_tui::TextHit, anchor: usize) -> usize {
+    if hit.end() <= anchor {
+        hit.start()
+    } else {
+        hit.end()
     }
 }
 

@@ -88,7 +88,7 @@ pub use presentation::{
     PresentationState, TextStyleDeclaration,
 };
 pub use rich_text::{ParagraphOptions, TextSpan, WrapMode};
-pub use routing::{EventDispatch, EventResult};
+pub use routing::{EventDispatch, EventResult, PointerEventContext, PointerViewport, TextHit};
 pub use runtime::{
     DEFAULT_QUEUE_CAPACITY, DEFAULT_RUNTIME_NOTICE_CAPACITY, DEFAULT_SUBSCRIPTION_CAPACITY,
     DEFAULT_TASK_LIMIT, Frame, QueueFull, Runtime, RuntimeConfig, RuntimeError, RuntimeEventError,

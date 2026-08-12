@@ -331,7 +331,7 @@ impl Gallery {
                     .into_node(),
             ]),
             Node::text(
-                "SelectableText: Shift-arrows select, Ctrl-C copies, Ctrl-Shift-C copies all",
+                "SelectableText: drag or Shift-arrows select, Ctrl-C copies, Ctrl-Shift-C copies all",
             ),
             Node::border(
                 SelectableText::new(
@@ -374,7 +374,7 @@ impl Gallery {
 
 fn main() -> Result<(), nagi_tui::RunError> {
     let options = TerminalOptions {
-        mouse_tracking: Some(MouseTracking::Press),
+        mouse_tracking: Some(MouseTracking::Button),
         clipboard: nagi_tui::TerminalClipboard::Osc52,
         focus_first: true,
         ..TerminalOptions::default()

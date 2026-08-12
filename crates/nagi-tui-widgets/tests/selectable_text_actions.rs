@@ -4,10 +4,13 @@ mod support;
 
 use std::ops::Range;
 
+use nagi_text::WidthProfile;
 use nagi_tui::{
-    ActionAvailability, App, BindingConflictKind, Color, Effect, Event, EventDispatch, Insets,
-    KeyAction, KeyBinding, KeyCode, KeyEvent, KeyMap, KeyProtocol, KeyScope, KeyStroke, Modifiers,
-    Node, NodeId, RepeatPolicy, Runtime, RuntimeError, Size, Style, TEXT_COPY_DOCUMENT_ACTION_ID,
+    ActionAvailability, App, BindingConflictKind, Color, Effect, Event, EventDispatch,
+    HorizontalAlignment, Insets, KeyAction, KeyBinding, KeyCode, KeyEvent, KeyMap, KeyProtocol,
+    KeyScope, KeyStroke, Modifiers, MouseButton, MouseEvent, MouseKind, Node, NodeId,
+    ParagraphOptions, RepeatPolicy, Runtime, RuntimeConfig, RuntimeError, ScrollAxis,
+    ScrollViewportOptions, Size, Style, TEXT_COPY_DOCUMENT_ACTION_ID,
     TEXT_COPY_SELECTION_ACTION_ID, TEXT_CURSOR_DOCUMENT_END_ACTION_ID,
     TEXT_CURSOR_DOCUMENT_START_ACTION_ID, TEXT_CURSOR_LEFT_ACTION_ID,
     TEXT_CURSOR_LINE_END_ACTION_ID, TEXT_CURSOR_LINE_START_ACTION_ID, TEXT_CURSOR_RIGHT_ACTION_ID,
@@ -16,7 +19,7 @@ use nagi_tui::{
     TEXT_SELECTION_EXTEND_LEFT_ACTION_ID, TEXT_SELECTION_EXTEND_LINE_END_ACTION_ID,
     TEXT_SELECTION_EXTEND_LINE_START_ACTION_ID, TEXT_SELECTION_EXTEND_RIGHT_ACTION_ID,
     TEXT_SELECTION_EXTEND_WORD_LEFT_ACTION_ID, TEXT_SELECTION_EXTEND_WORD_RIGHT_ACTION_ID,
-    TextSpan, VirtualClock,
+    TextSpan, VirtualClock, WrapMode,
 };
 use nagi_tui_widgets::{
     SelectableText, SelectableTextContent, SelectableTextState, TextCopyKind, TextCopyRequest,
@@ -26,6 +29,7 @@ use nagi_tui_widgets::{
 enum SelectableTextMessage {
     Change(SelectableTextState),
     Copy(TextCopyRequest),
+    Scroll(nagi_tui::ScrollOffset),
 }
 
 struct SelectableTextFixtureApp {
@@ -35,6 +39,189 @@ struct SelectableTextFixtureApp {
     copy: bool,
     key_map: KeyMap,
     messages: Vec<SelectableTextMessage>,
+}
+
+struct SelectableTextPointerApp {
+    content: SelectableTextContent,
+    state: SelectableTextState,
+    enabled: bool,
+    options: ParagraphOptions,
+    scroll_axis: Option<ScrollAxis>,
+    messages: Vec<SelectableTextMessage>,
+}
+
+impl App for SelectableTextPointerApp {
+    type Message = SelectableTextMessage;
+
+    fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+        if let SelectableTextMessage::Change(state) = message {
+            self.state = state;
+            self.messages.push(SelectableTextMessage::Change(state));
+        } else {
+            self.messages.push(message);
+        }
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        let text = SelectableText::new(
+            "text",
+            self.content.clone(),
+            self.state,
+            SelectableTextMessage::Change,
+        )
+        .enabled(self.enabled)
+        .paragraph_options(self.options)
+        .into_node();
+        let Some(axis) = self.scroll_axis else {
+            return text;
+        };
+        Node::scroll_viewport_with_options(
+            "scroll",
+            text,
+            ScrollViewportOptions {
+                axis,
+                on_scroll: Some(Box::new(|state| {
+                    SelectableTextMessage::Scroll(state.offset)
+                })),
+                ..ScrollViewportOptions::default()
+            },
+        )
+    }
+}
+
+#[test]
+fn selectable_text_pointer_selection_matches_shared_fixtures() {
+    let Some(records) = support::load(
+        "widgets/selectable-text-pointer.txt",
+        "widget-selectable-text-pointer",
+        &[
+            "content",
+            "width",
+            "height",
+            "wrap",
+            "alignment",
+            "profile",
+            "scroll",
+            "enabled",
+            "cursor",
+            "anchor",
+            "events",
+            "expected-cursor",
+            "expected-anchor",
+            "messages",
+            "consumed",
+            "capture",
+            "focus",
+            "offset",
+        ],
+    ) else {
+        return;
+    };
+    for record in records {
+        let content = SelectableTextContent::plain(record.text("content"));
+        let state = content.normalize_state(fixture_state(
+            record.field("cursor"),
+            record.field("anchor"),
+        ));
+        let mut config = RuntimeConfig::new(Size::new(
+            fixture_u32(record.field("width")),
+            fixture_u32(record.field("height")),
+        ));
+        config.width_profile = match record.field("profile") {
+            "modern" => WidthProfile::MODERN,
+            "cjk" => WidthProfile::CJK,
+            value => panic!("invalid pointer WidthProfile {value}"),
+        };
+        let options = ParagraphOptions {
+            wrap: match record.field("wrap") {
+                "word" => WrapMode::Word,
+                "hard" => WrapMode::Hard,
+                "none" => WrapMode::None,
+                value => panic!("invalid pointer WrapMode {value}"),
+            },
+            alignment: match record.field("alignment") {
+                "start" => HorizontalAlignment::Start,
+                "center" => HorizontalAlignment::Center,
+                "end" => HorizontalAlignment::End,
+                value => panic!("invalid pointer alignment {value}"),
+            },
+        };
+        let mut runtime = Runtime::with_clock(
+            SelectableTextPointerApp {
+                content,
+                state,
+                enabled: fixture_boolean(record.field("enabled")),
+                options,
+                scroll_axis: match record.field("scroll") {
+                    "none" => None,
+                    "vertical" => Some(ScrollAxis::Vertical),
+                    "horizontal" => Some(ScrollAxis::Horizontal),
+                    value => panic!("invalid pointer scroll axis {value}"),
+                },
+                messages: Vec::new(),
+            },
+            config,
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        let mut consumed = Vec::new();
+        for event in record.field("events").split(',') {
+            let dispatch = runtime
+                .dispatch_event(&pointer_fixture_event(event))
+                .unwrap();
+            consumed.push(dispatch.consumed());
+            runtime.process_pending().unwrap();
+            runtime.render_if_dirty().unwrap();
+        }
+        assert_eq!(
+            runtime.app().state,
+            fixture_state(
+                record.field("expected-cursor"),
+                record.field("expected-anchor")
+            ),
+            "case {} state",
+            record.id
+        );
+        assert_eq!(
+            pointer_fixture_messages(&runtime.app().messages),
+            record.field("messages"),
+            "case {} messages",
+            record.id
+        );
+        let expected_consumed = record
+            .field("consumed")
+            .split(',')
+            .map(fixture_boolean)
+            .collect::<Vec<_>>();
+        assert_eq!(consumed, expected_consumed, "case {} consumed", record.id);
+        assert_eq!(
+            runtime
+                .interaction()
+                .pointer_capture()
+                .map_or("none", NodeId::as_str),
+            record.field("capture"),
+            "case {} capture",
+            record.id
+        );
+        assert_eq!(
+            runtime
+                .interaction()
+                .focused()
+                .map_or("none", NodeId::as_str),
+            record.field("focus"),
+            "case {} focus",
+            record.id
+        );
+        let expected_offset = fixture_scroll_offset(record.field("offset"));
+        assert_eq!(
+            runtime.interaction().scroll_offset(&NodeId::from("scroll")),
+            expected_offset,
+            "case {} scroll offset",
+            record.id
+        );
+    }
 }
 
 impl App for SelectableTextFixtureApp {
@@ -530,6 +717,58 @@ fn fixture_event(value: &str) -> Event {
     }
 }
 
+fn pointer_fixture_event(value: &str) -> Event {
+    let (kind, coordinates) = value
+        .split_once('@')
+        .unwrap_or_else(|| panic!("invalid pointer event {value}"));
+    let (x, y) = coordinates
+        .split_once(':')
+        .unwrap_or_else(|| panic!("invalid pointer coordinates {coordinates}"));
+    let (kind, button, modifiers) = match kind {
+        "press" => (MouseKind::Press, MouseButton::Left, Modifiers::NONE),
+        "shift-press" => (
+            MouseKind::Press,
+            MouseButton::Left,
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        ),
+        "right-press" => (MouseKind::Press, MouseButton::Right, Modifiers::NONE),
+        "move" => (MouseKind::Move, MouseButton::Left, Modifiers::NONE),
+        "release" => (MouseKind::Release, MouseButton::Left, Modifiers::NONE),
+        value => panic!("invalid pointer event kind {value}"),
+    };
+    Event::Mouse(MouseEvent {
+        kind,
+        button,
+        x: fixture_u32(x),
+        y: fixture_u32(y),
+        modifiers,
+    })
+}
+
+fn pointer_fixture_messages(messages: &[SelectableTextMessage]) -> String {
+    if messages.is_empty() {
+        return "-".to_owned();
+    }
+    messages
+        .iter()
+        .map(|message| match message {
+            SelectableTextMessage::Change(state) => format!(
+                "change:{}:{}",
+                state.cursor(),
+                state
+                    .selection_anchor()
+                    .map_or_else(|| "-".to_owned(), |anchor| anchor.to_string())
+            ),
+            SelectableTextMessage::Scroll(offset) => format!("scroll:{}:{}", offset.x, offset.y),
+            SelectableTextMessage::Copy(_) => panic!("unexpected copy message in pointer fixture"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn fixture_action_id(event: &str) -> &'static str {
     match event {
         "left" | "repeat-left" => TEXT_CURSOR_LEFT_ACTION_ID,
@@ -633,4 +872,15 @@ fn fixture_boolean(value: &str) -> bool {
 
 fn fixture_usize(value: &str) -> usize {
     value.parse().unwrap()
+}
+
+fn fixture_u32(value: &str) -> u32 {
+    value.parse().unwrap()
+}
+
+fn fixture_scroll_offset(value: &str) -> nagi_tui::ScrollOffset {
+    let (x, y) = value
+        .split_once(':')
+        .unwrap_or_else(|| panic!("invalid scroll offset {value}"));
+    nagi_tui::ScrollOffset::new(fixture_u32(x), fixture_u32(y))
 }

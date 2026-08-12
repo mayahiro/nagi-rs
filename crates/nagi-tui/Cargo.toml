@@ -29,3 +29,7 @@ harness = false
 [[bench]]
 name = "clipboard"
 harness = false
+
+[[bench]]
+name = "pointer_selection"
+harness = false

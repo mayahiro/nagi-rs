@@ -15,7 +15,9 @@ use crate::action_routing::{
 use crate::core_action::{CoreAction, default_focus_action};
 use crate::effect::{ClipboardRequest, RuntimeCommand};
 use crate::renderer::operations;
-use crate::routing::{FocusChange, InteractiveKind, PointerChange, TreeIndex};
+use crate::routing::{
+    FocusChange, InteractiveKind, PointerChange, PointerEventContext, PointerViewport, TreeIndex,
+};
 use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeDiagnostics, RuntimeNoticeQueue};
 use crate::subscription_supervisor::{
     SubscriptionDiagnostics, SubscriptionReconciliation, SubscriptionSupervisor, SubscriptionTag,
@@ -25,7 +27,8 @@ use crate::text_edit::{TextEdit, apply_text_edit, normalize_cursor};
 use crate::wake::WakeHandle;
 use crate::{
     App, BindingConflict, Clock, EventDispatch, EventResult, InteractionState, Node, NodeId, Point,
-    ResolvedActions, ScrollOffset, Size, SubscriptionKey, Surface, SystemClock, TaskKey, Timestamp,
+    Rect, ResolvedActions, ScrollOffset, Size, SubscriptionKey, Surface, SystemClock, TaskKey,
+    Timestamp,
 };
 
 /// The default maximum number of messages waiting in a runtime queue
@@ -249,6 +252,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     next_action_index: ActionIndex<Application::Message>,
     resolved_action_route: Option<ResolvedActionRoute<Application::Message>>,
     next_resolved_action_route: ResolvedActionRoute<Application::Message>,
+    event_route: Vec<NodeId>,
     effects: EffectSupervisor<Application::Message>,
     subscriptions: SubscriptionSupervisor<Application::Message>,
     notices: Arc<RuntimeNoticeQueue>,
@@ -333,6 +337,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             next_action_index: ActionIndex::default(),
             resolved_action_route: None,
             next_resolved_action_route: ResolvedActionRoute::default(),
+            event_route: Vec::new(),
             effects,
             subscriptions,
             notices,
@@ -778,13 +783,25 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
         }
 
-        let route = self.tree_index.route(target.as_ref());
+        let mut route = std::mem::take(&mut self.event_route);
+        self.tree_index.route_into(target.as_ref(), &mut route);
+        let result = self.dispatch_event_route(event, &route);
+        route.clear();
+        self.event_route = route;
+        result
+    }
+
+    fn dispatch_event_route(
+        &mut self,
+        event: &Event,
+        route: &[NodeId],
+    ) -> Result<EventDispatch, RuntimeEventError> {
         let focus_owner = self
             .tree_index
             .focus_action_owner(self.interaction.focused.as_ref());
-        self.ensure_action_route(&route, focus_owner.as_ref())?;
+        self.ensure_action_route(route, focus_owner.as_ref())?;
         let mut dispatch = EventDispatch::default();
-        for (index, id) in route.into_iter().enumerate() {
+        for (index, id) in route.iter().enumerate() {
             let action_result = self
                 .resolved_action_route
                 .as_ref()
@@ -804,7 +821,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             let core_result = match core_match {
                 CoreActionMatch::None => None,
                 CoreActionMatch::Consume => Some(EventResult::consumed()),
-                CoreActionMatch::Invoke(action) => self.handle_core_action(&id, action),
+                CoreActionMatch::Invoke(action) => self.handle_core_action(id, action),
             };
             if let Some(result) = core_result {
                 self.apply_event_result(result, &mut dispatch)?;
@@ -814,12 +831,12 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
             let kind = self
                 .tree_index
-                .record(&id)
+                .record(id)
                 .map_or(InteractiveKind::Generic, |record| record.kind);
             let special = match kind {
-                InteractiveKind::TextInput if index == 0 => self.handle_text_input(&id, event),
+                InteractiveKind::TextInput if index == 0 => self.handle_text_input(id, event),
                 InteractiveKind::ScrollViewportVertical
-                | InteractiveKind::ScrollViewportHorizontal => self.handle_scroll_mouse(&id, event),
+                | InteractiveKind::ScrollViewportHorizontal => self.handle_scroll_mouse(id, event),
                 InteractiveKind::Generic | InteractiveKind::TextInput | InteractiveKind::Modal => {
                     None
                 }
@@ -830,10 +847,22 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                     break;
                 }
             }
+            let pointer_context = self.pointer_event_context(id, route, index, event);
+            let pointer_result = pointer_context.and_then(|context| {
+                self.view_tree
+                    .as_ref()
+                    .and_then(|view| view.handle_pointer_event(id, context))
+            });
+            if let Some(result) = pointer_result {
+                self.apply_event_result(result, &mut dispatch)?;
+                if dispatch.consumed {
+                    break;
+                }
+            }
             let result = self
                 .view_tree
                 .as_ref()
-                .and_then(|view| view.handle_event(&id, event));
+                .and_then(|view| view.handle_event(id, event));
             if let Some(result) = result {
                 self.apply_event_result(result, &mut dispatch)?;
                 if dispatch.consumed {
@@ -842,7 +871,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
             if self
                 .tree_index
-                .record(&id)
+                .record(id)
                 .is_some_and(|record| record.blocks_unhandled_events)
             {
                 dispatch.consumed = true;
@@ -850,6 +879,52 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
         }
         Ok(dispatch)
+    }
+
+    fn pointer_event_context(
+        &self,
+        id: &NodeId,
+        route: &[NodeId],
+        index: usize,
+        event: &Event,
+    ) -> Option<PointerEventContext> {
+        let Event::Mouse(mouse) = event else {
+            return None;
+        };
+        let record = self.tree_index.record(id)?;
+        let visible = record.rect.intersection(record.clip);
+        let local_position = Point::new(
+            local_pointer_coordinate(mouse.x, record.rect.x),
+            local_pointer_coordinate(mouse.y, record.rect.y),
+        );
+        let visible_bounds = Rect::new(
+            local_geometry_coordinate(visible.x, record.rect.x),
+            local_geometry_coordinate(visible.y, record.rect.y),
+            visible.width,
+            visible.height,
+        );
+        let viewport = route[index.saturating_add(1)..]
+            .iter()
+            .find_map(|viewport_id| {
+                let viewport_record = self.tree_index.record(viewport_id)?;
+                let axis = viewport_record.kind.scroll_axis()?;
+                let state = self.interaction.scroll_state(viewport_id)?;
+                Some(PointerViewport::new(
+                    viewport_id.clone(),
+                    axis,
+                    state,
+                    viewport_record.rect.intersection(viewport_record.clip),
+                ))
+            });
+        Some(PointerEventContext::new(
+            *mouse,
+            local_position,
+            record.rect.size(),
+            visible_bounds,
+            self.width_profile,
+            self.interaction.pointer_capture() == Some(id),
+            viewport,
+        ))
     }
 
     fn ensure_action_route(
@@ -1094,6 +1169,28 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         for message in result.messages {
             self.enqueue(message)?;
             dispatch.messages += 1;
+        }
+        if let Some((id, offset)) = result.scroll {
+            let is_available = self
+                .tree_index
+                .record(&id)
+                .is_some_and(|record| record.kind.is_scroll_viewport())
+                && self.tree_index.allows_interaction(&id);
+            if is_available {
+                if let Some((state, true)) = self.interaction.request_scroll(&id, offset) {
+                    self.dirty = true;
+                    self.urgent_frame = true;
+                    dispatch.redraw = true;
+                    if let Some(message) = self
+                        .view_tree
+                        .as_ref()
+                        .and_then(|view| view.scroll_message(&id, state))
+                    {
+                        self.enqueue(message)?;
+                        dispatch.messages += 1;
+                    }
+                }
+            }
         }
         dispatch.consumed |= result.consumed;
         dispatch.redraw |= result.redraw;
@@ -1456,6 +1553,18 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.process_pending()?;
         self.render_if_dirty()
     }
+}
+
+fn local_pointer_coordinate(value: u32, origin: i32) -> i32 {
+    clamp_pointer_coordinate(i64::from(value).saturating_sub(i64::from(origin)))
+}
+
+fn local_geometry_coordinate(value: i32, origin: i32) -> i32 {
+    clamp_pointer_coordinate(i64::from(value).saturating_sub(i64::from(origin)))
+}
+
+fn clamp_pointer_coordinate(value: i64) -> i32 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 fn resolve_frame_actions_into<Message>(
@@ -2131,6 +2240,64 @@ mod tests {
         assert!(dispatch.consumed());
         runtime.step().unwrap();
         assert_eq!(runtime.app().visits, ["input", "panel"]);
+    }
+
+    struct PointerHandlerOrderApp {
+        visits: Vec<&'static str>,
+    }
+
+    impl App for PointerHandlerOrderApp {
+        type Message = FocusMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            match message {
+                FocusMessage::Visit(id) => self.visits.push(id),
+            }
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::rich_text([crate::TextSpan::new("ab", crate::Style::default())])
+                .on_pointer_event("target", |context| {
+                    let hit = context.text_hit().expect("paragraph text hit");
+                    assert_eq!((hit.start(), hit.end()), (0, 1));
+                    assert_eq!(context.local_position(), Point::new(0, 0));
+                    assert_eq!(context.bounds(), Size::new(2, 1));
+                    assert_eq!(context.visible_bounds(), Rect::new(0, 0, 2, 1));
+                    assert!(!context.is_captured());
+                    assert!(context.viewport().is_none());
+                    EventResult::ignored().emit(FocusMessage::Visit("pointer"))
+                })
+                .on_event("target", |_| {
+                    EventResult::message(FocusMessage::Visit("raw"))
+                })
+        }
+    }
+
+    #[test]
+    fn geometry_pointer_handler_precedes_raw_handler() {
+        let mut runtime = Runtime::with_clock(
+            PointerHandlerOrderApp { visits: Vec::new() },
+            RuntimeConfig::new(Size::new(2, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        let dispatch = runtime
+            .dispatch_event(&Event::Mouse(crate::MouseEvent {
+                kind: MouseKind::Press,
+                button: MouseButton::Left,
+                x: 0,
+                y: 0,
+                modifiers: Modifiers::NONE,
+            }))
+            .unwrap();
+
+        assert!(dispatch.consumed());
+        assert_eq!(dispatch.messages(), 2);
+        runtime.process_pending().unwrap();
+        assert_eq!(runtime.app().visits, ["pointer", "raw"]);
     }
 
     struct ModalApp {
