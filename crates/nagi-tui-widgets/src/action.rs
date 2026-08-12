@@ -21,6 +21,24 @@ pub const SELECTION_FIRST_ACTION_ID: &str = "nagi.selection.first";
 /// Stable Action ID for selecting the last item
 pub const SELECTION_LAST_ACTION_ID: &str = "nagi.selection.last";
 
+/// Stable Action ID for extending a selection to the previous item
+pub const SELECTION_EXTEND_PREVIOUS_ACTION_ID: &str = "nagi.selection.extend-previous";
+
+/// Stable Action ID for extending a selection to the next item
+pub const SELECTION_EXTEND_NEXT_ACTION_ID: &str = "nagi.selection.extend-next";
+
+/// Stable Action ID for extending a selection to the first item
+pub const SELECTION_EXTEND_FIRST_ACTION_ID: &str = "nagi.selection.extend-first";
+
+/// Stable Action ID for extending a selection to the last item
+pub const SELECTION_EXTEND_LAST_ACTION_ID: &str = "nagi.selection.extend-last";
+
+/// Stable Action ID for scrolling a horizontal presentation toward its start
+pub const HORIZONTAL_SCROLL_PREVIOUS_ACTION_ID: &str = "nagi.scroll.horizontal-previous";
+
+/// Stable Action ID for scrolling a horizontal presentation toward its end
+pub const HORIZONTAL_SCROLL_NEXT_ACTION_ID: &str = "nagi.scroll.horizontal-next";
+
 /// Stable Action ID for selecting one page toward the beginning
 pub const SELECTION_PREVIOUS_PAGE_ACTION_ID: &str = "nagi.selection.previous-page";
 

@@ -22,3 +22,7 @@ harness = false
 [[bench]]
 name = "json_inspector"
 harness = false
+
+[[bench]]
+name = "code_view"
+harness = false

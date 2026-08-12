@@ -73,6 +73,10 @@ impl<'a> WidthProfile<'a> {
             .map(CellCount::get)
     }
 
+    pub(crate) const fn has_override(self) -> bool {
+        self.override_width.is_some()
+    }
+
     pub(crate) const fn ambiguous_is_wide(self) -> bool {
         self.ambiguous_is_wide
     }

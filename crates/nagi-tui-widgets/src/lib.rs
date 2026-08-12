@@ -8,6 +8,8 @@ mod button;
 mod calendar;
 mod chart;
 mod checkbox;
+mod code;
+mod code_view;
 mod command_palette;
 mod composer;
 mod dialog;
@@ -43,7 +45,10 @@ mod fixture_support;
 pub use action::{
     ACTIVATE_ACTION_ID, COLLAPSE_ACTION_ID, COMPOSER_SUBMIT_ACTION_ID, CONFIRM_ACTION_ID,
     DISMISS_ACTION_ID, EXPAND_ACTION_ID, HISTORY_NEXT_ACTION_ID, HISTORY_PREVIOUS_ACTION_ID,
-    INSPECTOR_COPY_ACTION_ID, NAVIGATION_BACK_ACTION_ID, SELECTION_FIRST_ACTION_ID,
+    HORIZONTAL_SCROLL_NEXT_ACTION_ID, HORIZONTAL_SCROLL_PREVIOUS_ACTION_ID,
+    INSPECTOR_COPY_ACTION_ID, NAVIGATION_BACK_ACTION_ID, SELECTION_EXTEND_FIRST_ACTION_ID,
+    SELECTION_EXTEND_LAST_ACTION_ID, SELECTION_EXTEND_NEXT_ACTION_ID,
+    SELECTION_EXTEND_PREVIOUS_ACTION_ID, SELECTION_FIRST_ACTION_ID,
     SELECTION_FIRST_DAY_OF_MONTH_ACTION_ID, SELECTION_LAST_ACTION_ID,
     SELECTION_LAST_DAY_OF_MONTH_ACTION_ID, SELECTION_NEXT_ACTION_ID, SELECTION_NEXT_DAY_ACTION_ID,
     SELECTION_NEXT_MONTH_ACTION_ID, SELECTION_NEXT_PAGE_ACTION_ID, SELECTION_NEXT_WEEK_ACTION_ID,
@@ -57,6 +62,15 @@ pub use button::{Button, ButtonStyle};
 pub use calendar::{Calendar, CalendarDate, CalendarStyle, CalendarWeekStart};
 pub use chart::{Chart, ChartPoint, ChartSeries, ChartStyle};
 pub use checkbox::{Checkbox, CheckboxStyle};
+pub use code::{
+    CodeDocument, CodeDocumentError, CodeDocumentErrorKind, CodeDocumentLimits, CodeLayout,
+    CodeLayoutCache, CodeLayoutError, CodeLayoutErrorKind, CodeLayoutLimits, CodeLayoutOptions,
+    CodeLine, DEFAULT_CODE_DOCUMENT_MAX_LINES, DEFAULT_CODE_DOCUMENT_MAX_SPANS,
+    DEFAULT_CODE_DOCUMENT_MAX_TEXT_BYTES, DEFAULT_CODE_LAYOUT_MAX_DISPLAY_BYTES,
+    DEFAULT_CODE_LAYOUT_MAX_VISUAL_ROWS, DEFAULT_CODE_LAYOUT_TAB_WIDTH,
+    DEFAULT_CODE_LAYOUT_VIEWPORT_WIDTH, InvalidCodeLine, InvalidCodeLineKind,
+};
+pub use code_view::{CodeCopyKind, CodeCopyRequest, CodeView, CodeViewState, CodeViewStyle};
 pub use command_palette::{Command, CommandPalette, CommandPaletteStyle};
 pub use composer::{Composer, ComposerOverflowPolicy, ComposerState};
 pub use dialog::{ConfirmDialog, ConfirmDialogDefault, Dialog, DialogAction, DialogStyle};
