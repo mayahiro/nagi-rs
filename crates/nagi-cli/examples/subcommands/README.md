@@ -1,8 +1,9 @@
 # Nested subcommands
 
 This example requires a `start` subcommand, expands its direct Usage Variant in
-parent Help, reuses the local `profile` value ID in root and child scopes, and
-returns a structured validator Diagnostic for a reserved profile
+parent Help, makes root `--verbose` inherited, reuses the local `profile` value
+ID in root and child scopes, and returns a structured validator Diagnostic for
+a reserved profile
 
 Run it from the Rust repository root:
 
@@ -11,8 +12,9 @@ cargo run -p nagi-cli --example subcommands -- start -vv
 ```
 
 It prints
-`starting profile service from root default with verbosity 2`. Values before
-and after child selection belong to different scopes:
+`starting profile service from root default with verbosity 2`. The inherited
+`-v` is accepted after `start` and remains in the root scope. Local `--profile`
+values before and after child selection belong to different scopes:
 
 ```sh
 cargo run -p nagi-cli --example subcommands -- \

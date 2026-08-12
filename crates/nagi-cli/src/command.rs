@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
@@ -56,6 +56,7 @@ pub struct OptionSpec {
     pub(crate) kind: OptionKind,
     pub(crate) parser: Arc<dyn ValueParser>,
     pub(crate) help: String,
+    pub(crate) inherited: bool,
     pub(crate) required: bool,
     pub(crate) repeated: bool,
     pub(crate) environment: Option<String>,
@@ -88,6 +89,7 @@ impl OptionSpec {
             kind,
             parser: raw_parser(),
             help: String::new(),
+            inherited: false,
             required: false,
             repeated: false,
             environment: None,
@@ -112,6 +114,16 @@ impl OptionSpec {
     /// Sets the help description
     pub fn help(mut self, help: impl Into<String>) -> Self {
         self.help = help.into();
+        self
+    }
+
+    /// Makes this option visible in its declaring command and selected descendants
+    ///
+    /// Recognition continues after subcommand selection and positionals until
+    /// `--`. Parsed values remain stored in the declaring command's Invocation
+    /// scope. Graph validation rejects descendant spelling collisions
+    pub const fn inherited(mut self) -> Self {
+        self.inherited = true;
         self
     }
 
@@ -189,6 +201,11 @@ impl OptionSpec {
     /// Returns the option kind
     pub fn kind(&self) -> OptionKind {
         self.kind
+    }
+
+    /// Reports whether this option is visible in selected descendant commands
+    pub const fn is_inherited(&self) -> bool {
+        self.inherited
     }
 }
 
@@ -543,7 +560,12 @@ impl Command {
 
     /// Validates the entire graph without consuming argv
     pub fn validate(&self) -> Result<(), Diagnostic> {
-        validate_command(self, true)
+        validate_command(
+            self,
+            true,
+            &InheritedSpellings::default(),
+            std::slice::from_ref(&self.name),
+        )
     }
 
     pub(crate) fn command_at_path(&self, path: &[String]) -> Option<&Command> {
@@ -558,6 +580,22 @@ impl Command {
                 .find(|candidate| candidate.name == *name)?;
         }
         Some(command)
+    }
+
+    pub(crate) fn commands_at_path(&self, path: &[String]) -> Option<Vec<&Command>> {
+        if path.first().map(String::as_str) != Some(self.name.as_str()) {
+            return None;
+        }
+        let mut command = self;
+        let mut commands = vec![self];
+        for name in &path[1..] {
+            command = command
+                .subcommands
+                .iter()
+                .find(|candidate| candidate.name == *name)?;
+            commands.push(command);
+        }
+        Some(commands)
     }
 
     pub(crate) fn command_id_path_at_path(&self, path: &[String]) -> Option<Vec<String>> {
@@ -588,7 +626,18 @@ impl Command {
     }
 }
 
-fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
+#[derive(Clone, Default)]
+struct InheritedSpellings {
+    longs: BTreeMap<String, String>,
+    shorts: BTreeMap<char, String>,
+}
+
+fn validate_command(
+    command: &Command,
+    root: bool,
+    inherited: &InheritedSpellings,
+    command_path: &[String],
+) -> Result<(), Diagnostic> {
     if !valid_id(&command.id) {
         return invalid(format!("invalid command ID '{}'", command.id));
     }
@@ -639,11 +688,23 @@ fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
                     "duplicate, invalid, or reserved long option '{long}'"
                 ));
             }
+            if let Some(origin) = inherited.longs.get(long) {
+                return invalid(format!(
+                    "command '{}' option '--{long}' conflicts with inherited option from '{origin}'",
+                    command_path.join(" ")
+                ));
+            }
         }
         if let Some(short) = option.short {
             if !short.is_ascii_alphanumeric() || reserved_short(short) || !shorts.insert(short) {
                 return invalid(format!(
                     "duplicate, invalid, or reserved short option '{short}'"
+                ));
+            }
+            if let Some(origin) = inherited.shorts.get(&short) {
+                return invalid(format!(
+                    "command '{}' option '-{short}' conflicts with inherited option from '{origin}'",
+                    command_path.join(" ")
                 ));
             }
         }
@@ -697,6 +758,20 @@ fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
     }
     validate_help(command)?;
 
+    let mut visible_inherited = inherited.clone();
+    let origin = command_path.join(" ");
+    for option in &command.options {
+        if !option.inherited {
+            continue;
+        }
+        if let Some(long) = &option.long {
+            visible_inherited.longs.insert(long.clone(), origin.clone());
+        }
+        if let Some(short) = option.short {
+            visible_inherited.shorts.insert(short, origin.clone());
+        }
+    }
+
     let mut child_spellings = BTreeSet::new();
     let mut child_ids = BTreeSet::new();
     for child in &command.subcommands {
@@ -714,7 +789,9 @@ fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
                 ));
             }
         }
-        validate_command(child, false)?;
+        let mut child_path = command_path.to_vec();
+        child_path.push(child.name.clone());
+        validate_command(child, false, &visible_inherited, &child_path)?;
     }
     Ok(())
 }

@@ -538,7 +538,7 @@ impl<'command> Parser<'command> {
             return Ok(result);
         }
         while self.index < self.arguments.len() {
-            let argument = self.arguments[self.index].clone();
+            let argument = std::mem::take(&mut self.arguments[self.index]);
             let bytes = argument.as_bytes();
             if self.options_enabled && bytes == b"--" {
                 self.options_enabled = false;
@@ -591,22 +591,6 @@ impl<'command> Parser<'command> {
             .last()
             .copied()
             .expect("parser always has a root command")
-    }
-
-    fn active_values(&self) -> &BTreeMap<String, InvocationValue> {
-        &self
-            .scopes
-            .last()
-            .expect("parser always has a root value scope")
-            .values
-    }
-
-    fn active_values_mut(&mut self) -> &mut BTreeMap<String, InvocationValue> {
-        &mut self
-            .scopes
-            .last_mut()
-            .expect("parser always has a root value scope")
-            .values
     }
 
     fn current_command_id_path(&self) -> Vec<String> {
@@ -698,20 +682,16 @@ impl<'command> Parser<'command> {
             }));
         }
 
-        let Some(option) = self
-            .active()
-            .options
-            .iter()
-            .find(|option| option.long.as_deref() == Some(name))
-            .cloned()
-        else {
+        let Some((scope_index, option_index)) = self.visible_long_option(name) else {
             return Err(self.error(
                 DiagnosticCode::UnknownOption,
                 format!("unknown option {}", quote_value(argument)),
             ));
         };
+        let command = self.commands[scope_index];
+        let option = &command.options[option_index];
         self.index += 1;
-        self.apply_option(&option, attached, argument)?;
+        self.apply_option(scope_index, option, attached)?;
         Ok(None)
     }
 
@@ -741,25 +721,21 @@ impl<'command> Parser<'command> {
                     command_id_path: vec![self.root.id.clone()],
                 }));
             }
-            let Some(option) = self
-                .active()
-                .options
-                .iter()
-                .find(|option| option.short == Some(short))
-                .cloned()
-            else {
+            let Some((scope_index, option_index)) = self.visible_short_option(short) else {
                 return Err(self.error(
                     DiagnosticCode::UnknownOption,
                     format!("unknown option '-{short}'"),
                 ));
             };
+            let command = self.commands[scope_index];
+            let option = &command.options[option_index];
             if option.kind == OptionKind::Value {
                 let attached = (offset + 1 < bytes.len())
                     .then(|| OsString::from_vec(bytes[offset + 1..].to_vec()));
-                self.apply_option(&option, attached, argument)?;
+                self.apply_option(scope_index, option, attached)?;
                 return Ok(None);
             }
-            self.apply_option(&option, None, argument)?;
+            self.apply_option(scope_index, option, None)?;
             offset += 1;
         }
         Ok(None)
@@ -767,9 +743,9 @@ impl<'command> Parser<'command> {
 
     fn apply_option(
         &mut self,
+        scope_index: usize,
         option: &OptionSpec,
         attached: Option<OsString>,
-        _spelling: &OsStr,
     ) -> Result<(), Diagnostic> {
         match option.kind {
             OptionKind::Flag => {
@@ -777,20 +753,21 @@ impl<'command> Parser<'command> {
                     return Err(self.error_with_targets(
                         DiagnosticCode::UnexpectedOptionValue,
                         format!("option '{}' does not take a value", option_display(option)),
-                        [DiagnosticTarget::option(&option.id)],
+                        [self.option_target(scope_index, &option.id)],
                     ));
                 }
-                if self.active_values().contains_key(&option.id) {
+                if self.scopes[scope_index].values.contains_key(&option.id) {
                     return Err(self.error_with_targets(
                         DiagnosticCode::DuplicateOption,
                         format!(
                             "option '{}' was provided more than once",
                             option_display(option)
                         ),
-                        [DiagnosticTarget::option(&option.id)],
+                        [self.option_target(scope_index, &option.id)],
                     ));
                 }
-                self.active_values_mut()
+                self.scopes[scope_index]
+                    .values
                     .insert(option.id.clone(), InvocationValue::Flag);
             }
             OptionKind::Count => {
@@ -798,10 +775,10 @@ impl<'command> Parser<'command> {
                     return Err(self.error_with_targets(
                         DiagnosticCode::UnexpectedOptionValue,
                         format!("option '{}' does not take a value", option_display(option)),
-                        [DiagnosticTarget::option(&option.id)],
+                        [self.option_target(scope_index, &option.id)],
                     ));
                 }
-                match self.active_values_mut().entry(option.id.clone()) {
+                match self.scopes[scope_index].values.entry(option.id.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(InvocationValue::Count(1));
                     }
@@ -816,25 +793,26 @@ impl<'command> Parser<'command> {
                 let raw = match attached {
                     Some(value) => value,
                     None => {
-                        let Some(value) = self.arguments.get(self.index).cloned() else {
+                        if self.index >= self.arguments.len() {
                             return Err(self.error_with_targets(
                                 DiagnosticCode::MissingOptionValue,
                                 format!("option '{}' requires a value", option_display(option)),
-                                [DiagnosticTarget::option(&option.id)],
+                                [self.option_target(scope_index, &option.id)],
                             ));
-                        };
+                        }
+                        let value = std::mem::take(&mut self.arguments[self.index]);
                         self.index += 1;
                         value
                     }
                 };
-                if !option.repeated && self.active_values().contains_key(&option.id) {
+                if !option.repeated && self.scopes[scope_index].values.contains_key(&option.id) {
                     return Err(self.error_with_targets(
                         DiagnosticCode::DuplicateOption,
                         format!(
                             "option '{}' was provided more than once",
                             option_display(option)
                         ),
-                        [DiagnosticTarget::option(&option.id)],
+                        [self.option_target(scope_index, &option.id)],
                     ));
                 }
                 let parsed = self.parse_value(
@@ -842,12 +820,45 @@ impl<'command> Parser<'command> {
                     &option.parser,
                     raw,
                     ValueSource::CommandLine,
-                    DiagnosticTarget::option(&option.id),
+                    self.option_target(scope_index, &option.id),
                 )?;
-                self.push_value(self.scopes.len() - 1, &option.id, parsed);
+                self.push_value(scope_index, &option.id, parsed);
             }
         }
         Ok(())
+    }
+
+    fn visible_long_option(&self, name: &str) -> Option<(usize, usize)> {
+        let active_index = self.commands.len() - 1;
+        (0..self.commands.len()).rev().find_map(|scope_index| {
+            self.commands[scope_index]
+                .options
+                .iter()
+                .enumerate()
+                .find(|(_, option)| {
+                    option.long.as_deref() == Some(name)
+                        && (scope_index == active_index || option.inherited)
+                })
+                .map(|(option_index, _)| (scope_index, option_index))
+        })
+    }
+
+    fn visible_short_option(&self, short: char) -> Option<(usize, usize)> {
+        let active_index = self.commands.len() - 1;
+        (0..self.commands.len()).rev().find_map(|scope_index| {
+            self.commands[scope_index]
+                .options
+                .iter()
+                .enumerate()
+                .find(|(_, option)| {
+                    option.short == Some(short) && (scope_index == active_index || option.inherited)
+                })
+                .map(|(option_index, _)| (scope_index, option_index))
+        })
+    }
+
+    fn option_target(&self, scope_index: usize, id: &str) -> DiagnosticTarget {
+        DiagnosticTarget::option(id).with_command_id_path(self.command_id_path(scope_index))
     }
 
     fn select_subcommand(&mut self, argument: &OsStr) -> bool {

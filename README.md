@@ -53,14 +53,14 @@ The complete source and behavior are documented with the examples below
 | `nagi-tui` | Terminal Presentation Rules, bounded Content-to-Node projection, App lifecycle, semantic nodes, scoped key maps, layout, events, Effects, Subscriptions, and terminal loop |
 | `nagi-tui-widgets` | 27 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
-| `nagi-cli` | Command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, staged Runtime Policy, and process integration |
+| `nagi-cli` | Local and inherited options, command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, staged Runtime Policy, and process integration |
 | `nagi-cli-test` | Process-free CLI input injection and output capture |
 
 The [Nagi semantic specifications](https://github.com/mayahiro/nagi/tree/main/spec)
 define behavior shared with the Go implementations. The
 [public CLI API guide](https://github.com/mayahiro/nagi/blob/main/docs/CLI_API.md)
-explains command-local scopes, Help presentation, structured validators, and
-staged adoption
+explains inherited options, command-local scopes, Help presentation,
+structured validators, and staged adoption
 
 ## Testing applications
 

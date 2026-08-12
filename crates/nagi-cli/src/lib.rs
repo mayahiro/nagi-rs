@@ -5,9 +5,11 @@
 //! argument values, produces and validates typed invocations, and executes
 //! handlers through an injected process context and Runtime Policy
 //!
-//! Parent and child Commands may reuse local value IDs. [`Invocation`] access
-//! starts at a documented current scope, while [`Invocation::scope`] selects
-//! one exact stable command-ID path and [`Invocation::require_value`] provides
+//! Options are local unless [`OptionSpec::inherited`] makes them visible in
+//! selected descendants. Every value remains in its declaration scope. Parent
+//! and child Commands may reuse local value IDs. [`Invocation`] access starts
+//! at a documented current scope, while [`Invocation::scope`] selects one
+//! exact stable command-ID path and [`Invocation::require_value`] provides
 //! fallible schema-required typed access
 //!
 //! Help-only Usage Variants and [`SubcommandUsageMode`] control presentation
@@ -42,8 +44,9 @@ pub use diagnostic::{
     ExitStatus,
 };
 pub use help::{
-    HelpBlock, HelpDocument, HelpEntry, HelpExample, HelpLink, HelpOptionGroup, HelpOptionRelation,
-    HelpOptionRelationKind, HelpRenderer, HelpSection, HelpUsageVariant, PlainHelpRenderer,
+    HelpBlock, HelpDocument, HelpEntry, HelpExample, HelpInheritedOption, HelpLink,
+    HelpOptionGroup, HelpOptionRelation, HelpOptionRelationKind, HelpRenderer, HelpSection,
+    HelpUsageVariant, PlainHelpRenderer,
 };
 pub use parser::{
     Invocation, InvocationScope, ParseResult, ValueAccessError, ValueAccessErrorKind,

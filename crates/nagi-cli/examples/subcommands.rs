@@ -20,6 +20,13 @@ fn application() -> Command {
                 .default_value("default")
                 .help("Root configuration profile"),
         )
+        .option(
+            OptionSpec::count("verbose")
+                .long("verbose")
+                .short('v')
+                .help("Increase verbosity")
+                .inherited(),
+        )
         .require_subcommand()
         .subcommand_usage(SubcommandUsageMode::Expanded)
         .subcommand(
@@ -33,12 +40,6 @@ fn application() -> Command {
                         .parser(string_parser())
                         .default_value("service")
                         .help("Service profile"),
-                )
-                .option(
-                    OptionSpec::count("verbose")
-                        .long("verbose")
-                        .short('v')
-                        .help("Increase verbosity"),
                 )
                 .validator(|invocation: &Invocation| {
                     let profile =

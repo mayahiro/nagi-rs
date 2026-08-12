@@ -75,6 +75,41 @@ pub struct HelpEntry {
     description: String,
 }
 
+/// One option inherited from an ancestor in a Help Document
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HelpInheritedOption {
+    command_path: Vec<String>,
+    command_id_path: Vec<String>,
+    entry: HelpEntry,
+}
+
+impl HelpInheritedOption {
+    /// Returns the source canonical command path
+    pub fn command_path(&self) -> &[String] {
+        &self.command_path
+    }
+
+    /// Returns the source stable command-ID path
+    pub fn command_id_path(&self) -> &[String] {
+        &self.command_id_path
+    }
+
+    /// Returns the source-local stable option ID
+    pub fn id(&self) -> &str {
+        self.entry.id()
+    }
+
+    /// Returns the option display label
+    pub fn label(&self) -> &str {
+        self.entry.label()
+    }
+
+    /// Returns the option description without the rendered origin note
+    pub fn description(&self) -> &str {
+        self.entry.description()
+    }
+}
+
 impl HelpEntry {
     pub(crate) fn identified(
         id: impl Into<String>,
@@ -318,6 +353,7 @@ pub struct HelpDocument {
     commands: Vec<HelpEntry>,
     arguments: Vec<HelpEntry>,
     options: Vec<HelpEntry>,
+    inherited_options: Vec<HelpInheritedOption>,
     option_relations: Vec<HelpOptionRelation>,
     option_groups: Vec<HelpOptionGroup>,
     examples: Vec<HelpExample>,
@@ -360,6 +396,11 @@ impl HelpDocument {
     /// Returns option entries
     pub fn options(&self) -> &[HelpEntry] {
         &self.options
+    }
+
+    /// Returns inherited options in outermost-to-nearest ancestor order
+    pub fn inherited_options(&self) -> &[HelpInheritedOption] {
+        &self.inherited_options
     }
 
     /// Returns pairwise option constraints
@@ -425,6 +466,21 @@ impl HelpRenderer for PlainHelpRenderer {
         render_entry_section(&mut output, "Commands", &document.commands);
         render_entry_section(&mut output, "Arguments", &document.arguments);
         render_entry_section(&mut output, "Options", &document.options);
+        let inherited_options = document
+            .inherited_options
+            .iter()
+            .map(|option| {
+                let mut description = option.description().to_owned();
+                if !description.is_empty() {
+                    description.push(' ');
+                }
+                description.push_str("[from ");
+                description.push_str(&option.command_path.join(" "));
+                description.push(']');
+                HelpEntry::identified(option.id(), option.label(), description)
+            })
+            .collect::<Vec<_>>();
+        render_entry_section(&mut output, "Inherited Options", &inherited_options);
 
         let mut constraints = document
             .option_relations
@@ -486,6 +542,9 @@ impl Command {
         let command_id_path = self
             .command_id_path_at_path(path)
             .expect("the validated Help path was resolved above");
+        let command_lineage = self
+            .commands_at_path(path)
+            .expect("the validated Help path was resolved above");
 
         let usage_variants = help_usage_variants(command, path, &command_id_path);
         let usage = usage_variants
@@ -537,6 +596,25 @@ impl Command {
             ));
         }
 
+        let mut inherited_options = Vec::new();
+        for (scope_index, ancestor) in command_lineage
+            .iter()
+            .take(command_lineage.len().saturating_sub(1))
+            .enumerate()
+        {
+            for option in ancestor.options.iter().filter(|option| option.inherited) {
+                inherited_options.push(HelpInheritedOption {
+                    command_path: path[..=scope_index].to_vec(),
+                    command_id_path: command_id_path[..=scope_index].to_vec(),
+                    entry: HelpEntry::identified(
+                        &option.id,
+                        option_label(option),
+                        option_description(option),
+                    ),
+                });
+            }
+        }
+
         let option_groups = command
             .option_groups
             .iter()
@@ -567,6 +645,7 @@ impl Command {
             commands,
             arguments,
             options,
+            inherited_options,
             option_relations,
             option_groups,
             examples: command.examples.clone(),

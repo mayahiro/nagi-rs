@@ -51,12 +51,12 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-tui` | Terminal Presentation Rules、上限付きContentからNodeへのprojection、App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
 | `nagi-tui-widgets` | Public TUI APIから構築した27個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
-| `nagi-cli` | Command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、段階実行Runtime Policy、process統合 |
+| `nagi-cli` | Localと継承Option、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、段階実行Runtime Policy、process統合 |
 | `nagi-cli-test` | ProcessなしのCLI input注入とoutput取得 |
 
 [Nagi semantic specification](https://github.com/mayahiro/nagi/tree/main/spec)がGo実装と共有する挙動を定義します
 
-[Public CLI API guide](https://github.com/mayahiro/nagi/blob/main/docs/CLI_API_ja.md)ではcommand-local scope、Help presentation、structured validator、段階導入を説明します
+[Public CLI API guide](https://github.com/mayahiro/nagi/blob/main/docs/CLI_API_ja.md)では継承Option、command-local scope、Help presentation、structured validator、段階導入を説明します
 
 ## Application test
 
