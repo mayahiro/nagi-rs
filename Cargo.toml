@@ -2,6 +2,7 @@
 members = [
     "crates/nagi-cli",
     "crates/nagi-cli-completion",
+    "crates/nagi-cli-prompt",
     "crates/nagi-cli-test",
     "crates/nagi-content",
     "crates/nagi-tui",

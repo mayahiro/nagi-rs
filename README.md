@@ -55,6 +55,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
 | `nagi-cli` | Local and inherited options, command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, handler-free completion resolution, staged Runtime Policy, and process integration |
 | `nagi-cli-completion` | Bash, Zsh, Fish, and PowerShell generators plus the reserved completion protocol |
+| `nagi-cli-prompt` | Optional line-oriented Confirm, Select, Input, and Secret prompts with injected I/O |
 | `nagi-cli-test` | Process-free CLI input injection and output capture |
 
 The [Nagi semantic specifications](https://github.com/mayahiro/nagi/tree/main/spec)
@@ -114,6 +115,7 @@ Run commands from the Rust repository root
 | [CLI subcommands](crates/nagi-cli/examples/subcommands/README.md) | `cargo run -p nagi-cli --example subcommands -- start -vv` |
 | [CLI staged adoption](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
+| [CLI lightweight prompts](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
 
 ## Limitations
 
@@ -162,9 +164,10 @@ wrapping. `ConfirmDialog` is the explicit-default two-action convenience
 
 CLI process integration supports Linux and macOS, preserves Unix argument
 values, and converts SIGINT into cooperative cancellation. Shell-specific
-generation is an optional crate, and applications own installation and dynamic
-candidate I/O. Configuration-file loading, interactive prompts, and TUI
-integration are not provided. The portable graph does not model arbitrary invocation grammars.
+generation and line-oriented Prompt are optional crates. Applications own
+completion installation, dynamic candidate I/O, credential handling, and
+approval policy. Configuration-file loading and CLI-to-TUI integration are not
+provided. The portable graph does not model arbitrary invocation grammars.
 Help-only Usage Variants can document validator-backed forms without changing
 parser semantics
 

@@ -53,6 +53,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
 | `nagi-cli` | Localと継承Option、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、handlerを含まないcompletion解決、段階実行Runtime Policy、process統合 |
 | `nagi-cli-completion` | Bash、Zsh、Fish、PowerShell generatorと予約済みcompletion protocol |
+| `nagi-cli-prompt` | 注入可能なI/Oを持つ任意の行指向Confirm、Select、Input、Secret |
 | `nagi-cli-test` | ProcessなしのCLI input注入とoutput取得 |
 
 [Nagi semantic specification](https://github.com/mayahiro/nagi/tree/main/spec)がGo実装と共有する挙動を定義します
@@ -102,6 +103,7 @@ Rust repository rootから実行します
 | [CLI subcommands](crates/nagi-cli/examples/subcommands/README.md) | `cargo run -p nagi-cli --example subcommands -- start -vv` |
 | [CLI段階導入](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
+| [CLI軽量prompt](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
 
 ## 制約
 
@@ -121,7 +123,17 @@ TUIのterminal inputとoutputはterminalへ接続されている必要があり�
 
 `Dialog`はapplication-defined action list、lazy controlled details、明示的なdefaultとcancel target、focus policy、Cell幅によるaction wrappingを構成します。`ConfirmDialog`はdefaultを明示する二action convenienceです
 
-CLI process統合はLinuxとmacOSへ対応し、Unix argument valueを保持してSIGINTを協調的cancellationへ変換します。Shell固有生成は任意crateであり、installationとdynamic candidate I/OはApplicationが所有します。設定file読み込み、interactive prompt、TUI統合は提供しません。Portable graphは任意のinvocation grammarを表現しません。Help-only Usage Variantはparser semanticsを変更せずにvalidatorで支えるformを記述できます
+CLI process統合はLinuxとmacOSへ対応し、Unix argument valueを保持してSIGINTを協調的cancellationへ変換します
+
+Shell固有生成と行指向Promptは任意crateです
+
+Completion installation、dynamic candidate I/O、credential管理、approval policyはApplicationが所有します
+
+設定file読み込みとCLIからTUIへの統合は提供しません
+
+Portable graphは任意のinvocation grammarを表現しません
+
+Help-only Usage Variantはparser semanticsを変更せずにvalidatorで支えるformを記述できます
 
 ## License
 
