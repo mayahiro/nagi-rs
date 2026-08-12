@@ -34,11 +34,13 @@ mod selectable_text;
 mod sparkline;
 mod spinner;
 mod split_pane;
+mod status_bar;
 mod suggestion_popup;
 mod table;
 mod tabs;
 mod text_area;
 mod text_area_history;
+mod toast;
 mod tree;
 mod tree_state;
 mod virtual_feed;
@@ -116,6 +118,7 @@ pub use selectable_text::{
 pub use sparkline::Sparkline;
 pub use spinner::{SPINNER_FRAMES, Spinner, SpinnerStyle};
 pub use split_pane::{SPLIT_PANE_RATIO_SCALE, SplitPane, SplitPaneState, SplitPaneStyle};
+pub use status_bar::{StatusBar, StatusBarPriority, StatusBarSlot};
 pub use suggestion_popup::{
     DuplicateSuggestionId, SuggestionId, SuggestionItems, SuggestionPopup, SuggestionPopupStatus,
     SuggestionPopupStyle, SuggestionRowContext,
@@ -124,6 +127,7 @@ pub use table::{Table, TableColumn, TableRow, TableStyle};
 pub use tabs::{TabItem, Tabs, TabsStyle};
 pub use text_area::{TextArea, TextAreaBoundaryNavigation, TextAreaState, TextAreaStyle};
 pub use text_area_history::TextAreaHistory;
+pub use toast::{Toast, ToastPlacement, ToastRegion, ToastStyle, ToastTone};
 pub use tree::{Tree, TreeItem, TreeStyle};
 pub use tree_state::TreeState;
 pub use virtual_feed::VirtualFeed;

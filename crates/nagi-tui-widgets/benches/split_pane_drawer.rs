@@ -3,8 +3,11 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use nagi_tui::{Length, Node};
-use nagi_tui_widgets::{Drawer, DrawerSide, SplitPane, SplitPaneState};
+use nagi_tui::{Length, Node, ResponsiveRowPlacement};
+use nagi_tui_widgets::{
+    Drawer, DrawerSide, SplitPane, SplitPaneState, StatusBar, StatusBarPriority, StatusBarSlot,
+    Toast, ToastRegion, ToastTone,
+};
 
 const SAMPLE_COUNT: usize = 12;
 const CALLS_PER_SAMPLE: usize = 10_000;
@@ -68,6 +71,33 @@ fn main() {
                 .size(Length::Fixed(5))
                 .body(|| Node::text("details"))
                 .on_dismiss(|| ())
+                .into_node()
+        }),
+    );
+    report(
+        "status-bar-three-slots",
+        samples(|| {
+            StatusBar::new([
+                StatusBarSlot::new(Node::text("connected")).priority(StatusBarPriority::High),
+                StatusBarSlot::new(Node::text("running"))
+                    .placement(ResponsiveRowPlacement::Center)
+                    .priority(StatusBarPriority::Critical),
+                StatusBarSlot::new(Node::text("usage 42%")).placement(ResponsiveRowPlacement::End),
+            ])
+            .into_node()
+        }),
+    );
+    report(
+        "toast-region-eight-records-three-visible",
+        samples(|| {
+            let toasts = (0..8).map(|index| {
+                Toast::new(format!("toast-{index}"), move || {
+                    Node::text(index.to_string())
+                })
+                .tone(ToastTone::Info)
+            });
+            ToastRegion::new(Node::text("base"), toasts)
+                .visible_limit(3)
                 .into_node()
         }),
     );

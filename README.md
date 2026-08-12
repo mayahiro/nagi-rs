@@ -195,6 +195,12 @@ places it at a viewport edge, and reuses Core Modal focus and routing by
 default. Applications own open-state persistence, outside-click behavior, and
 the meaning of drawer content
 
+`StatusBar` composes arbitrary one-row slots through Core `ResponsiveRow`,
+which retains higher-priority start, center, or end items before semantic
+indexing. `ToastRegion` overlays only the newest configured number of lazy
+`Toast` bodies. Applications own notification records and may pair an After
+Effect with stable identity or a generation for stale-safe expiry
+
 `Disclosure` keeps expanded state in the application and constructs its body
 only while expanded. Core Modal scopes focus their first descendant on entry
 and return to previous focus on close by default; both targets are configurable.

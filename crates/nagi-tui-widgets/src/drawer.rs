@@ -164,7 +164,7 @@ impl<Message: 'static> Drawer<Message> {
             DrawerSide::Top => Node::column([drawer, filler]),
             DrawerSide::Bottom => Node::column([filler, drawer]),
         };
-        Node::stack([self.base, layer])
+        Node::overlay(self.base, layer)
     }
 }
 

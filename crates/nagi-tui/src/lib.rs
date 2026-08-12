@@ -20,6 +20,7 @@ mod node;
 mod panel;
 mod presentation;
 mod renderer;
+mod responsive_row;
 mod rich_text;
 mod routing;
 mod runtime;
@@ -89,6 +90,7 @@ pub use presentation::{
     PresentationDisplay, PresentationRule, PresentationSelector, PresentationSheet,
     PresentationState, TextStyleDeclaration,
 };
+pub use responsive_row::{ResponsiveRowItem, ResponsiveRowOptions, ResponsiveRowPlacement};
 pub use rich_text::{ParagraphOptions, TextSpan, WrapMode};
 pub use routing::{EventDispatch, EventResult, PointerEventContext, PointerViewport, TextHit};
 pub use runtime::{

@@ -12,6 +12,10 @@ use nagi_vt::Style;
 use crate::action_routing::{ActionIndex, NodeKeyInteraction};
 use crate::layout::{Track, add_size, allocate_into, horizontal_rect, inset, vertical_rect};
 use crate::panel::{BorderGlyphs, content_insets as panel_content_insets, glyphs as border_glyphs};
+use crate::responsive_row::{
+    INLINE_RESPONSIVE_ROW_ITEMS, ResolvedResponsiveRowLayout, ResponsiveRowItem,
+    ResponsiveRowMetric, ResponsiveRowOptions, resolve_responsive_row_layout,
+};
 use crate::rich_text::ParagraphLayoutCache;
 use crate::routing::{EventHandler, InteractiveKind, NodeRecord, PointerEventHandler, TreeIndex};
 use crate::split_pane::resolve_split_pane_layout;
@@ -244,12 +248,17 @@ enum NodeKind<Message> {
     },
     Row(LinearNode<Message>),
     Column(LinearNode<Message>),
+    ResponsiveRow(ResponsiveRowNode<Message>),
     SplitPane {
         primary: Box<Node<Message>>,
         secondary: Box<Node<Message>>,
         options: SplitPaneOptions,
     },
     Stack(Vec<Node<Message>>),
+    Overlay {
+        base: Box<Node<Message>>,
+        layer: Box<Node<Message>>,
+    },
     AnchoredOverlay {
         base: Box<Node<Message>>,
         anchor: NodeId,
@@ -331,6 +340,17 @@ struct AnchoredOverlayFrame {
 struct LinearNode<Message> {
     children: Vec<Node<Message>>,
     cache: RefCell<Option<Box<CachedLinearLayout>>>,
+}
+
+struct ResponsiveRowNode<Message> {
+    items: Vec<ResponsiveRowItem<Message>>,
+    options: ResponsiveRowOptions,
+    cache: RefCell<Option<Box<CachedResponsiveRowLayout>>>,
+}
+
+struct CachedResponsiveRowLayout {
+    rect: Rect,
+    layout: ResolvedResponsiveRowLayout,
 }
 
 impl<Message> LinearNode<Message> {
@@ -455,6 +475,24 @@ impl<Message> Node<Message> {
         Self::new(NodeKind::Column(LinearNode::new(children)))
     }
 
+    /// Creates a priority-aware three-region horizontal container
+    ///
+    /// Supplied item Nodes are eager. Items that do not fit the assigned width
+    /// are omitted from preparation, semantic indexing, hit testing, routing,
+    /// and rendering. Higher priorities are retained first and source order
+    /// breaks equal-priority ties
+    #[must_use]
+    pub fn responsive_row(
+        items: impl IntoIterator<Item = ResponsiveRowItem<Message>>,
+        options: ResponsiveRowOptions,
+    ) -> Self {
+        Self::new(NodeKind::ResponsiveRow(ResponsiveRowNode {
+            items: items.into_iter().collect(),
+            options,
+            cache: RefCell::new(None),
+        }))
+    }
+
     /// Creates a responsive two-pane container with a one-Cell divider
     ///
     /// Both supplied Nodes are eager, but only panes present in the resolved
@@ -474,6 +512,19 @@ impl<Message> Node<Message> {
     #[must_use]
     pub fn stack(children: impl IntoIterator<Item = Self>) -> Self {
         Self::new(NodeKind::Stack(children.into_iter().collect()))
+    }
+
+    /// Places a front layer over a base without adding the layer to measurement
+    ///
+    /// Both children receive the complete assigned rectangle. The base is
+    /// prepared, indexed, and rendered first, so the layer is topmost for
+    /// overlapping pointer hits
+    #[must_use]
+    pub fn overlay(base: Self, layer: Self) -> Self {
+        Self::new(NodeKind::Overlay {
+            base: Box::new(base),
+            layer: Box::new(layer),
+        })
     }
 
     /// Places a front layer relative to an identified descendant of `base`
@@ -934,6 +985,9 @@ impl<Message> Node<Message> {
             NodeKind::Column(linear) => {
                 measure_linear(&linear.children, constraints, false, profile)
             }
+            NodeKind::ResponsiveRow(responsive) => {
+                measure_responsive_row(responsive, constraints, profile)
+            }
             NodeKind::SplitPane {
                 primary,
                 secondary,
@@ -943,6 +997,7 @@ impl<Message> Node<Message> {
                 let child = child.measure(constraints, profile);
                 Size::new(size.width.max(child.width), size.height.max(child.height))
             }),
+            NodeKind::Overlay { base, .. } => base.measure(constraints, profile),
             NodeKind::AnchoredOverlay { base, .. } => base.measure(constraints, profile),
             NodeKind::Padding { insets, child } => add_size(
                 child.measure(shrink_constraints(constraints, *insets), profile),
@@ -1020,6 +1075,15 @@ impl<Message> Node<Message> {
             NodeKind::Column(linear) => {
                 render_linear(surface, rect, clip, linear, false, interaction, profile)
             }
+            NodeKind::ResponsiveRow(responsive) => {
+                let layout = responsive.layout(rect, profile);
+                for (item, item_rect) in responsive.items.iter().zip(layout.as_slice()) {
+                    if let Some(item_rect) = item_rect {
+                        item.node
+                            .render(surface, *item_rect, clip, interaction, profile);
+                    }
+                }
+            }
             NodeKind::SplitPane {
                 primary,
                 secondary,
@@ -1038,6 +1102,10 @@ impl<Message> Node<Message> {
                 for child in children {
                     child.render(surface, rect, clip, interaction, profile);
                 }
+            }
+            NodeKind::Overlay { base, layer } => {
+                base.render(surface, rect, clip, interaction, profile);
+                layer.render(surface, rect, clip, interaction, profile);
             }
             NodeKind::AnchoredOverlay {
                 base,
@@ -1315,6 +1383,10 @@ impl<Message> Node<Message> {
                 .children
                 .iter()
                 .find_map(|child| child.visit(id, operation)),
+            NodeKind::ResponsiveRow(responsive) => responsive
+                .items
+                .iter()
+                .find_map(|item| item.node.visit(id, operation)),
             NodeKind::SplitPane {
                 primary, secondary, ..
             } => primary
@@ -1323,6 +1395,9 @@ impl<Message> Node<Message> {
             NodeKind::Stack(children) => {
                 children.iter().find_map(|child| child.visit(id, operation))
             }
+            NodeKind::Overlay { base, layer } => base
+                .visit(id, operation)
+                .or_else(|| layer.visit(id, operation)),
             NodeKind::AnchoredOverlay { base, overlay, .. } => base
                 .visit(id, operation)
                 .or_else(|| overlay.visit(id, operation)),
@@ -1380,6 +1455,19 @@ impl<Message> Node<Message> {
                 .find_map(|(child, child_rect)| {
                     child.find_node_geometry(id, child_rect, clip, interaction, profile)
                 }),
+            NodeKind::ResponsiveRow(responsive) => {
+                let layout = responsive.layout(rect, profile);
+                responsive
+                    .items
+                    .iter()
+                    .zip(layout.as_slice())
+                    .find_map(|(item, item_rect)| {
+                        item_rect.and_then(|item_rect| {
+                            item.node
+                                .find_node_geometry(id, item_rect, clip, interaction, profile)
+                        })
+                    })
+            }
             NodeKind::SplitPane {
                 primary,
                 secondary,
@@ -1408,6 +1496,9 @@ impl<Message> Node<Message> {
             NodeKind::Stack(children) => children
                 .iter()
                 .find_map(|child| child.find_node_geometry(id, rect, clip, interaction, profile)),
+            NodeKind::Overlay { base, layer } => base
+                .find_node_geometry(id, rect, clip, interaction, profile)
+                .or_else(|| layer.find_node_geometry(id, rect, clip, interaction, profile)),
             NodeKind::AnchoredOverlay {
                 base,
                 anchor,
@@ -1648,6 +1739,24 @@ impl<Message> Node<Message> {
                     )?;
                 }
             }
+            NodeKind::ResponsiveRow(responsive) => {
+                let layout = responsive.layout(rect, profile);
+                for (item, item_rect) in responsive.items.iter().zip(layout.as_slice()) {
+                    if let Some(item_rect) = item_rect {
+                        item.node.build_index(
+                            *item_rect,
+                            clip,
+                            parent,
+                            false,
+                            focus_fallback,
+                            interaction,
+                            index,
+                            actions,
+                            profile,
+                        )?;
+                    }
+                }
+            }
             NodeKind::SplitPane {
                 primary,
                 secondary,
@@ -1695,6 +1804,30 @@ impl<Message> Node<Message> {
                         profile,
                     )?;
                 }
+            }
+            NodeKind::Overlay { base, layer } => {
+                base.build_index(
+                    rect,
+                    clip,
+                    parent,
+                    false,
+                    focus_fallback,
+                    interaction,
+                    index,
+                    actions,
+                    profile,
+                )?;
+                layer.build_index(
+                    rect,
+                    clip,
+                    parent,
+                    false,
+                    focus_fallback,
+                    interaction,
+                    index,
+                    actions,
+                    profile,
+                )?;
             }
             NodeKind::AnchoredOverlay {
                 base,
@@ -1915,6 +2048,15 @@ impl<Message> Node<Message> {
                     child.prepare_virtual_flows_at(child_rect, interaction, profile);
                 }
             }
+            NodeKind::ResponsiveRow(responsive) => {
+                let layout = responsive.layout(rect, profile);
+                for (item, item_rect) in responsive.items.iter().zip(layout.as_slice()) {
+                    if let Some(item_rect) = item_rect {
+                        item.node
+                            .prepare_virtual_flows_at(*item_rect, interaction, profile);
+                    }
+                }
+            }
             NodeKind::SplitPane {
                 primary,
                 secondary,
@@ -1932,6 +2074,10 @@ impl<Message> Node<Message> {
                 for child in children {
                     child.prepare_virtual_flows_at(rect, interaction, profile);
                 }
+            }
+            NodeKind::Overlay { base, layer } => {
+                base.prepare_virtual_flows_at(rect, interaction, profile);
+                layer.prepare_virtual_flows_at(rect, interaction, profile);
             }
             NodeKind::AnchoredOverlay {
                 base,
@@ -2141,6 +2287,16 @@ impl<Message> Node<Message> {
                 }
                 changed
             }
+            NodeKind::ResponsiveRow(responsive) => {
+                let layout = responsive.layout(rect, profile);
+                let mut changed = false;
+                for (item, item_rect) in responsive.items.iter().zip(layout.as_slice()) {
+                    if let Some(item_rect) = item_rect {
+                        changed |= item.node.prepare_at(*item_rect, interaction, profile);
+                    }
+                }
+                changed
+            }
             NodeKind::SplitPane {
                 primary,
                 secondary,
@@ -2162,6 +2318,10 @@ impl<Message> Node<Message> {
                     changed |= child.prepare_at(rect, interaction, profile);
                 }
                 changed
+            }
+            NodeKind::Overlay { base, layer } => {
+                base.prepare_at(rect, interaction, profile)
+                    | layer.prepare_at(rect, interaction, profile)
             }
             NodeKind::AnchoredOverlay {
                 base,
@@ -2615,6 +2775,94 @@ fn render_linear<Message>(
     let layout = linear.layout(rect, horizontal, profile);
     for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
         child.render(surface, child_rect, clip, interaction, profile);
+    }
+}
+
+fn measure_responsive_row<Message>(
+    responsive: &ResponsiveRowNode<Message>,
+    constraints: Constraints,
+    profile: WidthProfile<'static>,
+) -> Size {
+    let height = match (responsive.options.height, constraints.height) {
+        (0, limit) => limit,
+        (height, Limit::Unbounded) => Limit::Bounded(height),
+        (height, Limit::Bounded(limit)) => Limit::Bounded(height.min(limit)),
+    };
+    let child_constraints = Constraints {
+        width: Limit::Unbounded,
+        height,
+    };
+    let mut measured = Size::default();
+    for item in &responsive.items {
+        let child = item.node.measure(child_constraints, profile);
+        measured.width = measured.width.saturating_add(child.width.max(1));
+        measured.height = measured.height.max(child.height);
+    }
+    measured.width = measured.width.saturating_add(
+        responsive
+            .options
+            .gap
+            .saturating_mul(responsive.items.len().saturating_sub(1) as u32),
+    );
+    if responsive.options.height != 0 {
+        measured.height = responsive.options.height;
+    }
+    measured
+}
+
+impl<Message> ResponsiveRowNode<Message> {
+    fn layout(
+        &self,
+        rect: Rect,
+        profile: WidthProfile<'static>,
+    ) -> Ref<'_, ResolvedResponsiveRowLayout> {
+        let rebuild = self
+            .cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|cached| cached.rect != rect);
+        if rebuild {
+            let layout_rect = Rect::new(
+                rect.x,
+                rect.y,
+                rect.width,
+                if self.options.height == 0 {
+                    rect.height
+                } else {
+                    rect.height.min(self.options.height)
+                },
+            );
+            let constraints = Constraints {
+                width: Limit::Unbounded,
+                height: Limit::Bounded(layout_rect.height),
+            };
+            let mut inline_metrics = [ResponsiveRowMetric::default(); INLINE_RESPONSIVE_ROW_ITEMS];
+            let mut overflow_metrics = if self.items.len() > INLINE_RESPONSIVE_ROW_ITEMS {
+                vec![ResponsiveRowMetric::default(); self.items.len()]
+            } else {
+                Vec::new()
+            };
+            let metrics = if overflow_metrics.is_empty() {
+                &mut inline_metrics[..self.items.len()]
+            } else {
+                overflow_metrics.as_mut_slice()
+            };
+            for (metric, item) in metrics.iter_mut().zip(&self.items) {
+                *metric = ResponsiveRowMetric {
+                    placement: item.placement,
+                    priority: item.priority,
+                    desired_width: item.node.measure(constraints, profile).width.max(1),
+                };
+            }
+            let layout = resolve_responsive_row_layout(layout_rect, metrics, self.options.gap);
+            *self.cache.borrow_mut() = Some(Box::new(CachedResponsiveRowLayout { rect, layout }));
+        }
+        Ref::map(self.cache.borrow(), |cached| {
+            &cached
+                .as_ref()
+                .expect("responsive row layout cache is initialized")
+                .layout
+        })
     }
 }
 
