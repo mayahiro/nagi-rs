@@ -4,6 +4,7 @@ bench:
 	cargo bench -p nagi-tui --bench scroll_viewport
 	cargo bench -p nagi-tui --bench content_projection
 	cargo bench -p nagi-cli --bench inherited_options
+	cargo bench -p nagi-cli --bench completion
 
 build:
 	cargo build --workspace --all-targets

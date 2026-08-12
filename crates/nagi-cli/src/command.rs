@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
+use crate::completion::CompletionProvider;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, display_os};
 use crate::help::{HelpBlock, HelpExample, HelpLink, HelpSection, UsageVariantDefinition};
 use crate::parser::Invocation;
@@ -63,6 +64,7 @@ pub struct OptionSpec {
     pub(crate) default: Option<OsString>,
     pub(crate) requires: Vec<OptionRelation>,
     pub(crate) conflicts: Vec<OptionRelation>,
+    pub(crate) completion_provider: Option<Arc<dyn CompletionProvider>>,
 }
 
 impl OptionSpec {
@@ -96,6 +98,7 @@ impl OptionSpec {
             default: None,
             requires: Vec::new(),
             conflicts: Vec::new(),
+            completion_provider: None,
         }
     }
 
@@ -142,6 +145,18 @@ impl OptionSpec {
     /// Sets the typed parser used by a Value option
     pub fn parser(mut self, parser: Arc<dyn ValueParser>) -> Self {
         self.parser = parser;
+        self
+    }
+
+    /// Sets the dynamic completion provider for this Value option
+    ///
+    /// The provider is only called while this option's value is the active
+    /// completion target. Parsing and handler execution never call it
+    pub fn completion_provider<P>(mut self, provider: P) -> Self
+    where
+        P: CompletionProvider + 'static,
+    {
+        self.completion_provider = Some(Arc::new(provider));
         self
     }
 
@@ -217,6 +232,7 @@ pub struct Argument {
     pub(crate) help: String,
     pub(crate) required: bool,
     pub(crate) repeated: bool,
+    pub(crate) completion_provider: Option<Arc<dyn CompletionProvider>>,
 }
 
 impl Argument {
@@ -228,12 +244,25 @@ impl Argument {
             help: String::new(),
             required: false,
             repeated: false,
+            completion_provider: None,
         }
     }
 
     /// Sets the typed parser
     pub fn parser(mut self, parser: Arc<dyn ValueParser>) -> Self {
         self.parser = parser;
+        self
+    }
+
+    /// Sets the dynamic completion provider for this positional argument
+    ///
+    /// The provider is only called while this argument is the active
+    /// completion target. Parsing and handler execution never call it
+    pub fn completion_provider<P>(mut self, provider: P) -> Self
+    where
+        P: CompletionProvider + 'static,
+    {
+        self.completion_provider = Some(Arc::new(provider));
         self
     }
 
@@ -709,7 +738,10 @@ fn validate_command(
             }
         }
         if option.kind != OptionKind::Value
-            && (option.repeated || option.environment.is_some() || option.default.is_some())
+            && (option.repeated
+                || option.environment.is_some()
+                || option.default.is_some()
+                || option.completion_provider.is_some())
         {
             return invalid(format!(
                 "non-value option '{}' has value-only configuration",

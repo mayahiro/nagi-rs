@@ -17,6 +17,11 @@
 //! [`Diagnostic`] with application codes, option or argument targets, and
 //! remediation hints
 //!
+//! [`CompletionEngine`] snapshots the validated graph without handlers and
+//! resolves static candidates plus only the active Option or Argument
+//! [`CompletionProvider`]. Shell-specific generation remains in the optional
+//! `nagi-cli-completion` crate
+//!
 //! [`Command::parse`], [`Command::run_parsed_with_policy`],
 //! [`Command::run_invocation_with_policy`], and the pure [`RuntimePolicy`]
 //! helpers support command-by-command adoption in an existing CLI.
@@ -26,6 +31,7 @@
 #![deny(unsafe_code)]
 
 mod command;
+mod completion;
 mod diagnostic;
 mod help;
 mod parser;
@@ -38,6 +44,12 @@ mod value;
 pub use command::{
     Argument, Command, InvocationValidator, OptionGroup, OptionGroupKind, OptionKind, OptionSpec,
     PresenceBasis, SubcommandUsageMode,
+};
+pub use completion::{
+    CompletionCandidate, CompletionCandidateKind, CompletionEngine, CompletionError,
+    CompletionErrorKind, CompletionInput, CompletionOccurrence, CompletionOccurrenceKind,
+    CompletionProvider, CompletionProviderError, CompletionRequest, CompletionResult,
+    CompletionTarget, CompletionTargetKind,
 };
 pub use diagnostic::{
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticTarget, DiagnosticTargetKind,

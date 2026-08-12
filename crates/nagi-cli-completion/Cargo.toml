@@ -1,0 +1,16 @@
+[package]
+name = "nagi-cli-completion"
+description = "Shell completion generators and protocol adapter for Nagi CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[dependencies]
+nagi-cli = { path = "../nagi-cli", version = "0.2.7" }
