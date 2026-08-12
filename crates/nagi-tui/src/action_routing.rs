@@ -257,11 +257,9 @@ impl<Message> ResolvedActionRoute<Message> {
             return ActionMatch::None;
         };
         for (action, resolved) in group.actions.iter().zip(group.resolved.actions()) {
-            if !resolved
-                .bindings()
-                .iter()
-                .any(|binding| binding.matches(event))
-            {
+            if !resolved.bindings().iter().any(|binding| {
+                binding_matches_availability(*binding, event, resolved.availability())
+            }) {
                 continue;
             }
             return match resolved.availability() {
@@ -285,11 +283,9 @@ impl<Message> ResolvedActionRoute<Message> {
             return CoreActionMatch::None;
         };
         for (action, resolved) in group.actions.iter().zip(group.resolved.actions()) {
-            if !resolved
-                .bindings()
-                .iter()
-                .any(|binding| binding.matches(event))
-            {
+            if !resolved.bindings().iter().any(|binding| {
+                binding_matches_availability(*binding, event, resolved.availability())
+            }) {
                 continue;
             }
             return match resolved.availability() {
@@ -312,6 +308,18 @@ impl<Message> ResolvedActionRoute<Message> {
             }
         }
         resolved
+    }
+}
+
+fn binding_matches_availability(
+    binding: crate::KeyBinding,
+    event: &Event,
+    availability: crate::ActionAvailability,
+) -> bool {
+    if availability == crate::ActionAvailability::DisabledConsume {
+        binding.matches_stroke(event)
+    } else {
+        binding.matches(event)
     }
 }
 

@@ -1,10 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 use std::time::Duration;
 
 use crate::effect::{EffectKind, RuntimeCommand, Task};
+use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeKind, RuntimeNoticeQueue};
 use crate::wake::WakeHandle;
 use crate::{CancelToken, Effect, ScopeId, TaskKey, Timestamp};
 
@@ -119,6 +121,7 @@ pub(crate) struct EffectSupervisor<Message> {
     next_identifier: u64,
     next_order: u64,
     diagnostics: EffectDiagnostics,
+    notices: Option<Arc<RuntimeNoticeQueue>>,
 }
 
 impl<Message: Send + 'static> EffectSupervisor<Message> {
@@ -143,11 +146,16 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             next_identifier: 1,
             next_order: 0,
             diagnostics: EffectDiagnostics::default(),
+            notices: None,
         }
     }
 
     pub(crate) fn set_wake(&mut self, wake: WakeHandle) {
         self.wake = wake;
+    }
+
+    pub(crate) fn set_notices(&mut self, notices: Arc<RuntimeNoticeQueue>) {
+        self.notices = Some(notices);
     }
 
     pub(crate) fn schedule(&mut self, effect: Effect<Message>, now: Timestamp) {
@@ -406,6 +414,12 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             }
             TaskResult::Panicked => {
                 self.diagnostics.task_panics = self.diagnostics.task_panics.saturating_add(1);
+                if let Some(notices) = &self.notices {
+                    notices.push(RuntimeNotice::effect(
+                        RuntimeNoticeKind::EffectPanicked,
+                        state.latest.as_ref(),
+                    ));
+                }
             }
         }
         if let Some(continuation) = state.continuation.take() {
@@ -418,6 +432,12 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
         let Some(mut state) = self.tasks.remove(&id) else {
             return;
         };
+        if let Some(notices) = &self.notices {
+            notices.push(RuntimeNotice::effect(
+                RuntimeNoticeKind::EffectSpawnFailed,
+                state.latest.as_ref(),
+            ));
+        }
         if matches!(state.status, TaskStatus::Running) {
             self.running = self.running.saturating_sub(1);
         }

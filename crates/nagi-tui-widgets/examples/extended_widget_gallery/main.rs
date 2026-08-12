@@ -167,7 +167,7 @@ impl App for Gallery {
         .with_length(Length::Fixed(1));
 
         let page = match self.page {
-            0 => self.inputs_page(context.size.width.saturating_sub(4).max(1)),
+            0 => self.inputs_page(context),
             1 => self.data_page(),
             _ => self.commands_page(),
         };
@@ -209,6 +209,7 @@ impl App for Gallery {
         ))
         .default_action("dialog-cancel")
         .cancel_action("dialog-cancel")
+        .width_profile(context.width_profile)
         .action_wrap_width(context.size.width.saturating_sub(4).max(1))
         .into_node();
         Node::stack([content, dialog])
@@ -216,7 +217,8 @@ impl App for Gallery {
 }
 
 impl Gallery {
-    fn inputs_page(&self, composer_width: u32) -> Node<Message> {
+    fn inputs_page(&self, context: nagi_tui::ViewContext) -> Node<Message> {
+        let composer_width = context.size.width.saturating_sub(4).max(1);
         let composer_valid = !self.composer.text_area().value().trim().is_empty();
         let mut composer = Composer::new(
             "composer",
@@ -227,6 +229,7 @@ impl Gallery {
             || Message::SubmitComposer,
         )
         .placeholder("Enter a message")
+        .width_profile(context.width_profile)
         .soft_wrap(composer_width)
         .rows(1, 3)
         .history(self.composer_history.clone())
@@ -265,6 +268,7 @@ impl Gallery {
             Node::border(
                 TextArea::new("notes", self.notes.clone(), Message::EditNotes)
                     .placeholder("Enter notes")
+                    .width_profile(context.width_profile)
                     .into_node(),
                 Style::default(),
             ),

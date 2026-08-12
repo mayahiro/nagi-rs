@@ -60,7 +60,7 @@ impl App for FilteredList {
         Effect::none()
     }
 
-    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+    fn view(&self, context: nagi_tui::ViewContext) -> Node<Self::Message> {
         let items = PACKAGES
             .iter()
             .enumerate()
@@ -116,6 +116,7 @@ impl App for FilteredList {
                     HelpBinding::new("Left/Right", "page"),
                     HelpBinding::new("Esc", "exit"),
                 ])
+                .width_profile(context.width_profile)
                 .into_node()
                 .with_length(Length::Fixed(1)),
             ]),

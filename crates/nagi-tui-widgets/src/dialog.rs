@@ -78,8 +78,8 @@ impl<Message: 'static> DialogAction<Message> {
         self.enabled
     }
 
-    fn button_width(&self) -> u32 {
-        u32::try_from(text_width(&self.label, WidthProfile::MODERN))
+    fn button_width(&self, profile: WidthProfile<'static>) -> u32 {
+        u32::try_from(text_width(&self.label, profile))
             .unwrap_or(u32::MAX)
             .saturating_add(4)
     }
@@ -110,6 +110,7 @@ pub struct Dialog<Message> {
     return_focus: ModalReturnFocus,
     action_wrap_width: Option<u32>,
     style: DialogStyle,
+    width_profile: WidthProfile<'static>,
 }
 
 impl<Message: 'static> Dialog<Message> {
@@ -132,6 +133,7 @@ impl<Message: 'static> Dialog<Message> {
             return_focus: ModalReturnFocus::Previous,
             action_wrap_width: None,
             style: DialogStyle::default(),
+            width_profile: WidthProfile::MODERN,
         }
     }
 
@@ -197,6 +199,15 @@ impl<Message: 'static> Dialog<Message> {
         self
     }
 
+    /// Sets the terminal cell-width policy used to arrange actions
+    ///
+    /// Pass `ViewContext::width_profile` to keep the widget aligned with its Runtime
+    #[must_use]
+    pub const fn width_profile(mut self, profile: WidthProfile<'static>) -> Self {
+        self.width_profile = profile;
+        self
+    }
+
     /// Returns confirmation and dismissal descriptors in semantic order
     #[must_use]
     pub fn action_descriptors(&self) -> [ActionDescriptor; 2] {
@@ -235,7 +246,11 @@ impl<Message: 'static> Dialog<Message> {
             children.push(details.into_node());
         }
         if !self.actions.is_empty() {
-            children.push(dialog_action_rows(self.actions, self.action_wrap_width));
+            children.push(dialog_action_rows(
+                self.actions,
+                self.action_wrap_width,
+                self.width_profile,
+            ));
         }
 
         let panel = Node::border(Node::column(children), self.style.border);
@@ -382,6 +397,15 @@ impl<Message: 'static> ConfirmDialog<Message> {
         self
     }
 
+    /// Sets the terminal cell-width policy used to arrange actions
+    ///
+    /// Pass `ViewContext::width_profile` to keep the widget aligned with its Runtime
+    #[must_use]
+    pub fn width_profile(mut self, profile: WidthProfile<'static>) -> Self {
+        self.dialog = self.dialog.width_profile(profile);
+        self
+    }
+
     /// Returns confirmation and dismissal descriptors in semantic order
     #[must_use]
     pub fn action_descriptors(&self) -> [ActionDescriptor; 2] {
@@ -398,13 +422,14 @@ impl<Message: 'static> ConfirmDialog<Message> {
 fn dialog_action_rows<Message: 'static>(
     actions: Vec<DialogAction<Message>>,
     wrap_width: Option<u32>,
+    profile: WidthProfile<'static>,
 ) -> Node<Message> {
     let mut rows = Vec::new();
     let mut row = Vec::new();
     let mut used = 0_u32;
 
     for action in actions {
-        let width = action.button_width();
+        let width = action.button_width(profile);
         let required = if row.is_empty() {
             width
         } else {

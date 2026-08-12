@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeKind, RuntimeNoticeQueue};
 use crate::subscription::{
     BufferedSubscriptionMessage, DeliveryKind, DeliveryPolicy, SubscriptionAtomicDiagnostics,
     SubscriptionInbox, SubscriptionKind, SubscriptionProducer, SubscriptionSource,
@@ -136,6 +137,7 @@ pub(crate) struct SubscriptionSupervisor<Message> {
     stops: u64,
     batch_flushes: u64,
     spawn_failures: u64,
+    notices: Option<Arc<RuntimeNoticeQueue>>,
 }
 
 impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
@@ -152,11 +154,16 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             stops: 0,
             batch_flushes: 0,
             spawn_failures: 0,
+            notices: None,
         }
     }
 
     pub(crate) fn set_wake(&mut self, wake: WakeHandle) {
         self.wake = wake;
+    }
+
+    pub(crate) fn set_notices(&mut self, notices: Arc<RuntimeNoticeQueue>) {
+        self.notices = Some(notices);
     }
 
     pub(crate) fn reconcile(
@@ -366,23 +373,59 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             SubscriptionProducer::Stream(producer) => {
                 let token = CancelToken::default();
                 let worker_token = token.clone();
+                let completion_token = worker_token.clone();
                 let sink = SubscriptionSink {
                     inbox: Arc::clone(&inbox),
                 };
+                let completion_sink = sink.clone();
                 let finished = Arc::new(AtomicBool::new(false));
                 let worker_finished = Arc::clone(&finished);
                 let diagnostics = Arc::clone(&self.atomic_diagnostics);
+                let notices = self.notices.clone();
+                let worker_key = source.key.clone();
+                let wake = self.wake.clone();
                 let spawn = thread::Builder::new()
                     .name(format!("nagi-tui-subscription-{}", source.key))
                     .spawn(move || {
-                        if catch_unwind(AssertUnwindSafe(|| producer(worker_token, sink))).is_err()
-                        {
-                            diagnostics.producer_panics.fetch_add(1, Ordering::Relaxed);
+                        let outcome =
+                            catch_unwind(AssertUnwindSafe(|| producer(worker_token, sink)));
+                        match outcome {
+                            Err(_) => {
+                                diagnostics.producer_panics.fetch_add(1, Ordering::Relaxed);
+                                if let Some(notices) = &notices {
+                                    notices.push(RuntimeNotice::subscription_stream(
+                                        RuntimeNoticeKind::SubscriptionStreamPanicked,
+                                        worker_key,
+                                        generation,
+                                    ));
+                                }
+                            }
+                            Ok(())
+                                if !completion_token.is_cancelled()
+                                    && !completion_sink.is_closed() =>
+                            {
+                                if let Some(notices) = &notices {
+                                    notices.push(RuntimeNotice::subscription_stream(
+                                        RuntimeNoticeKind::SubscriptionStreamCompleted,
+                                        worker_key,
+                                        generation,
+                                    ));
+                                }
+                            }
+                            Ok(()) => {}
                         }
                         worker_finished.store(true, Ordering::Release);
+                        wake.notify();
                     });
                 if spawn.is_err() {
                     self.spawn_failures = self.spawn_failures.saturating_add(1);
+                    if let Some(notices) = &self.notices {
+                        notices.push(RuntimeNotice::subscription_stream(
+                            RuntimeNoticeKind::SubscriptionSpawnFailed,
+                            source.key.clone(),
+                            generation,
+                        ));
+                    }
                     finished.store(true, Ordering::Release);
                 }
                 ActiveProducer::Stream { token, finished }
@@ -931,6 +974,45 @@ mod tests {
         assert_eq!(supervisor.running_streams(), 0);
         assert_eq!(supervisor.active_subscriptions(), 1);
         assert_eq!(supervisor.diagnostics().producer_panics(), 1);
+    }
+
+    #[test]
+    fn cancelled_stream_does_not_report_completion() {
+        let notices = Arc::new(RuntimeNoticeQueue::new(4));
+        let mut supervisor = SubscriptionSupervisor::<String>::new(1);
+        supervisor.set_notices(Arc::clone(&notices));
+        let (started_sender, started) = sync_channel(1);
+        supervisor
+            .reconcile(
+                Subscription::stream("events", DeliveryPolicy::reliable(), move |_token, sink| {
+                    started_sender.send(()).unwrap();
+                    sink.wait_closed();
+                }),
+                Timestamp::default(),
+            )
+            .unwrap();
+        started.recv().unwrap();
+        let finished = match &supervisor
+            .active
+            .get(&SubscriptionKey::from("events"))
+            .unwrap()
+            .producer
+        {
+            ActiveProducer::Stream { finished, .. } => Arc::clone(finished),
+            ActiveProducer::Every { .. } => panic!("expected Stream"),
+        };
+
+        supervisor
+            .reconcile(Subscription::none(), Timestamp::default())
+            .unwrap();
+        for _ in 0..10_000 {
+            if finished.load(Ordering::Acquire) {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(notices.pending(), 0);
     }
 
     #[test]

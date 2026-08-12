@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 
 use nagi_text::{
     WidthProfile, cell_at_byte, grapheme_boundaries, grapheme_width, graphemes,
-    next_grapheme_boundary, previous_grapheme_boundary, truncate,
+    next_grapheme_boundary, previous_grapheme_boundary, text_width, truncate,
 };
 use nagi_tui::{
     Action, ActionAvailability, ActionDescriptor, Event, EventResult, KeyBinding, KeyCode,
@@ -143,8 +143,6 @@ pub enum TextAreaBoundaryNavigation {
 pub struct TextAreaStyle {
     /// Style used by editable text
     pub normal: Style,
-    /// Style used by the visible cursor marker
-    pub cursor: Style,
     /// Style used by placeholder text
     pub placeholder: Style,
     /// Style merged over the area while it owns focus
@@ -157,10 +155,6 @@ impl Default for TextAreaStyle {
     fn default() -> Self {
         Self {
             normal: Style::default(),
-            cursor: Style {
-                reverse: true,
-                ..Style::default()
-            },
             placeholder: Style {
                 dim: true,
                 ..Style::default()
@@ -189,6 +183,7 @@ pub struct TextArea<Message> {
     enabled: bool,
     style: TextAreaStyle,
     selection_style: Style,
+    width_profile: WidthProfile<'static>,
     wrap_width: Option<usize>,
     boundary_navigation: TextAreaBoundaryNavigation,
     viewport: Option<TextAreaViewport>,
@@ -230,6 +225,7 @@ impl<Message: 'static> TextArea<Message> {
                 reverse: true,
                 ..Style::default()
             },
+            width_profile: WidthProfile::MODERN,
             wrap_width: None,
             boundary_navigation: TextAreaBoundaryNavigation::Consume,
             viewport: None,
@@ -264,6 +260,15 @@ impl<Message: 'static> TextArea<Message> {
     #[must_use]
     pub const fn selection_style(mut self, style: Style) -> Self {
         self.selection_style = style;
+        self
+    }
+
+    /// Sets the terminal cell-width policy used by editing and layout
+    ///
+    /// Pass `ViewContext::width_profile` to keep the widget aligned with its Runtime
+    #[must_use]
+    pub const fn width_profile(mut self, profile: WidthProfile<'static>) -> Self {
+        self.width_profile = profile;
         self
     }
 
@@ -340,6 +345,7 @@ impl<Message: 'static> TextArea<Message> {
             self.boundary_navigation,
             &self.state,
             self.wrap_width,
+            self.width_profile,
         )
     }
 
@@ -359,12 +365,16 @@ impl<Message: 'static> TextArea<Message> {
         let caret_id = self.viewport.as_ref().map(|viewport| &viewport.caret_id);
         let content = text_area_content(
             &self.state,
-            &self.placeholder,
-            self.enabled,
-            self.style,
-            self.selection_style,
-            self.wrap_width,
-            caret_id,
+            TextAreaContentRender {
+                placeholder: &self.placeholder,
+                enabled: self.enabled,
+                style: self.style,
+                selection_style: self.selection_style,
+                wrap_width: self.wrap_width,
+                focus_owner: &self.id,
+                caret_id,
+                width_profile: self.width_profile,
+            },
         );
         if !self.enabled {
             let id = self.id;
@@ -383,6 +393,7 @@ impl<Message: 'static> TextArea<Message> {
             id: id.clone(),
             state: self.state,
             wrap_width: self.wrap_width,
+            width_profile: self.width_profile,
             on_change: self.on_change,
             on_undo: self.on_undo,
             on_redo: self.on_redo,
@@ -616,9 +627,10 @@ pub(crate) fn text_area_action_descriptors(
     boundary_navigation: TextAreaBoundaryNavigation,
     state: &TextAreaState,
     wrap_width: Option<usize>,
+    profile: WidthProfile<'static>,
 ) -> [ActionDescriptor; TEXT_AREA_ACTION_COUNT] {
     let (has_up, has_down) = if boundary_navigation == TextAreaBoundaryNavigation::Bubble {
-        visual_line_directions(state, wrap_width)
+        visual_line_directions(state, wrap_width, profile)
     } else {
         (true, true)
     };
@@ -649,6 +661,7 @@ struct TextAreaActionContext<Message> {
     id: NodeId,
     state: TextAreaState,
     wrap_width: Option<usize>,
+    width_profile: WidthProfile<'static>,
     on_change: Arc<dyn Fn(TextAreaState) -> Message>,
     on_undo: Option<Arc<dyn Fn() -> Message>>,
     on_redo: Option<Arc<dyn Fn() -> Message>>,
@@ -705,7 +718,12 @@ fn text_area_action_result<Message>(
         }
         _ => {}
     }
-    let next = text_area_state_for_action(&context.state, action, context.wrap_width);
+    let next = text_area_state_for_action(
+        &context.state,
+        action,
+        context.wrap_width,
+        context.width_profile,
+    );
     text_area_change_result(context, next)
 }
 
@@ -725,15 +743,16 @@ fn text_area_state_for_action(
     state: &TextAreaState,
     action: TextAreaSemanticAction,
     wrap_width: Option<usize>,
+    profile: WidthProfile<'static>,
 ) -> TextAreaState {
     match action {
         TextAreaSemanticAction::CursorLeft => apply_movement(state, TextAreaEdit::Left, false),
         TextAreaSemanticAction::CursorRight => apply_movement(state, TextAreaEdit::Right, false),
         TextAreaSemanticAction::CursorUp => {
-            apply_vertical_movement(state, false, false, wrap_width)
+            apply_vertical_movement(state, false, false, wrap_width, profile)
         }
         TextAreaSemanticAction::CursorDown => {
-            apply_vertical_movement(state, true, false, wrap_width)
+            apply_vertical_movement(state, true, false, wrap_width, profile)
         }
         TextAreaSemanticAction::CursorLineStart => apply_movement(state, TextAreaEdit::Home, false),
         TextAreaSemanticAction::CursorLineEnd => apply_movement(state, TextAreaEdit::End, false),
@@ -744,10 +763,10 @@ fn text_area_state_for_action(
             apply_movement(state, TextAreaEdit::Right, true)
         }
         TextAreaSemanticAction::SelectionExtendUp => {
-            apply_vertical_movement(state, false, true, wrap_width)
+            apply_vertical_movement(state, false, true, wrap_width, profile)
         }
         TextAreaSemanticAction::SelectionExtendDown => {
-            apply_vertical_movement(state, true, true, wrap_width)
+            apply_vertical_movement(state, true, true, wrap_width, profile)
         }
         TextAreaSemanticAction::SelectionExtendLineStart => {
             apply_movement(state, TextAreaEdit::Home, true)
@@ -767,39 +786,45 @@ fn text_area_state_for_action(
 
 fn text_area_content<Message>(
     state: &TextAreaState,
-    placeholder: &str,
-    enabled: bool,
-    style: TextAreaStyle,
-    selection_style: Style,
-    wrap_width: Option<usize>,
-    caret_id: Option<&NodeId>,
+    render: TextAreaContentRender<'_>,
 ) -> Node<Message> {
+    let TextAreaContentRender {
+        placeholder,
+        enabled,
+        style,
+        selection_style,
+        wrap_width,
+        focus_owner,
+        caret_id,
+        width_profile: profile,
+    } = render;
     let state = normalize_state(state.clone());
     if state.value.is_empty() {
         if enabled {
             return Node::row([
-                text_area_caret(style.cursor, caret_id),
+                text_area_caret(focus_owner, caret_id),
                 Node::styled_text(placeholder, style.placeholder),
             ]);
         }
         return Node::styled_text(placeholder, style.disabled);
     }
 
-    let lines = visual_line_ranges(&state.value, wrap_width);
+    let lines = visual_line_ranges(&state.value, wrap_width, profile);
     let cursor_line = visual_line_index(&lines, state.cursor);
+    let cursor_wraps = text_area_cursor_wraps(&state, &lines[cursor_line], wrap_width, profile);
     let horizontal_offset = if wrap_width.is_some() {
         0
     } else {
         state.horizontal_offset
     };
-    let mut nodes = Vec::with_capacity(lines.len());
+    let mut nodes = Vec::with_capacity(lines.len().saturating_add(1));
     for (index, line) in lines.into_iter().enumerate() {
         let line_style = if enabled {
             style.normal
         } else {
             style.disabled
         };
-        let line_caret_id = if enabled && index == cursor_line {
+        let line_caret_id = if enabled && index == cursor_line && !cursor_wraps {
             caret_id
         } else {
             None
@@ -808,25 +833,45 @@ fn text_area_content<Message>(
             &state,
             line,
             TextAreaLineRender {
-                cursor_line: enabled && index == cursor_line,
+                cursor_line: enabled && index == cursor_line && !cursor_wraps,
                 normal_style: line_style,
-                cursor_style: style.cursor,
                 selection_style,
                 horizontal_offset,
+                focus_owner,
                 caret_id: line_caret_id,
+                width_profile: profile,
             },
         ));
+        if index == cursor_line && cursor_wraps {
+            nodes.push(if enabled {
+                text_area_caret(focus_owner, caret_id)
+            } else {
+                Node::styled_text("", style.disabled)
+            });
+        }
     }
     Node::column(nodes)
+}
+
+struct TextAreaContentRender<'a> {
+    placeholder: &'a str,
+    enabled: bool,
+    style: TextAreaStyle,
+    selection_style: Style,
+    wrap_width: Option<usize>,
+    focus_owner: &'a NodeId,
+    caret_id: Option<&'a NodeId>,
+    width_profile: WidthProfile<'static>,
 }
 
 struct TextAreaLineRender<'a> {
     cursor_line: bool,
     normal_style: Style,
-    cursor_style: Style,
     selection_style: Style,
     horizontal_offset: usize,
+    focus_owner: &'a NodeId,
     caret_id: Option<&'a NodeId>,
+    width_profile: WidthProfile<'static>,
 }
 
 fn text_area_line_content<Message>(
@@ -835,9 +880,11 @@ fn text_area_line_content<Message>(
     render: TextAreaLineRender<'_>,
 ) -> Node<Message> {
     let line_text = &state.value[line.clone()];
-    let visible_start = line
-        .start
-        .saturating_add(text_area_visible_start(line_text, render.horizontal_offset));
+    let visible_start = line.start.saturating_add(text_area_visible_start(
+        line_text,
+        render.horizontal_offset,
+        render.width_profile,
+    ));
     let selection = state.selection();
     let mut boundaries = vec![visible_start, line.end];
     if let Some(selection) = &selection {
@@ -856,7 +903,7 @@ fn text_area_line_content<Message>(
         && cell_at_byte(
             line_text,
             state.cursor.saturating_sub(line.start),
-            WidthProfile::MODERN,
+            render.width_profile,
         )
         .is_some_and(|cell| cell >= render.horizontal_offset);
     let mut parts = Vec::with_capacity(boundaries.len().saturating_mul(2));
@@ -867,7 +914,7 @@ fn text_area_line_content<Message>(
         let start = pair[0];
         let end = pair[1];
         if cursor_visible && state.cursor == start {
-            parts.push(text_area_caret(render.cursor_style, render.caret_id));
+            parts.push(text_area_caret(render.focus_owner, render.caret_id));
             cursor_visible = false;
         }
         if start == end {
@@ -883,7 +930,7 @@ fn text_area_line_content<Message>(
         parts.push(Node::styled_text(&state.value[start..end], part_style));
     }
     if cursor_visible && state.cursor == line.end {
-        parts.push(text_area_caret(render.cursor_style, render.caret_id));
+        parts.push(text_area_caret(render.focus_owner, render.caret_id));
     }
     if parts.is_empty() {
         Node::styled_text("", render.normal_style)
@@ -892,8 +939,8 @@ fn text_area_line_content<Message>(
     }
 }
 
-fn text_area_caret<Message>(style: Style, id: Option<&NodeId>) -> Node<Message> {
-    let caret = Node::styled_text("▏", style);
+fn text_area_caret<Message>(focus_owner: &NodeId, id: Option<&NodeId>) -> Node<Message> {
+    let caret = Node::cursor_anchor(focus_owner.clone());
     match id {
         Some(id) => caret.with_id(id.clone()),
         None => caret,
@@ -914,7 +961,7 @@ fn append_boundary(boundaries: &mut Vec<usize>, boundary: usize, start: usize, e
     }
 }
 
-fn text_area_visible_start(line: &str, offset: usize) -> usize {
+fn text_area_visible_start(line: &str, offset: usize, profile: WidthProfile<'static>) -> usize {
     if offset == 0 {
         return 0;
     }
@@ -923,7 +970,7 @@ fn text_area_visible_start(line: &str, offset: usize) -> usize {
         if cells >= offset {
             return grapheme.start();
         }
-        cells = cells.saturating_add(grapheme_width(grapheme.text(), WidthProfile::MODERN));
+        cells = cells.saturating_add(grapheme_width(grapheme.text(), profile));
     }
     line.len()
 }
@@ -1073,9 +1120,10 @@ fn apply_vertical_movement(
     down: bool,
     extend: bool,
     wrap_width: Option<usize>,
+    profile: WidthProfile<'static>,
 ) -> TextAreaState {
     let state = normalize_state(state.clone());
-    let lines = visual_line_ranges(&state.value, wrap_width);
+    let lines = visual_line_ranges(&state.value, wrap_width, profile);
     let current = visual_line_index(&lines, state.cursor);
     let target = if down {
         current.saturating_add(1).min(lines.len().saturating_sub(1))
@@ -1090,12 +1138,12 @@ fn apply_vertical_movement(
         cell_at_byte(
             current_line,
             state.cursor.saturating_sub(lines[current].start),
-            WidthProfile::MODERN,
+            profile,
         )
         .unwrap_or(0)
     });
     let target_line = &state.value[lines[target].clone()];
-    let relative = truncate(target_line, preferred, WidthProfile::MODERN).len();
+    let relative = truncate(target_line, preferred, profile).len();
     moved_state(
         state,
         lines[target].start.saturating_add(relative),
@@ -1148,7 +1196,11 @@ fn current_line(value: &str, cursor: usize) -> Range<usize> {
         .unwrap_or(value.len()..value.len())
 }
 
-fn visual_line_ranges(value: &str, wrap_width: Option<usize>) -> Vec<Range<usize>> {
+fn visual_line_ranges(
+    value: &str,
+    wrap_width: Option<usize>,
+    profile: WidthProfile<'static>,
+) -> Vec<Range<usize>> {
     let Some(wrap_width) = wrap_width else {
         return line_ranges(value);
     };
@@ -1164,7 +1216,7 @@ fn visual_line_ranges(value: &str, wrap_width: Option<usize>) -> Vec<Range<usize
         let mut cells = 0_usize;
         for grapheme in graphemes(&value[logical.clone()]) {
             let grapheme_start = logical.start.saturating_add(grapheme.start());
-            let width = grapheme_width(grapheme.text(), WidthProfile::MODERN);
+            let width = grapheme_width(grapheme.text(), profile);
             let next = cells.saturating_add(width);
             if width != 0 && grapheme_start != start && next > wrap_width {
                 visual_lines.push(start..grapheme_start);
@@ -1179,12 +1231,36 @@ fn visual_line_ranges(value: &str, wrap_width: Option<usize>) -> Vec<Range<usize
     visual_lines
 }
 
+fn text_area_cursor_wraps(
+    state: &TextAreaState,
+    line: &Range<usize>,
+    wrap_width: Option<usize>,
+    profile: WidthProfile<'static>,
+) -> bool {
+    wrap_width.is_some_and(|wrap_width| {
+        state.cursor == line.end
+            && !line.is_empty()
+            && text_width(&state.value[line.clone()], profile) == wrap_width.max(1)
+    })
+}
+
 pub(crate) fn text_area_visual_line_count(
     state: &TextAreaState,
     wrap_width: Option<usize>,
+    profile: WidthProfile<'static>,
 ) -> usize {
     let state = normalize_state(state.clone());
-    visual_line_ranges(&state.value, wrap_width).len()
+    let lines = visual_line_ranges(&state.value, wrap_width, profile);
+    let mut count = lines.len();
+    if text_area_cursor_wraps(
+        &state,
+        &lines[visual_line_index(&lines, state.cursor)],
+        wrap_width,
+        profile,
+    ) {
+        count = count.saturating_add(1);
+    }
+    count
 }
 
 fn visual_line_index(lines: &[Range<usize>], cursor: usize) -> usize {
@@ -1203,9 +1279,13 @@ fn visual_line_index(lines: &[Range<usize>], cursor: usize) -> usize {
         .unwrap_or(lines.len().saturating_sub(1))
 }
 
-fn visual_line_directions(state: &TextAreaState, wrap_width: Option<usize>) -> (bool, bool) {
+fn visual_line_directions(
+    state: &TextAreaState,
+    wrap_width: Option<usize>,
+    profile: WidthProfile<'static>,
+) -> (bool, bool) {
     let state = normalize_state(state.clone());
-    let lines = visual_line_ranges(&state.value, wrap_width);
+    let lines = visual_line_ranges(&state.value, wrap_width, profile);
     let current = visual_line_index(&lines, state.cursor);
     (current > 0, current.saturating_add(1) < lines.len())
 }
@@ -1245,9 +1325,9 @@ fn normalize_state(mut state: TextAreaState) -> TextAreaState {
 mod tests {
     use super::{
         ActionAvailability, RepeatPolicy, TextAreaBoundaryNavigation, TextAreaEdit,
-        TextAreaSemanticAction, TextAreaState, apply_edit, apply_movement, apply_vertical_movement,
-        select_all, text_area_action_descriptors, text_area_state_for_action,
-        visual_line_directions, visual_line_index, visual_line_ranges,
+        TextAreaSemanticAction, TextAreaState, WidthProfile, apply_edit, apply_movement,
+        apply_vertical_movement, select_all, text_area_action_descriptors,
+        text_area_state_for_action, visual_line_directions, visual_line_index, visual_line_ranges,
     };
     use std::ops::Range;
 
@@ -1275,8 +1355,8 @@ mod tests {
                 "insert" => apply_edit(&state, TextAreaEdit::Insert(&inserted)),
                 "left" => apply_edit(&state, TextAreaEdit::Left),
                 "right" => apply_edit(&state, TextAreaEdit::Right),
-                "up" => apply_vertical_movement(&state, false, false, None),
-                "down" => apply_vertical_movement(&state, true, false, None),
+                "up" => apply_vertical_movement(&state, false, false, None, WidthProfile::MODERN),
+                "down" => apply_vertical_movement(&state, true, false, None, WidthProfile::MODERN),
                 "home" => apply_edit(&state, TextAreaEdit::Home),
                 "end" => apply_edit(&state, TextAreaEdit::End),
                 "backspace" => apply_edit(&state, TextAreaEdit::Backspace),
@@ -1332,6 +1412,7 @@ mod tests {
                         &state,
                         visual_fixture_action(event),
                         wrap_width.map(|width| width.max(1)),
+                        WidthProfile::MODERN,
                     );
                 }
             }
@@ -1354,7 +1435,11 @@ mod tests {
                 "case {}",
                 record.id
             );
-            let lines = visual_line_ranges(&state.value, wrap_width.map(|width| width.max(1)));
+            let lines = visual_line_ranges(
+                &state.value,
+                wrap_width.map(|width| width.max(1)),
+                WidthProfile::MODERN,
+            );
             assert_eq!(
                 lines,
                 ranges(record.field("expected-ranges")),
@@ -1367,7 +1452,11 @@ mod tests {
                 "case {}",
                 record.id
             );
-            let directions = visual_line_directions(&state, wrap_width.map(|width| width.max(1)));
+            let directions = visual_line_directions(
+                &state,
+                wrap_width.map(|width| width.max(1)),
+                WidthProfile::MODERN,
+            );
             let boundary = match record.field("boundary") {
                 "consume" => TextAreaBoundaryNavigation::Consume,
                 "bubble" => TextAreaBoundaryNavigation::Bubble,
@@ -1380,6 +1469,7 @@ mod tests {
                 boundary,
                 &state,
                 wrap_width.map(|width| width.max(1)),
+                WidthProfile::MODERN,
             );
             assert_eq!(
                 descriptors[2].availability(),
@@ -1455,6 +1545,7 @@ mod tests {
             TextAreaBoundaryNavigation::Consume,
             &state,
             None,
+            WidthProfile::MODERN,
         );
         let unavailable = text_area_action_descriptors(
             false,
@@ -1463,6 +1554,7 @@ mod tests {
             TextAreaBoundaryNavigation::Consume,
             &state,
             None,
+            WidthProfile::MODERN,
         );
 
         for index in 0..enabled.len() {

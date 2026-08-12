@@ -172,6 +172,7 @@ pub(crate) struct NodeRecord {
     pub(crate) clip: Rect,
     pub(crate) focusable: bool,
     pub(crate) has_handler: bool,
+    pub(crate) blocks_unhandled_events: bool,
     pub(crate) kind: InteractiveKind,
 }
 
@@ -452,6 +453,7 @@ mod tests {
                             clip: Rect::new(0, 0, 10, 10),
                             focusable: false,
                             has_handler: true,
+                            blocks_unhandled_events: false,
                             kind: if child == modal {
                                 InteractiveKind::Modal
                             } else {
@@ -498,6 +500,7 @@ mod tests {
                             clip: rect(parts[2]),
                             focusable: false,
                             has_handler: true,
+                            blocks_unhandled_events: false,
                             kind: InteractiveKind::Generic,
                         },
                         false,

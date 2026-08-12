@@ -85,7 +85,7 @@ impl App for LogViewer {
         )
     }
 
-    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+    fn view(&self, context: nagi_tui::ViewContext) -> Node<Self::Message> {
         let source_list = List::new(
             "sources",
             SOURCES
@@ -165,6 +165,7 @@ impl App for LogViewer {
                 HelpBinding::new("p", "pause"),
                 HelpBinding::new("Esc", "exit"),
             ])
+            .width_profile(context.width_profile)
             .into_node()
             .with_length(Length::Fixed(1)),
         ])

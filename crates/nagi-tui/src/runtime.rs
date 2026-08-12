@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nagi_surface::SurfaceError;
+use nagi_text::WidthProfile;
 use nagi_vt::{Event, KeyAction, KeyCode, MouseButton, MouseKind, TerminalOp};
 
 use crate::action_routing::{
@@ -15,6 +16,7 @@ use crate::core_action::{CoreAction, default_focus_action};
 use crate::effect::RuntimeCommand;
 use crate::renderer::operations;
 use crate::routing::{FocusChange, InteractiveKind, PointerChange, TreeIndex};
+use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeDiagnostics, RuntimeNoticeQueue};
 use crate::subscription_supervisor::{
     SubscriptionDiagnostics, SubscriptionReconciliation, SubscriptionSupervisor, SubscriptionTag,
 };
@@ -35,8 +37,11 @@ pub const DEFAULT_TASK_LIMIT: usize = 64;
 /// The default per-source subscription inbox capacity
 pub const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 256;
 
+/// The default maximum number of retained asynchronous lifecycle notices
+pub const DEFAULT_RUNTIME_NOTICE_CAPACITY: usize = 256;
+
 /// Runtime construction settings
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct RuntimeConfig {
     /// Initial terminal cell size
     pub size: Size,
@@ -46,8 +51,14 @@ pub struct RuntimeConfig {
     pub task_limit: usize,
     /// Maximum pending values retained by each subscription source
     pub subscription_capacity: usize,
+    /// Maximum retained asynchronous lifecycle notices
+    pub runtime_notice_capacity: usize,
     /// Smallest interval between non-urgent rendered frames
     pub minimum_frame_interval: Duration,
+    /// Terminal cell-width policy used by the complete view
+    ///
+    /// A Custom override must return stable widths for this Runtime's lifetime
+    pub width_profile: WidthProfile<'static>,
 }
 
 impl RuntimeConfig {
@@ -59,7 +70,9 @@ impl RuntimeConfig {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             task_limit: DEFAULT_TASK_LIMIT,
             subscription_capacity: DEFAULT_SUBSCRIPTION_CAPACITY,
+            runtime_notice_capacity: DEFAULT_RUNTIME_NOTICE_CAPACITY,
             minimum_frame_interval: Duration::ZERO,
+            width_profile: WidthProfile::MODERN,
         }
     }
 }
@@ -73,6 +86,8 @@ pub enum RuntimeError {
     ZeroTaskLimit,
     /// Per-source subscription capacity must be greater than zero
     ZeroSubscriptionCapacity,
+    /// Runtime notice capacity must be greater than zero
+    ZeroRuntimeNoticeCapacity,
     /// A frame surface could not be constructed
     Surface(SurfaceError),
     /// Two nodes in one semantic tree used the same stable ID
@@ -93,6 +108,9 @@ impl fmt::Display for RuntimeError {
             Self::ZeroSubscriptionCapacity => {
                 formatter.write_str("runtime subscription capacity must be positive")
             }
+            Self::ZeroRuntimeNoticeCapacity => {
+                formatter.write_str("runtime notice capacity must be positive")
+            }
             Self::Surface(error) => write!(formatter, "construct runtime surface: {error}"),
             Self::DuplicateNodeId(id) => write!(formatter, "duplicate NodeId {id}"),
             Self::DuplicateSubscriptionKey(key) => {
@@ -111,6 +129,7 @@ impl Error for RuntimeError {
             Self::ZeroQueueCapacity
             | Self::ZeroTaskLimit
             | Self::ZeroSubscriptionCapacity
+            | Self::ZeroRuntimeNoticeCapacity
             | Self::DuplicateNodeId(_)
             | Self::DuplicateSubscriptionKey(_) => None,
         }
@@ -218,6 +237,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     dirty: bool,
     urgent_frame: bool,
     minimum_frame_interval: Duration,
+    width_profile: WidthProfile<'static>,
     last_frame: Option<Timestamp>,
     previous_surface: Option<Arc<Surface>>,
     spare_surface: Option<Surface>,
@@ -231,6 +251,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     next_resolved_action_route: ResolvedActionRoute<Application::Message>,
     effects: EffectSupervisor<Application::Message>,
     subscriptions: SubscriptionSupervisor<Application::Message>,
+    notices: Arc<RuntimeNoticeQueue>,
     subscriptions_dirty: bool,
     exit_requested: bool,
     pending_focus: Option<NodeId>,
@@ -274,12 +295,18 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         if config.subscription_capacity == 0 {
             return Err(RuntimeError::ZeroSubscriptionCapacity);
         }
+        if config.runtime_notice_capacity == 0 {
+            return Err(RuntimeError::ZeroRuntimeNoticeCapacity);
+        }
         let startup = app.init();
         let declared_subscriptions = app.subscriptions();
+        let notices = Arc::new(RuntimeNoticeQueue::new(config.runtime_notice_capacity));
         let mut effects = EffectSupervisor::new(config.task_limit);
+        effects.set_notices(Arc::clone(&notices));
         effects.set_wake(wake.clone());
         effects.schedule(startup, clock.now());
         let mut subscriptions = SubscriptionSupervisor::new(config.subscription_capacity);
+        subscriptions.set_notices(Arc::clone(&notices));
         subscriptions.set_wake(wake);
         subscriptions
             .reconcile(declared_subscriptions, clock.now())
@@ -293,6 +320,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             dirty: true,
             urgent_frame: true,
             minimum_frame_interval: config.minimum_frame_interval,
+            width_profile: config.width_profile,
             last_frame: None,
             previous_surface: None,
             spare_surface: None,
@@ -306,6 +334,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             next_resolved_action_route: ResolvedActionRoute::default(),
             effects,
             subscriptions,
+            notices,
             subscriptions_dirty: false,
             exit_requested: false,
             pending_focus: None,
@@ -325,6 +354,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     pub fn app_mut(&mut self) -> &mut Application {
         self.dirty = true;
         self.subscriptions_dirty = true;
+        self.view_tree = None;
         &mut self.app
     }
 
@@ -352,6 +382,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.size = size;
             self.dirty = true;
             self.urgent_frame = true;
+            self.view_tree = None;
         }
     }
 
@@ -480,6 +511,23 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.subscriptions.diagnostics()
     }
 
+    /// Returns retained asynchronous lifecycle notices
+    #[must_use]
+    pub fn pending_runtime_notices(&self) -> usize {
+        self.notices.pending()
+    }
+
+    /// Removes and returns retained notices in occurrence order
+    pub fn drain_runtime_notices(&mut self) -> Vec<RuntimeNotice> {
+        self.notices.drain()
+    }
+
+    /// Returns bounded notice queue counters
+    #[must_use]
+    pub fn runtime_notice_diagnostics(&self) -> RuntimeNoticeDiagnostics {
+        self.notices.diagnostics()
+    }
+
     /// Returns time until the next clock-driven effect deadline
     #[must_use]
     pub fn time_until_effect_deadline(&self) -> Option<Duration> {
@@ -517,11 +565,34 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     /// Applies queued messages and observes each immediately before update
     pub fn process_pending_with(
         &mut self,
-        mut observe: impl FnMut(&Application::Message),
+        observe: impl FnMut(&Application::Message),
     ) -> Result<usize, RuntimeError> {
         self.reconcile_subscriptions()?;
         self.poll_effects();
         self.poll_subscriptions();
+        self.process_queued_with_inner(observe)
+    }
+
+    /// Applies messages already in the application queue without polling
+    /// asynchronous Effects or Subscriptions
+    pub fn process_queued(&mut self) -> Result<usize, RuntimeError> {
+        self.process_queued_with(|_| {})
+    }
+
+    /// Applies messages already in the application queue and observes each
+    /// immediately before update without polling asynchronous sources
+    pub fn process_queued_with(
+        &mut self,
+        observe: impl FnMut(&Application::Message),
+    ) -> Result<usize, RuntimeError> {
+        self.reconcile_subscriptions()?;
+        self.process_queued_with_inner(observe)
+    }
+
+    fn process_queued_with_inner(
+        &mut self,
+        mut observe: impl FnMut(&Application::Message),
+    ) -> Result<usize, RuntimeError> {
         let mut processed = 0;
         while let Some(queued) = self.queue.pop_front() {
             observe(&queued.message);
@@ -531,6 +602,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.apply_effect_commands();
             if !without_redraw {
                 self.dirty = true;
+                self.view_tree = None;
             }
             self.subscriptions_dirty = true;
             self.reconcile_subscriptions()?;
@@ -550,6 +622,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
             self.dirty = true;
             self.urgent_frame = true;
+            self.view_tree = None;
         }
     }
 
@@ -632,6 +705,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         {
             self.dirty = true;
             self.urgent_frame = true;
+            self.view_tree = None;
         }
         true
     }
@@ -748,6 +822,14 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 if dispatch.consumed {
                     break;
                 }
+            }
+            if self
+                .tree_index
+                .record(&id)
+                .is_some_and(|record| record.blocks_unhandled_events)
+            {
+                dispatch.consumed = true;
+                break;
             }
         }
         Ok(dispatch)
@@ -1114,17 +1196,26 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             return Ok(());
         }
         self.interaction.request_scroll(viewport_id, next);
-        view.prepare_interaction(self.size, &mut self.interaction);
-        view.build_tree_index_into(self.size, &self.interaction, index, actions)
-            .map_err(RuntimeError::DuplicateNodeId)
+        view.prepare_interaction(self.size, &mut self.interaction, self.width_profile);
+        view.build_tree_index_into(
+            self.size,
+            &self.interaction,
+            index,
+            actions,
+            self.width_profile,
+        )
+        .map_err(RuntimeError::DuplicateNodeId)
     }
 
     fn ensure_tree(&mut self) -> Result<(), RuntimeError> {
         if self.view_tree.is_some() {
             return Ok(());
         }
-        let view = self.app.view(crate::ViewContext::new(self.size));
-        view.prepare_virtual_flows(self.size, &mut self.interaction);
+        let view = self.app.view(crate::ViewContext::with_width_profile(
+            self.size,
+            self.width_profile,
+        ));
+        view.prepare_virtual_flows(self.size, &mut self.interaction, self.width_profile);
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
         let mut action_index = std::mem::take(&mut self.next_action_index);
         if let Err(id) = view.build_tree_index_into(
@@ -1132,20 +1223,29 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             &self.interaction,
             &mut tree_index,
             &mut action_index,
+            self.width_profile,
         ) {
             self.next_tree_index = tree_index;
             self.next_action_index = action_index;
             return Err(RuntimeError::DuplicateNodeId(id));
         }
+        let previous_focus_order = self.tree_index.focus_scope();
+        let current_focus_order = tree_index.focus_scope();
+        let focus_fallback = self
+            .interaction
+            .focused
+            .as_ref()
+            .and_then(|focused| self.tree_index.focus_fallback(focused))
+            .cloned();
         self.interaction.reconcile(
             &tree_index.active,
-            &[],
-            tree_index.focus_scope().as_ref(),
+            previous_focus_order.as_ref(),
+            current_focus_order.as_ref(),
             tree_index
                 .active_modal
                 .as_ref()
                 .map(|modal| (modal, &tree_index.active_modal_focus)),
-            None,
+            focus_fallback.as_ref(),
         );
         if self
             .interaction
@@ -1156,12 +1256,13 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.interaction.pointer_capture = None;
         }
         self.apply_pending_interaction(&tree_index);
-        if view.prepare_interaction(self.size, &mut self.interaction) {
+        if view.prepare_interaction(self.size, &mut self.interaction, self.width_profile) {
             if let Err(id) = view.build_tree_index_into(
                 self.size,
                 &self.interaction,
                 &mut tree_index,
                 &mut action_index,
+                self.width_profile,
             ) {
                 self.next_tree_index = tree_index;
                 self.next_action_index = action_index;
@@ -1211,8 +1312,11 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 }
             }
         }
-        let view = self.app.view(crate::ViewContext::new(self.size));
-        view.prepare_virtual_flows(self.size, &mut self.interaction);
+        let view = self.app.view(crate::ViewContext::with_width_profile(
+            self.size,
+            self.width_profile,
+        ));
+        view.prepare_virtual_flows(self.size, &mut self.interaction, self.width_profile);
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
         let mut action_index = std::mem::take(&mut self.next_action_index);
         if let Err(id) = view.build_tree_index_into(
@@ -1220,6 +1324,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             &self.interaction,
             &mut tree_index,
             &mut action_index,
+            self.width_profile,
         ) {
             self.next_tree_index = tree_index;
             self.next_action_index = action_index;
@@ -1254,12 +1359,13 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.interaction.pointer_capture = None;
         }
         self.apply_pending_interaction(&tree_index);
-        if view.prepare_interaction(self.size, &mut self.interaction) {
+        if view.prepare_interaction(self.size, &mut self.interaction, self.width_profile) {
             if let Err(id) = view.build_tree_index_into(
                 self.size,
                 &self.interaction,
                 &mut tree_index,
                 &mut action_index,
+                self.width_profile,
             ) {
                 self.next_tree_index = tree_index;
                 self.next_action_index = action_index;
@@ -1302,7 +1408,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 }
             },
         };
-        view.render_to(&mut surface, &self.interaction);
+        view.render_to_profile(&mut surface, &self.interaction, self.width_profile);
         let previous_surface = self.previous_surface.take();
         let frame_operations = operations(previous_surface.as_deref(), &surface);
         if let Some(previous_surface) = previous_surface {
@@ -2012,6 +2118,7 @@ mod tests {
 
     struct ModalApp {
         visits: Vec<&'static str>,
+        hard: bool,
     }
 
     impl App for ModalApp {
@@ -2035,9 +2142,12 @@ mod tests {
                 .on_event("input", |_| {
                     EventResult::ignored().emit(FocusMessage::Visit("input"))
                 });
-            let modal = Node::modal("modal", input).on_event("modal", |_| {
+            let mut modal = Node::modal("modal", input).on_event("modal", |_| {
                 EventResult::ignored().emit(FocusMessage::Visit("modal"))
             });
+            if self.hard {
+                modal = modal.block_unhandled_events();
+            }
             Node::stack([background, modal]).on_event("root", |_| {
                 EventResult::message(FocusMessage::Visit("root"))
             })
@@ -2047,7 +2157,10 @@ mod tests {
     #[test]
     fn modal_restricts_focus_and_routes_through_modal_ancestors() {
         let mut runtime = Runtime::with_clock(
-            ModalApp { visits: Vec::new() },
+            ModalApp {
+                visits: Vec::new(),
+                hard: false,
+            },
             RuntimeConfig::new(Size::new(12, 1)),
             VirtualClock::new(),
         )
@@ -2083,6 +2196,35 @@ mod tests {
         assert_eq!(routed.messages(), 3);
         runtime.step().unwrap();
         assert_eq!(runtime.app().visits, ["input", "modal", "root"]);
+    }
+
+    #[test]
+    fn event_boundary_stops_unhandled_event_at_modal() {
+        let mut runtime = Runtime::with_clock(
+            ModalApp {
+                visits: Vec::new(),
+                hard: true,
+            },
+            RuntimeConfig::new(Size::new(12, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        assert!(runtime.request_focus(&NodeId::from("input")).unwrap());
+
+        let routed = runtime
+            .dispatch_event(&Event::Key(KeyEvent {
+                code: KeyCode::Right,
+                modifiers: Modifiers::NONE,
+                action: KeyAction::Unknown,
+                text: None,
+                protocol: KeyProtocol::Legacy,
+            }))
+            .unwrap();
+        assert!(routed.consumed());
+        assert_eq!(routed.messages(), 2);
+        runtime.step().unwrap();
+        assert_eq!(runtime.app().visits, ["input", "modal"]);
     }
 
     struct ScrollApp;

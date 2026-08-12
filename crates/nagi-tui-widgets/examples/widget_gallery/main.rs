@@ -128,6 +128,7 @@ impl App for Gallery {
             },
         ))
         .details(details)
+        .width_profile(context.width_profile)
         .action_wrap_width(context.size.width.saturating_sub(4).max(1))
         .into_node();
         Node::stack([content, dialog])

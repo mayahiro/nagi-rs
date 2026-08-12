@@ -171,6 +171,7 @@ pub struct Node<Message> {
     kind: NodeKind<Message>,
     length: Length,
     id: Option<NodeId>,
+    blocks_unhandled_events: bool,
     focusable: bool,
     focused_style: Option<Style>,
     handler: Option<Box<EventHandler<Message>>>,
@@ -191,6 +192,9 @@ enum NodeKind<Message> {
     Surface(Surface),
     Spacer(Size),
     Gap(u32),
+    CursorAnchor {
+        focus_owner: NodeId,
+    },
     TextInput {
         value: String,
         placeholder: String,
@@ -366,6 +370,18 @@ impl<Message> Node<Message> {
     #[must_use]
     pub fn gap(cells: u32) -> Self {
         Self::new(NodeKind::Gap(cells))
+    }
+
+    /// Creates a zero-width cursor position shown while `focus_owner` is
+    /// focused
+    ///
+    /// The anchor measures one row high, consumes no horizontal layout space,
+    /// and sets the output Surface cursor only while its position is visible
+    #[must_use]
+    pub fn cursor_anchor(focus_owner: impl Into<NodeId>) -> Self {
+        Self::new(NodeKind::CursorAnchor {
+            focus_owner: focus_owner.into(),
+        })
     }
 
     /// Creates a horizontal container
@@ -619,6 +635,18 @@ impl<Message> Node<Message> {
         self
     }
 
+    /// Consumes routed events that remain unhandled after this identified node
+    /// has processed its actions, built-in behavior, and raw handler
+    ///
+    /// The boundary prevents the event from reaching ancestors and
+    /// terminal-level fallback mapping. It has no effect until the node has a
+    /// stable identity
+    #[must_use]
+    pub const fn block_unhandled_events(mut self) -> Self {
+        self.blocks_unhandled_events = true;
+        self
+    }
+
     /// Makes this node focusable under a stable identity
     #[must_use]
     pub fn focusable(mut self, id: impl Into<NodeId>) -> Self {
@@ -726,6 +754,7 @@ impl<Message> Node<Message> {
             kind,
             length: Length::Auto,
             id: None,
+            blocks_unhandled_events: false,
             focusable: false,
             focused_style: None,
             handler: None,
@@ -739,58 +768,71 @@ impl<Message> Node<Message> {
             .get_or_insert_with(|| Box::new(NodeKeyInteraction::new()))
     }
 
+    #[cfg(test)]
     pub(crate) fn render_to(&self, surface: &mut Surface, interaction: &InteractionState) {
-        let bounds = Rect::new(0, 0, surface.width(), surface.height());
-        self.render(surface, bounds, bounds, interaction);
+        self.render_to_profile(surface, interaction, WidthProfile::MODERN);
     }
 
-    fn measure(&self, constraints: Constraints) -> Size {
+    pub(crate) fn render_to_profile(
+        &self,
+        surface: &mut Surface,
+        interaction: &InteractionState,
+        profile: WidthProfile<'static>,
+    ) {
+        let bounds = Rect::new(0, 0, surface.width(), surface.height());
+        self.render(surface, bounds, bounds, interaction, profile);
+    }
+
+    fn measure(&self, constraints: Constraints, profile: WidthProfile<'static>) -> Size {
         let measured = match &self.kind {
-            NodeKind::Text { content, .. } => measure_text(content, constraints),
+            NodeKind::Text { content, .. } => measure_text(content, constraints, profile),
             NodeKind::RichText {
                 spans,
                 options,
                 cache,
-            } => measure_rich_text(spans, *options, cache, constraints),
+            } => measure_rich_text(spans, *options, cache, constraints, profile),
             NodeKind::Surface(surface) => Size::new(surface.width(), surface.height()),
             NodeKind::Spacer(size) => *size,
             NodeKind::Gap(_) => Size::default(),
+            NodeKind::CursorAnchor { .. } => Size::new(0, 1),
             NodeKind::TextInput {
                 value, placeholder, ..
             } => {
-                let width = text_width(value, WidthProfile::MODERN)
-                    .max(text_width(placeholder, WidthProfile::MODERN))
+                let width = text_width(value, profile)
+                    .max(text_width(placeholder, profile))
                     .min(u32::MAX as usize) as u32;
                 Size::new(width, 1)
             }
-            NodeKind::Row(linear) => measure_linear(&linear.children, constraints, true),
-            NodeKind::Column(linear) => measure_linear(&linear.children, constraints, false),
+            NodeKind::Row(linear) => measure_linear(&linear.children, constraints, true, profile),
+            NodeKind::Column(linear) => {
+                measure_linear(&linear.children, constraints, false, profile)
+            }
             NodeKind::Stack(children) => children.iter().fold(Size::default(), |size, child| {
-                let child = child.measure(constraints);
+                let child = child.measure(constraints, profile);
                 Size::new(size.width.max(child.width), size.height.max(child.height))
             }),
             NodeKind::Padding { insets, child } => add_size(
-                child.measure(shrink_constraints(constraints, *insets)),
+                child.measure(shrink_constraints(constraints, *insets), profile),
                 insets.left.saturating_add(insets.right),
                 insets.top.saturating_add(insets.bottom),
             ),
             NodeKind::Border { child, .. } => add_size(
-                child.measure(shrink_constraints(constraints, Insets::all(1))),
+                child.measure(shrink_constraints(constraints, Insets::all(1)), profile),
                 2,
                 2,
             ),
             NodeKind::Panel { options, child, .. } => {
                 let insets = panel_content_insets(*options);
                 add_size(
-                    child.measure(shrink_constraints(constraints, insets)),
+                    child.measure(shrink_constraints(constraints, insets), profile),
                     insets.left.saturating_add(insets.right),
                     insets.top.saturating_add(insets.bottom),
                 )
             }
             NodeKind::Align { child, .. }
             | NodeKind::Clip(child)
-            | NodeKind::Modal { child, .. } => child.measure(constraints),
-            NodeKind::ScrollViewport { child, .. } => child.measure(constraints),
+            | NodeKind::Modal { child, .. } => child.measure(constraints, profile),
+            NodeKind::ScrollViewport { child, .. } => child.measure(constraints, profile),
             NodeKind::VirtualScrollViewport(virtual_node) => virtual_node.content_size,
             NodeKind::VirtualFlow(_) => virtual_flow_intrinsic_size(constraints),
         };
@@ -803,20 +845,24 @@ impl<Message> Node<Message> {
         rect: Rect,
         clip: Rect,
         interaction: &InteractionState,
+        profile: WidthProfile<'static>,
     ) {
         match &self.kind {
             NodeKind::Text { content, style } => {
-                render_text(surface, rect, clip, content, *style);
+                render_text(surface, rect, clip, content, *style, profile);
             }
             NodeKind::RichText {
                 spans,
                 options,
                 cache,
             } => {
-                render_rich_text(surface, rect, clip, spans, *options, cache);
+                render_rich_text(surface, rect, clip, spans, *options, cache, profile);
             }
-            NodeKind::Surface(source) => render_surface_node(surface, rect, clip, source),
+            NodeKind::Surface(source) => render_surface_node(surface, rect, clip, source, profile),
             NodeKind::Spacer(_) | NodeKind::Gap(_) => {}
+            NodeKind::CursorAnchor { focus_owner } => {
+                render_cursor_anchor(surface, rect, clip, focus_owner, interaction);
+            }
             NodeKind::TextInput {
                 value,
                 placeholder,
@@ -833,23 +879,26 @@ impl<Message> Node<Message> {
                 *style,
                 *placeholder_style,
                 interaction,
+                profile,
             ),
-            NodeKind::Row(linear) => render_linear(surface, rect, clip, linear, true, interaction),
+            NodeKind::Row(linear) => {
+                render_linear(surface, rect, clip, linear, true, interaction, profile)
+            }
             NodeKind::Column(linear) => {
-                render_linear(surface, rect, clip, linear, false, interaction)
+                render_linear(surface, rect, clip, linear, false, interaction, profile)
             }
             NodeKind::Stack(children) => {
                 for child in children {
-                    child.render(surface, rect, clip, interaction);
+                    child.render(surface, rect, clip, interaction, profile);
                 }
             }
             NodeKind::Padding { insets, child } => {
                 let child_rect = inset(rect, insets.left, insets.top, insets.right, insets.bottom);
-                child.render(surface, child_rect, clip, interaction);
+                child.render(surface, child_rect, clip, interaction, profile);
             }
             NodeKind::Border { style, child } => {
-                render_border(surface, rect, clip, *style);
-                child.render(surface, inset(rect, 1, 1, 1, 1), clip, interaction);
+                render_border(surface, rect, clip, *style, profile);
+                child.render(surface, inset(rect, 1, 1, 1, 1), clip, interaction, profile);
             }
             NodeKind::Align {
                 horizontal,
@@ -858,22 +907,34 @@ impl<Message> Node<Message> {
             } => {
                 child.render(
                     surface,
-                    aligned_child_rect(rect, child, *horizontal, *vertical),
+                    aligned_child_rect(rect, child, *horizontal, *vertical, profile),
                     clip,
                     interaction,
+                    profile,
                 );
             }
             NodeKind::Clip(child) => {
-                child.render(surface, rect, clip.intersection(rect), interaction)
+                child.render(surface, rect, clip.intersection(rect), interaction, profile)
             }
             NodeKind::ScrollViewport { child, options } => {
                 let id = self
                     .id
                     .as_ref()
                     .expect("ScrollViewport always has a NodeId");
-                let child_rect =
-                    scroll_child_rect(rect, child, interaction.scroll_offset(id), options.axis);
-                child.render(surface, child_rect, clip.intersection(rect), interaction);
+                let child_rect = scroll_child_rect(
+                    rect,
+                    child,
+                    interaction.scroll_offset(id),
+                    options.axis,
+                    profile,
+                );
+                child.render(
+                    surface,
+                    child_rect,
+                    clip.intersection(rect),
+                    interaction,
+                    profile,
+                );
             }
             NodeKind::VirtualScrollViewport(virtual_node) => {
                 let id = self
@@ -888,12 +949,13 @@ impl<Message> Node<Message> {
                     rect,
                     interaction.scroll_offset(id),
                 ) {
-                    let fragment_rect = virtual_fragment_rect(rect, &fragment);
+                    let fragment_rect = virtual_fragment_rect(rect, &fragment, profile);
                     fragment.fragment.node.render(
                         surface,
                         fragment_rect,
                         clip.intersection(rect),
                         interaction,
+                        profile,
                     );
                 }
             }
@@ -905,16 +967,27 @@ impl<Message> Node<Message> {
                             virtual_flow_item_rect(rect, frame.offset, item.origin, item.height),
                             clip.intersection(rect),
                             interaction,
+                            profile,
                         );
                     }
                 }
             }
-            NodeKind::Modal { child, .. } => child.render(surface, rect, clip, interaction),
+            NodeKind::Modal { child, .. } => {
+                child.render(surface, rect, clip, interaction, profile)
+            }
             NodeKind::Panel {
                 title,
                 options,
                 child,
-            } => render_panel(surface, rect, clip, child, title, *options, interaction),
+            } => render_panel(
+                surface,
+                RenderRegion { rect, clip },
+                child,
+                title,
+                *options,
+                interaction,
+                profile,
+            ),
         }
         let focused = self
             .id
@@ -936,6 +1009,7 @@ impl<Message> Node<Message> {
         interaction: &InteractionState,
         index: &mut TreeIndex,
         actions: &mut ActionIndex<Message>,
+        profile: WidthProfile<'static>,
     ) -> Result<(), NodeId> {
         let bounds = Rect::new(0, 0, size.width, size.height);
         index.clear();
@@ -949,6 +1023,7 @@ impl<Message> Node<Message> {
             interaction,
             index,
             actions,
+            profile,
         )
     }
 
@@ -956,14 +1031,20 @@ impl<Message> Node<Message> {
         &self,
         size: Size,
         interaction: &mut InteractionState,
+        profile: WidthProfile<'static>,
     ) -> bool {
         let bounds = Rect::new(0, 0, size.width, size.height);
-        self.prepare_at(bounds, interaction)
+        self.prepare_at(bounds, interaction, profile)
     }
 
-    pub(crate) fn prepare_virtual_flows(&self, size: Size, interaction: &mut InteractionState) {
+    pub(crate) fn prepare_virtual_flows(
+        &self,
+        size: Size,
+        interaction: &mut InteractionState,
+        profile: WidthProfile<'static>,
+    ) {
         let bounds = Rect::new(0, 0, size.width, size.height);
-        self.prepare_virtual_flows_at(bounds, interaction);
+        self.prepare_virtual_flows_at(bounds, interaction, profile);
     }
 
     pub(crate) fn handle_event(&self, id: &NodeId, event: &Event) -> Option<EventResult<Message>> {
@@ -1057,6 +1138,7 @@ impl<Message> Node<Message> {
             | NodeKind::Surface(_)
             | NodeKind::Spacer(_)
             | NodeKind::Gap(_)
+            | NodeKind::CursorAnchor { .. }
             | NodeKind::TextInput { .. } => None,
         }
     }
@@ -1072,6 +1154,7 @@ impl<Message> Node<Message> {
         interaction: &InteractionState,
         index: &mut TreeIndex,
         actions: &mut ActionIndex<Message>,
+        profile: WidthProfile<'static>,
     ) -> Result<(), NodeId> {
         let focus_fallback = self
             .key_interaction
@@ -1098,6 +1181,7 @@ impl<Message> Node<Message> {
                     clip,
                     focusable: self.focusable,
                     has_handler: self.handler.is_some(),
+                    blocks_unhandled_events: self.blocks_unhandled_events,
                     kind,
                 },
                 is_root,
@@ -1129,9 +1213,10 @@ impl<Message> Node<Message> {
             | NodeKind::Surface(_)
             | NodeKind::Spacer(_)
             | NodeKind::Gap(_)
+            | NodeKind::CursorAnchor { .. }
             | NodeKind::TextInput { .. } => {}
             NodeKind::Row(linear) => {
-                let layout = linear.layout(rect, true);
+                let layout = linear.layout(rect, true, profile);
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
                     child.build_index(
                         child_rect,
@@ -1142,11 +1227,12 @@ impl<Message> Node<Message> {
                         interaction,
                         index,
                         actions,
+                        profile,
                     )?;
                 }
             }
             NodeKind::Column(linear) => {
-                let layout = linear.layout(rect, false);
+                let layout = linear.layout(rect, false, profile);
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
                     child.build_index(
                         child_rect,
@@ -1157,6 +1243,7 @@ impl<Message> Node<Message> {
                         interaction,
                         index,
                         actions,
+                        profile,
                     )?;
                 }
             }
@@ -1171,6 +1258,7 @@ impl<Message> Node<Message> {
                         interaction,
                         index,
                         actions,
+                        profile,
                     )?;
                 }
             }
@@ -1183,6 +1271,7 @@ impl<Message> Node<Message> {
                 interaction,
                 index,
                 actions,
+                profile,
             )?,
             NodeKind::Border { child, .. } => child.build_index(
                 inset(rect, 1, 1, 1, 1),
@@ -1193,13 +1282,14 @@ impl<Message> Node<Message> {
                 interaction,
                 index,
                 actions,
+                profile,
             )?,
             NodeKind::Align {
                 horizontal,
                 vertical,
                 child,
             } => child.build_index(
-                aligned_child_rect(rect, child, *horizontal, *vertical),
+                aligned_child_rect(rect, child, *horizontal, *vertical, profile),
                 clip,
                 parent,
                 false,
@@ -1207,6 +1297,7 @@ impl<Message> Node<Message> {
                 interaction,
                 index,
                 actions,
+                profile,
             )?,
             NodeKind::Clip(child) => child.build_index(
                 rect,
@@ -1217,6 +1308,7 @@ impl<Message> Node<Message> {
                 interaction,
                 index,
                 actions,
+                profile,
             )?,
             NodeKind::ScrollViewport { child, options } => {
                 let id = self
@@ -1224,7 +1316,13 @@ impl<Message> Node<Message> {
                     .as_ref()
                     .expect("ScrollViewport always has a NodeId");
                 child.build_index(
-                    scroll_child_rect(rect, child, interaction.scroll_offset(id), options.axis),
+                    scroll_child_rect(
+                        rect,
+                        child,
+                        interaction.scroll_offset(id),
+                        options.axis,
+                        profile,
+                    ),
                     clip.intersection(rect),
                     parent,
                     false,
@@ -1232,6 +1330,7 @@ impl<Message> Node<Message> {
                     interaction,
                     index,
                     actions,
+                    profile,
                 )?;
             }
             NodeKind::VirtualScrollViewport(virtual_node) => {
@@ -1258,7 +1357,7 @@ impl<Message> Node<Message> {
                     state.offset,
                 ) {
                     fragment.fragment.node.build_index(
-                        virtual_fragment_rect(rect, &fragment),
+                        virtual_fragment_rect(rect, &fragment, profile),
                         clip.intersection(rect),
                         parent,
                         false,
@@ -1266,6 +1365,7 @@ impl<Message> Node<Message> {
                         interaction,
                         index,
                         actions,
+                        profile,
                     )?;
                 }
             }
@@ -1281,6 +1381,7 @@ impl<Message> Node<Message> {
                             interaction,
                             index,
                             actions,
+                            profile,
                         )?;
                     }
                 }
@@ -1294,6 +1395,7 @@ impl<Message> Node<Message> {
                 interaction,
                 index,
                 actions,
+                profile,
             )?,
             NodeKind::Panel { options, child, .. } => {
                 let insets = panel_content_insets(*options);
@@ -1306,58 +1408,67 @@ impl<Message> Node<Message> {
                     interaction,
                     index,
                     actions,
+                    profile,
                 )?;
             }
         }
         Ok(())
     }
 
-    fn prepare_virtual_flows_at(&self, rect: Rect, interaction: &mut InteractionState) {
+    fn prepare_virtual_flows_at(
+        &self,
+        rect: Rect,
+        interaction: &mut InteractionState,
+        profile: WidthProfile<'static>,
+    ) {
         match &self.kind {
             NodeKind::VirtualFlow(flow) => {
                 let id = self.id.as_ref().expect("VirtualFlow always has a NodeId");
-                prepare_virtual_flow_node(id, flow, rect, interaction);
+                prepare_virtual_flow_node(id, flow, rect, interaction, profile);
             }
             NodeKind::Row(linear) => {
-                let layout = linear.layout(rect, true);
+                let layout = linear.layout(rect, true, profile);
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-                    child.prepare_virtual_flows_at(child_rect, interaction);
+                    child.prepare_virtual_flows_at(child_rect, interaction, profile);
                 }
             }
             NodeKind::Column(linear) => {
-                let layout = linear.layout(rect, false);
+                let layout = linear.layout(rect, false, profile);
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-                    child.prepare_virtual_flows_at(child_rect, interaction);
+                    child.prepare_virtual_flows_at(child_rect, interaction, profile);
                 }
             }
             NodeKind::Stack(children) => {
                 for child in children {
-                    child.prepare_virtual_flows_at(rect, interaction);
+                    child.prepare_virtual_flows_at(rect, interaction, profile);
                 }
             }
             NodeKind::Padding { insets, child } => child.prepare_virtual_flows_at(
                 inset(rect, insets.left, insets.top, insets.right, insets.bottom),
                 interaction,
+                profile,
             ),
             NodeKind::Border { child, .. } => {
-                child.prepare_virtual_flows_at(inset(rect, 1, 1, 1, 1), interaction)
+                child.prepare_virtual_flows_at(inset(rect, 1, 1, 1, 1), interaction, profile)
             }
             NodeKind::Align {
                 horizontal,
                 vertical,
                 child,
             } => child.prepare_virtual_flows_at(
-                aligned_child_rect(rect, child, *horizontal, *vertical),
+                aligned_child_rect(rect, child, *horizontal, *vertical, profile),
                 interaction,
+                profile,
             ),
             NodeKind::Clip(child) | NodeKind::Modal { child, .. } => {
-                child.prepare_virtual_flows_at(rect, interaction);
+                child.prepare_virtual_flows_at(rect, interaction, profile);
             }
             NodeKind::Panel { options, child, .. } => {
                 let insets = panel_content_insets(*options);
                 child.prepare_virtual_flows_at(
                     inset(rect, insets.left, insets.top, insets.right, insets.bottom),
                     interaction,
+                    profile,
                 );
             }
             NodeKind::ScrollViewport { child, options } => {
@@ -1366,8 +1477,15 @@ impl<Message> Node<Message> {
                     .as_ref()
                     .expect("ScrollViewport always has a NodeId");
                 child.prepare_virtual_flows_at(
-                    scroll_child_rect(rect, child, interaction.scroll_offset(id), options.axis),
+                    scroll_child_rect(
+                        rect,
+                        child,
+                        interaction.scroll_offset(id),
+                        options.axis,
+                        profile,
+                    ),
                     interaction,
+                    profile,
                 );
             }
             NodeKind::VirtualScrollViewport(virtual_node) => {
@@ -1394,8 +1512,9 @@ impl<Message> Node<Message> {
                     state.offset,
                 ) {
                     fragment.fragment.node.prepare_virtual_flows_at(
-                        virtual_fragment_rect(rect, &fragment),
+                        virtual_fragment_rect(rect, &fragment, profile),
                         interaction,
+                        profile,
                     );
                 }
             }
@@ -1404,11 +1523,17 @@ impl<Message> Node<Message> {
             | NodeKind::Surface(_)
             | NodeKind::Spacer(_)
             | NodeKind::Gap(_)
+            | NodeKind::CursorAnchor { .. }
             | NodeKind::TextInput { .. } => {}
         }
     }
 
-    fn prepare_at(&self, rect: Rect, interaction: &mut InteractionState) -> bool {
+    fn prepare_at(
+        &self,
+        rect: Rect,
+        interaction: &mut InteractionState,
+        profile: WidthProfile<'static>,
+    ) -> bool {
         match &self.kind {
             NodeKind::TextInput { value, .. } => {
                 interaction.ensure_text_input(
@@ -1423,7 +1548,7 @@ impl<Message> Node<Message> {
                     .as_ref()
                     .expect("ScrollViewport always has a NodeId");
                 let previous_offset = interaction.scroll_offset(id);
-                let content = child.measure(scroll_constraints(rect, options.axis));
+                let content = child.measure(scroll_constraints(rect, options.axis), profile);
                 let width = content.width.max(rect.width);
                 let height = content.height.max(rect.height);
                 let state = interaction.prepare_scroll(
@@ -1436,8 +1561,9 @@ impl<Message> Node<Message> {
                     options.stick_to_end,
                 );
                 let child_changed = child.prepare_at(
-                    scroll_child_rect(rect, child, state.offset, options.axis),
+                    scroll_child_rect(rect, child, state.offset, options.axis, profile),
                     interaction,
+                    profile,
                 );
                 return state.offset != previous_offset || child_changed;
             }
@@ -1470,66 +1596,70 @@ impl<Message> Node<Message> {
                     state.offset,
                 ) {
                     let request_changed = previous_request != Some(fragment.request);
-                    let child_changed = fragment
-                        .fragment
-                        .node
-                        .prepare_at(virtual_fragment_rect(rect, &fragment), interaction);
+                    let child_changed = fragment.fragment.node.prepare_at(
+                        virtual_fragment_rect(rect, &fragment, profile),
+                        interaction,
+                        profile,
+                    );
                     return request_changed || child_changed;
                 }
                 return previous_request.is_some();
             }
             NodeKind::VirtualFlow(flow) => {
                 let id = self.id.as_ref().expect("VirtualFlow always has a NodeId");
-                return prepare_virtual_flow_node(id, flow, rect, interaction);
+                return prepare_virtual_flow_node(id, flow, rect, interaction, profile);
             }
             _ => {}
         }
         match &self.kind {
             NodeKind::Row(linear) => {
-                let layout = linear.layout(rect, true);
+                let layout = linear.layout(rect, true, profile);
                 let mut changed = false;
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-                    changed |= child.prepare_at(child_rect, interaction);
+                    changed |= child.prepare_at(child_rect, interaction, profile);
                 }
                 changed
             }
             NodeKind::Column(linear) => {
-                let layout = linear.layout(rect, false);
+                let layout = linear.layout(rect, false, profile);
                 let mut changed = false;
                 for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-                    changed |= child.prepare_at(child_rect, interaction);
+                    changed |= child.prepare_at(child_rect, interaction, profile);
                 }
                 changed
             }
             NodeKind::Stack(children) => {
                 let mut changed = false;
                 for child in children {
-                    changed |= child.prepare_at(rect, interaction);
+                    changed |= child.prepare_at(rect, interaction, profile);
                 }
                 changed
             }
             NodeKind::Padding { insets, child } => child.prepare_at(
                 inset(rect, insets.left, insets.top, insets.right, insets.bottom),
                 interaction,
+                profile,
             ),
             NodeKind::Border { child, .. } => {
-                child.prepare_at(inset(rect, 1, 1, 1, 1), interaction)
+                child.prepare_at(inset(rect, 1, 1, 1, 1), interaction, profile)
             }
             NodeKind::Align {
                 horizontal,
                 vertical,
                 child,
             } => child.prepare_at(
-                aligned_child_rect(rect, child, *horizontal, *vertical),
+                aligned_child_rect(rect, child, *horizontal, *vertical, profile),
                 interaction,
+                profile,
             ),
-            NodeKind::Clip(child) => child.prepare_at(rect, interaction),
-            NodeKind::Modal { child, .. } => child.prepare_at(rect, interaction),
+            NodeKind::Clip(child) => child.prepare_at(rect, interaction, profile),
+            NodeKind::Modal { child, .. } => child.prepare_at(rect, interaction, profile),
             NodeKind::Panel { options, child, .. } => {
                 let insets = panel_content_insets(*options);
                 child.prepare_at(
                     inset(rect, insets.left, insets.top, insets.right, insets.bottom),
                     interaction,
+                    profile,
                 )
             }
             NodeKind::Text { .. }
@@ -1537,6 +1667,7 @@ impl<Message> Node<Message> {
             | NodeKind::Surface(_)
             | NodeKind::Spacer(_)
             | NodeKind::Gap(_)
+            | NodeKind::CursorAnchor { .. }
             | NodeKind::TextInput { .. }
             | NodeKind::ScrollViewport { .. }
             | NodeKind::VirtualScrollViewport(_)
@@ -1553,14 +1684,14 @@ const fn scroll_interactive_kind(axis: ScrollAxis) -> InteractiveKind {
     }
 }
 
-fn measure_text(content: &str, constraints: Constraints) -> Size {
+fn measure_text(content: &str, constraints: Constraints, profile: WidthProfile<'static>) -> Size {
     let max_width = match constraints.width {
         Limit::Bounded(width) => width as usize,
         Limit::Unbounded => usize::MAX,
     };
     let mut width = 0_usize;
     let mut height = 0_usize;
-    for line in wrapped_lines(content, max_width, WidthProfile::MODERN) {
+    for line in wrapped_lines(content, max_width, profile) {
         width = width.max(line.width());
         height = height.saturating_add(1);
     }
@@ -1575,6 +1706,7 @@ fn measure_rich_text(
     options: ParagraphOptions,
     cache: &RefCell<ParagraphLayoutCache>,
     constraints: Constraints,
+    profile: WidthProfile<'static>,
 ) -> Size {
     let (max_width, bounded) = match constraints.width {
         Limit::Bounded(width) => (width, true),
@@ -1582,7 +1714,7 @@ fn measure_rich_text(
     };
     cache
         .borrow_mut()
-        .resolve(spans, max_width, bounded, options.wrap)
+        .resolve(spans, max_width, bounded, options.wrap, profile)
         .size
 }
 
@@ -1590,6 +1722,7 @@ fn measure_linear<Message>(
     children: &[Node<Message>],
     constraints: Constraints,
     horizontal: bool,
+    profile: WidthProfile<'static>,
 ) -> Size {
     let child_constraints = if horizontal {
         Constraints {
@@ -1603,7 +1736,7 @@ fn measure_linear<Message>(
         }
     };
     children.iter().fold(Size::default(), |size, child| {
-        let mut measured = child.measure(child_constraints);
+        let mut measured = child.measure(child_constraints, profile);
         if let NodeKind::Gap(cells) = &child.kind {
             if horizontal {
                 measured.width = *cells;
@@ -1669,10 +1802,11 @@ fn render_linear<Message>(
     linear: &LinearNode<Message>,
     horizontal: bool,
     interaction: &InteractionState,
+    profile: WidthProfile<'static>,
 ) {
-    let layout = linear.layout(rect, horizontal);
+    let layout = linear.layout(rect, horizontal, profile);
     for (child, child_rect) in linear.children.iter().zip(layout.rects(rect)) {
-        child.render(surface, child_rect, clip, interaction);
+        child.render(surface, child_rect, clip, interaction, profile);
     }
 }
 
@@ -1691,14 +1825,19 @@ struct LinearLayout {
 }
 
 impl<Message> LinearNode<Message> {
-    fn layout(&self, rect: Rect, horizontal: bool) -> Ref<'_, LinearLayout> {
+    fn layout(
+        &self,
+        rect: Rect,
+        horizontal: bool,
+        profile: WidthProfile<'static>,
+    ) -> Ref<'_, LinearLayout> {
         let rebuild = self
             .cache
             .borrow()
             .as_ref()
             .is_none_or(|cached| cached.rect != rect || cached.layout.horizontal != horizontal);
         if rebuild {
-            let layout = resolve_linear_layout(&self.children, rect, horizontal);
+            let layout = resolve_linear_layout(&self.children, rect, horizontal, profile);
             *self.cache.borrow_mut() = Some(Box::new(CachedLinearLayout { rect, layout }));
         }
         Ref::map(self.cache.borrow(), |cached| {
@@ -1766,6 +1905,7 @@ fn resolve_linear_layout<Message>(
     children: &[Node<Message>],
     rect: Rect,
     horizontal: bool,
+    profile: WidthProfile<'static>,
 ) -> LinearLayout {
     let available = if horizontal { rect.width } else { rect.height };
     let mut layout = LinearLayout {
@@ -1780,7 +1920,13 @@ fn resolve_linear_layout<Message>(
             desired: 0,
         }; INLINE_LINEAR_CHILDREN];
         let mut minimums = [0; INLINE_LINEAR_CHILDREN];
-        fill_linear_tracks(children, rect, horizontal, &mut tracks[..children.len()]);
+        fill_linear_tracks(
+            children,
+            rect,
+            horizontal,
+            &mut tracks[..children.len()],
+            profile,
+        );
         allocate_into(
             available,
             &tracks[..children.len()],
@@ -1799,7 +1945,7 @@ fn resolve_linear_layout<Message>(
     ];
     let mut minimums = vec![0; children.len()];
     layout.overflow = vec![0; children.len()];
-    fill_linear_tracks(children, rect, horizontal, &mut tracks);
+    fill_linear_tracks(children, rect, horizontal, &mut tracks, profile);
     allocate_into(available, &tracks, &mut layout.overflow, &mut minimums);
     layout
 }
@@ -1809,9 +1955,10 @@ fn fill_linear_tracks<Message>(
     rect: Rect,
     horizontal: bool,
     tracks: &mut [Track],
+    profile: WidthProfile<'static>,
 ) {
     for (index, child) in children.iter().enumerate() {
-        let measured = child.measure(Constraints::bounded(rect.size()));
+        let measured = child.measure(Constraints::bounded(rect.size()), profile);
         let desired = match &child.kind {
             NodeKind::Gap(cells) => *cells,
             _ if horizontal => measured.width,
@@ -1824,25 +1971,26 @@ fn fill_linear_tracks<Message>(
     }
 }
 
-fn render_text(surface: &mut Surface, rect: Rect, clip: Rect, content: &str, style: Style) {
+fn render_text(
+    surface: &mut Surface,
+    rect: Rect,
+    clip: Rect,
+    content: &str,
+    style: Style,
+    profile: WidthProfile<'static>,
+) {
     if rect.is_empty() {
         return;
     }
-    let lines = wrapped_lines(content, rect.width as usize, WidthProfile::MODERN);
+    let lines = wrapped_lines(content, rect.width as usize, profile);
     for (line_index, line) in lines.take(rect.height as usize).enumerate() {
         let y = add_coordinate(rect.y, line_index as u32);
         let mut x = i64::from(rect.x);
         for grapheme in graphemes(line.text()) {
-            let span = grapheme_width(grapheme.text(), WidthProfile::MODERN).max(1) as i64;
+            let span = grapheme_width(grapheme.text(), profile).max(1) as i64;
             let end = x.saturating_add(span);
             if contains_unit(clip, x, i64::from(y), end) {
-                surface.write(
-                    clamp_i64_to_i32(x),
-                    y,
-                    grapheme.text(),
-                    style,
-                    WidthProfile::MODERN,
-                );
+                surface.write(clamp_i64_to_i32(x), y, grapheme.text(), style, profile);
             }
             x = end;
         }
@@ -1856,34 +2004,42 @@ fn render_rich_text(
     spans: &[TextSpan],
     options: ParagraphOptions,
     cache: &RefCell<ParagraphLayoutCache>,
+    profile: WidthProfile<'static>,
 ) {
     if rect.is_empty() {
         return;
     }
     let mut cache = cache.borrow_mut();
-    let layout = cache.resolve(spans, rect.width, true, options.wrap);
+    let layout = cache.resolve(spans, rect.width, true, options.wrap, profile);
     for line_index in 0..layout.lines.len().min(rect.height as usize) {
         render_rich_text_line(
             surface,
-            rect,
-            clip,
+            RenderRegion { rect, clip },
             line_index as u32,
             &layout,
             spans,
             options,
+            profile,
         );
     }
 }
 
-fn render_rich_text_line(
-    surface: &mut Surface,
+#[derive(Clone, Copy)]
+struct RenderRegion {
     rect: Rect,
     clip: Rect,
+}
+
+fn render_rich_text_line(
+    surface: &mut Surface,
+    region: RenderRegion,
     line_index: u32,
     layout: &crate::rich_text::ParagraphLayout<'_>,
     spans: &[TextSpan],
     options: ParagraphOptions,
+    profile: WidthProfile<'static>,
 ) {
+    let RenderRegion { rect, clip } = region;
     let line = &layout.lines[line_index as usize];
     let desired = line.width.min(rect.width);
     let mut x = i64::from(add_coordinate(
@@ -1903,14 +2059,42 @@ fn render_rich_text_line(
                 y,
                 unit.text(spans),
                 unit.style(spans),
-                WidthProfile::MODERN,
+                profile,
             );
         }
         x = end;
     }
 }
 
-fn render_surface_node(surface: &mut Surface, rect: Rect, clip: Rect, source: &Surface) {
+fn render_cursor_anchor(
+    surface: &mut Surface,
+    rect: Rect,
+    clip: Rect,
+    focus_owner: &NodeId,
+    interaction: &InteractionState,
+) {
+    if interaction.focused() != Some(focus_owner) || rect.x < clip.x || rect.y < clip.y {
+        return;
+    }
+    let mut x = i64::from(rect.x);
+    let right = i64::from(clip.x) + i64::from(clip.width);
+    if x == right && clip.width > 0 {
+        x -= 1;
+    }
+    let point = crate::Point::new(clamp_i64_to_i32(x), rect.y);
+    if !clip.contains(point) || point.x < 0 || point.y < 0 {
+        return;
+    }
+    let _ = surface.set_cursor(Some(Cursor::new(point.x as u32, point.y as u32)));
+}
+
+fn render_surface_node(
+    surface: &mut Surface,
+    rect: Rect,
+    clip: Rect,
+    source: &Surface,
+    profile: WidthProfile<'static>,
+) {
     if rect.is_empty() {
         return;
     }
@@ -1940,13 +2124,10 @@ fn render_surface_node(surface: &mut Surface, rect: Rect, clip: Rect, source: &S
                     surface.set_style(target_x, target_y, style);
                 }
             } else {
-                surface.write(
-                    target_x,
-                    target_y,
-                    cell.content(),
-                    cell.style(),
-                    WidthProfile::MODERN,
-                );
+                if grapheme_width(cell.content(), profile) != span as usize {
+                    continue;
+                }
+                surface.write(target_x, target_y, cell.content(), cell.style(), profile);
             }
         }
     }
@@ -1979,6 +2160,7 @@ fn render_text_input(
     style: Style,
     placeholder_style: Style,
     interaction: &InteractionState,
+    profile: WidthProfile<'static>,
 ) {
     if rect.is_empty() {
         return;
@@ -1995,13 +2177,13 @@ fn render_text_input(
     let cursor_cell = if value.is_empty() {
         0
     } else {
-        cell_at_byte(value, cursor, WidthProfile::MODERN).unwrap_or(0)
+        cell_at_byte(value, cursor, profile).unwrap_or(0)
     };
     let visible_width = rect.width as usize;
     let requested_start = cursor_cell.saturating_sub(visible_width.saturating_sub(1));
     let mut start_cell = requested_start;
     let start_byte = loop {
-        if let Some(byte) = byte_at_cell(content, start_cell, WidthProfile::MODERN) {
+        if let Some(byte) = byte_at_cell(content, start_cell, profile) {
             break byte;
         }
         if start_cell == 0 {
@@ -2009,7 +2191,14 @@ fn render_text_input(
         }
         start_cell -= 1;
     };
-    render_single_line(surface, rect, clip, &content[start_byte..], content_style);
+    render_single_line(
+        surface,
+        rect,
+        clip,
+        &content[start_byte..],
+        content_style,
+        profile,
+    );
 
     if focused {
         let relative = cursor_cell
@@ -2022,23 +2211,24 @@ fn render_text_input(
     }
 }
 
-fn render_single_line(surface: &mut Surface, rect: Rect, clip: Rect, content: &str, style: Style) {
+fn render_single_line(
+    surface: &mut Surface,
+    rect: Rect,
+    clip: Rect,
+    content: &str,
+    style: Style,
+    profile: WidthProfile<'static>,
+) {
     let mut x = i64::from(rect.x);
     let right = i64::from(rect.x) + i64::from(rect.width);
     for grapheme in graphemes(content) {
-        let span = grapheme_width(grapheme.text(), WidthProfile::MODERN).max(1) as i64;
+        let span = grapheme_width(grapheme.text(), profile).max(1) as i64;
         let end = x.saturating_add(span);
         if end > right {
             break;
         }
         if contains_unit(clip, x, i64::from(rect.y), end) {
-            surface.write(
-                clamp_i64_to_i32(x),
-                rect.y,
-                grapheme.text(),
-                style,
-                WidthProfile::MODERN,
-            );
+            surface.write(clamp_i64_to_i32(x), rect.y, grapheme.text(), style, profile);
         }
         x = end;
     }
@@ -2049,8 +2239,9 @@ fn scroll_child_rect<Message>(
     child: &Node<Message>,
     requested: ScrollOffset,
     axis: ScrollAxis,
+    profile: WidthProfile<'static>,
 ) -> Rect {
-    let content = child.measure(scroll_constraints(viewport, axis));
+    let content = child.measure(scroll_constraints(viewport, axis), profile);
     let width = content.width.max(viewport.width);
     let height = content.height.max(viewport.height);
     let offset =
@@ -2076,6 +2267,7 @@ fn prepare_virtual_flow_node<Message>(
     flow: &VirtualFlowNode<Message>,
     rect: Rect,
     interaction: &mut InteractionState,
+    profile: WidthProfile<'static>,
 ) -> bool {
     let previous = flow.cache.borrow_mut().take();
     let previous_signature = previous.as_ref().map(|frame| {
@@ -2120,10 +2312,13 @@ fn prepare_virtual_flow_node<Message>(
             let height = reusable
                 .get(&index)
                 .expect("a requested virtual flow item was built")
-                .measure(Constraints {
-                    width: Limit::Bounded(rect.width),
-                    height: Limit::Unbounded,
-                })
+                .measure(
+                    Constraints {
+                        width: Limit::Bounded(rect.width),
+                        height: Limit::Unbounded,
+                    },
+                    profile,
+                )
                 .height
                 .max(1);
             measurements.push((index, height));
@@ -2155,6 +2350,7 @@ fn prepare_virtual_flow_node<Message>(
         child_changed |= node.prepare_at(
             virtual_flow_item_rect(rect, window.offset, origin, height),
             interaction,
+            profile,
         );
         items.push(VirtualFlowBuiltItem {
             index,
@@ -2264,7 +2460,11 @@ fn virtual_content_is_empty(content: Size, axis: ScrollAxis) -> bool {
     }
 }
 
-fn virtual_fragment_rect<Message>(viewport: Rect, cached: &VirtualCache<Message>) -> Rect {
+fn virtual_fragment_rect<Message>(
+    viewport: Rect,
+    cached: &VirtualCache<Message>,
+    profile: WidthProfile<'static>,
+) -> Rect {
     let request = cached.request;
     let origin = ScrollOffset::new(
         cached.fragment.origin.x.min(request.content_size.width),
@@ -2277,7 +2477,7 @@ fn virtual_fragment_rect<Message>(viewport: Rect, cached: &VirtualCache<Message>
     let measured = cached
         .fragment
         .node
-        .measure(Constraints::bounded(remaining));
+        .measure(Constraints::bounded(remaining), profile);
     let visible_end = ScrollOffset::new(
         request.offset.x.saturating_add(request.size.width),
         request.offset.y.saturating_add(request.size.height),
@@ -2309,13 +2509,20 @@ fn scroll_constraints(viewport: Rect, axis: ScrollAxis) -> Constraints {
     }
 }
 
-fn render_border(surface: &mut Surface, rect: Rect, clip: Rect, style: Style) {
+fn render_border(
+    surface: &mut Surface,
+    rect: Rect,
+    clip: Rect,
+    style: Style,
+    profile: WidthProfile<'static>,
+) {
     render_border_with_glyphs(
         surface,
         rect,
         clip,
         style,
-        &border_glyphs(BorderKind::Single),
+        &profile_aware_border_glyphs(border_glyphs(BorderKind::Single), profile),
+        profile,
     );
 }
 
@@ -2325,6 +2532,7 @@ fn render_border_with_glyphs(
     clip: Rect,
     style: Style,
     glyphs: &BorderGlyphs,
+    profile: WidthProfile<'static>,
 ) {
     if rect.is_empty() {
         return;
@@ -2339,15 +2547,24 @@ fn render_border_with_glyphs(
             i64::from(rect.y),
             glyphs.horizontal,
             style,
+            profile,
         );
         if bottom != i64::from(rect.y) {
-            write_border_cell(surface, clip, x, bottom, glyphs.horizontal, style);
+            write_border_cell(surface, clip, x, bottom, glyphs.horizontal, style, profile);
         }
     }
     for y in i64::from(rect.y)..=bottom {
-        write_border_cell(surface, clip, i64::from(rect.x), y, glyphs.vertical, style);
+        write_border_cell(
+            surface,
+            clip,
+            i64::from(rect.x),
+            y,
+            glyphs.vertical,
+            style,
+            profile,
+        );
         if right != i64::from(rect.x) {
-            write_border_cell(surface, clip, right, y, glyphs.vertical, style);
+            write_border_cell(surface, clip, right, y, glyphs.vertical, style, profile);
         }
     }
     write_border_cell(
@@ -2357,6 +2574,7 @@ fn render_border_with_glyphs(
         i64::from(rect.y),
         glyphs.top_left,
         style,
+        profile,
     );
     if right != i64::from(rect.x) {
         write_border_cell(
@@ -2366,6 +2584,7 @@ fn render_border_with_glyphs(
             i64::from(rect.y),
             glyphs.top_right,
             style,
+            profile,
         );
     }
     if bottom != i64::from(rect.y) {
@@ -2376,22 +2595,32 @@ fn render_border_with_glyphs(
             bottom,
             glyphs.bottom_left,
             style,
+            profile,
         );
         if right != i64::from(rect.x) {
-            write_border_cell(surface, clip, right, bottom, glyphs.bottom_right, style);
+            write_border_cell(
+                surface,
+                clip,
+                right,
+                bottom,
+                glyphs.bottom_right,
+                style,
+                profile,
+            );
         }
     }
 }
 
 fn render_panel<Message>(
     surface: &mut Surface,
-    rect: Rect,
-    clip: Rect,
+    region: RenderRegion,
     child: &Node<Message>,
     title: &str,
     options: PanelOptions,
     interaction: &InteractionState,
+    profile: WidthProfile<'static>,
 ) {
+    let RenderRegion { rect, clip } = region;
     if rect.is_empty() {
         return;
     }
@@ -2408,23 +2637,32 @@ fn render_panel<Message>(
         rect,
         clip,
         options.style.border,
-        &border_glyphs(options.border),
+        &profile_aware_border_glyphs(border_glyphs(options.border), profile),
+        profile,
     );
-    render_panel_title(surface, rect, clip, title, options.style.title);
+    render_panel_title(surface, rect, clip, title, options.style.title, profile);
     let insets = panel_content_insets(options);
     child.render(
         surface,
         inset(rect, insets.left, insets.top, insets.right, insets.bottom),
         clip,
         interaction,
+        profile,
     );
 }
 
-fn render_panel_title(surface: &mut Surface, rect: Rect, clip: Rect, title: &str, style: Style) {
+fn render_panel_title(
+    surface: &mut Surface,
+    rect: Rect,
+    clip: Rect,
+    title: &str,
+    style: Style,
+    profile: WidthProfile<'static>,
+) {
     if title.is_empty() || rect.width < 4 {
         return;
     }
-    let title = truncate(title, (rect.width - 4) as usize, WidthProfile::MODERN);
+    let title = truncate(title, (rect.width - 4) as usize, profile);
     let content = format!(" {title} ");
     render_single_line(
         surface,
@@ -2432,18 +2670,55 @@ fn render_panel_title(surface: &mut Surface, rect: Rect, clip: Rect, title: &str
         clip,
         &content,
         style,
+        profile,
     );
 }
 
-fn write_border_cell(surface: &mut Surface, clip: Rect, x: i64, y: i64, text: &str, style: Style) {
+fn write_border_cell(
+    surface: &mut Surface,
+    clip: Rect,
+    x: i64,
+    y: i64,
+    text: &str,
+    style: Style,
+    profile: WidthProfile<'static>,
+) {
     if contains_unit(clip, x, y, x + 1) {
         surface.write(
             clamp_i64_to_i32(x),
             clamp_i64_to_i32(y),
             text,
             style,
-            WidthProfile::MODERN,
+            profile,
         );
+    }
+}
+
+fn profile_aware_border_glyphs(
+    glyphs: BorderGlyphs,
+    profile: WidthProfile<'static>,
+) -> BorderGlyphs {
+    if [
+        glyphs.top_left,
+        glyphs.horizontal,
+        glyphs.top_right,
+        glyphs.vertical,
+        glyphs.bottom_left,
+        glyphs.bottom_right,
+    ]
+    .into_iter()
+    .all(|glyph| grapheme_width(glyph, profile) == 1)
+    {
+        glyphs
+    } else {
+        BorderGlyphs {
+            top_left: "+",
+            horizontal: "-",
+            top_right: "+",
+            vertical: "|",
+            bottom_left: "+",
+            bottom_right: "+",
+        }
     }
 }
 
@@ -2477,8 +2752,9 @@ fn aligned_child_rect<Message>(
     child: &Node<Message>,
     horizontal: HorizontalAlignment,
     vertical: VerticalAlignment,
+    profile: WidthProfile<'static>,
 ) -> Rect {
-    let desired = child.measure(Constraints::bounded(rect.size()));
+    let desired = child.measure(Constraints::bounded(rect.size()), profile);
     let width = desired.width.min(rect.width);
     let height = desired.height.min(rect.height);
     Rect::new(
@@ -2659,6 +2935,28 @@ mod tests {
             let style = surface.cell(x, 0).unwrap().style();
             assert!(style.reverse && style.underline);
         }
+    }
+
+    #[test]
+    fn cursor_anchor_uses_no_layout_width_and_follows_focus() {
+        let node = Node::<Message>::row([
+            Node::text("A"),
+            Node::cursor_anchor("editor"),
+            Node::text("B"),
+        ]);
+        let mut surface = Surface::new(2, 1).unwrap();
+        let mut interaction = InteractionState::new();
+        interaction.focused = Some(NodeId::from("editor"));
+
+        node.render_to(&mut surface, &interaction);
+
+        assert_eq!(surface.cell(0, 0).unwrap().content(), "A");
+        assert_eq!(surface.cell(1, 0).unwrap().content(), "B");
+        assert_eq!(surface.cursor(), Some(Cursor::new(1, 0)));
+
+        let mut unfocused = Surface::new(2, 1).unwrap();
+        node.render_to(&mut unfocused, &InteractionState::new());
+        assert_eq!(unfocused.cursor(), None);
     }
 
     #[test]

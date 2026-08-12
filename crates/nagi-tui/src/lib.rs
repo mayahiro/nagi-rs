@@ -22,6 +22,7 @@ mod renderer;
 mod rich_text;
 mod routing;
 mod runtime;
+mod runtime_notice;
 mod subscription;
 mod subscription_supervisor;
 mod supervisor;
@@ -81,15 +82,16 @@ pub use presentation::{
 pub use rich_text::{ParagraphOptions, TextSpan, WrapMode};
 pub use routing::{EventDispatch, EventResult};
 pub use runtime::{
-    DEFAULT_QUEUE_CAPACITY, DEFAULT_SUBSCRIPTION_CAPACITY, DEFAULT_TASK_LIMIT, Frame, QueueFull,
-    Runtime, RuntimeConfig, RuntimeError, RuntimeEventError,
+    DEFAULT_QUEUE_CAPACITY, DEFAULT_RUNTIME_NOTICE_CAPACITY, DEFAULT_SUBSCRIPTION_CAPACITY,
+    DEFAULT_TASK_LIMIT, Frame, QueueFull, Runtime, RuntimeConfig, RuntimeError, RuntimeEventError,
 };
+pub use runtime_notice::{RuntimeNotice, RuntimeNoticeDiagnostics, RuntimeNoticeKind};
 pub use subscription::{
     DeliveryPolicy, Subscription, SubscriptionClosed, SubscriptionKey, SubscriptionSink,
 };
 pub use subscription_supervisor::SubscriptionDiagnostics;
 pub use supervisor::EffectDiagnostics;
-pub use terminal::{RunError, TerminalOptions, run_terminal};
+pub use terminal::{RunError, TerminalOptions, run_terminal, run_terminal_with_notice_handler};
 pub use virtual_flow::{
     DuplicateVirtualFlowItemKey, VirtualFlowAnchor, VirtualFlowAnchorAffinity, VirtualFlowItem,
     VirtualFlowItemContext, VirtualFlowItems, VirtualFlowOptions, VirtualFlowSource,

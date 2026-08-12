@@ -27,7 +27,7 @@ impl App for Dashboard {
         Effect::none()
     }
 
-    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+    fn view(&self, context: nagi_tui::ViewContext) -> Node<Self::Message> {
         let requests = Node::panel(
             Node::column([
                 Node::styled_text(
@@ -91,6 +91,7 @@ impl App for Dashboard {
             8,
         )
         .bounds(0, 7, 0, 12)
+        .width_profile(context.width_profile)
         .into_node();
         let resources = BarChart::new(
             [
@@ -101,6 +102,7 @@ impl App for Dashboard {
             16,
         )
         .maximum(100)
+        .width_profile(context.width_profile)
         .into_node();
         let services = Table::new(
             "services",
@@ -144,6 +146,7 @@ impl App for Dashboard {
                 HelpBinding::new("Up/Down", "select service"),
                 HelpBinding::new("Esc", "exit"),
             ])
+            .width_profile(context.width_profile)
             .into_node()
             .with_length(Length::Fixed(1)),
         ])

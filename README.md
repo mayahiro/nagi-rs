@@ -73,14 +73,20 @@ nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
 `nagi-tui-test` drives messages, terminal input, resize, virtual time, Effects,
-Subscriptions, frame inspection, and active resolved action queries without a
-real terminal
+Subscriptions, Runtime notices, frame inspection, and active resolved action
+queries without a real terminal
 
 `nagi-cli-test` injects argv and process services, then captures output and Exit
 Status without starting a process or installing a signal handler
 
 The shared [event-driven application architecture](https://github.com/mayahiro/nagi/blob/main/docs/EVENT_DRIVEN_APPLICATIONS.md)
 explains how process output and timers enter Nagi without a second UI loop
+
+`RuntimeConfig::width_profile` and `TerminalOptions::width_profile` select one
+cell width policy for Core measurement, rendering, hit geometry, and cursor
+placement. Pass `ViewContext::width_profile` to width-sensitive widget builders.
+Unexpected asynchronous lifecycle transitions are available through the
+bounded Runtime notice queue or the terminal notice-handler entry point
 
 ## Examples
 
@@ -129,8 +135,9 @@ domain state
 
 `TextArea` keeps no-wrap behavior by default. `soft_wrap` adds visual-line
 navigation, `boundary_navigation` can pass Up and Down through at visual
-boundaries, and `viewport` follows an application-identified caret without an
-extra Tab stop
+boundaries, and `viewport` follows an application-identified zero-width typed
+cursor anchor without an extra Tab stop. The cursor does not draw a caret
+grapheme or shift following text
 
 `Composer` adds controlled submit and history recall, automatic row bounds,
 optional validation content, and insertion limits over `TextArea`. Applications
@@ -143,7 +150,9 @@ I/O, pointer selection, and redaction policy remain application concerns
 
 `Disclosure` keeps expanded state in the application and constructs its body
 only while expanded. Core Modal scopes focus their first descendant on entry
-and return to previous focus on close by default; both targets are configurable
+and return to previous focus on close by default; both targets are configurable.
+`Node::block_unhandled_events` adds an opt-in hard input boundary when a modal
+must also stop unhandled raw Events and terminal fallback mapping
 
 `Dialog` composes application-defined action lists, lazy controlled details,
 explicit default and cancel targets, focus policies, and Cell-width action

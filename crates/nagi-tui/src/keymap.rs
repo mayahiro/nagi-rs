@@ -354,7 +354,7 @@ impl KeyBinding {
     /// Reports whether a normalized event matches this binding
     #[must_use]
     pub fn matches(self, event: &Event) -> bool {
-        if KeyStroke::from_event(event) != Some(self.stroke) {
+        if !self.matches_stroke(event) {
             return false;
         }
         match event {
@@ -366,6 +366,16 @@ impl KeyBinding {
             Event::Text(_) => true,
             _ => false,
         }
+    }
+
+    /// Reports whether an event has this binding's normalized stroke
+    ///
+    /// Unlike [`Self::matches`], this ignores repeat policy. Disabled-consume
+    /// actions use it to keep repeated input inside the same semantic boundary
+    /// without invoking a handler that is initial-only
+    #[must_use]
+    pub fn matches_stroke(self, event: &Event) -> bool {
+        KeyStroke::from_event(event) == Some(self.stroke)
     }
 }
 

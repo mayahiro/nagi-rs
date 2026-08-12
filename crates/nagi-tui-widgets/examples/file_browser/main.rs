@@ -66,7 +66,7 @@ impl App for FileBrowser {
         Effect::none()
     }
 
-    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+    fn view(&self, context: nagi_tui::ViewContext) -> Node<Self::Message> {
         let entries = entries_for(&self.cwd);
         let picker = FilePicker::new("files", entries.clone(), self.selected, Message::Select)
             .on_open(Message::Open)
@@ -134,6 +134,7 @@ impl App for FileBrowser {
                 HelpBinding::new("Tab", "focus"),
                 HelpBinding::new("Esc", "exit"),
             ])
+            .width_profile(context.width_profile)
             .into_node()
             .with_length(Length::Fixed(1)),
         ])

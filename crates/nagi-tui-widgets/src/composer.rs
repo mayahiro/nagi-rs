@@ -1,6 +1,6 @@
 use std::sync::{Arc, LazyLock};
 
-use nagi_text::graphemes;
+use nagi_text::{WidthProfile, graphemes};
 use nagi_tui::{
     Action, ActionAvailability, ActionDescriptor, BindingSupport, EventResult, KeyBinding, KeyCode,
     KeyStroke, Length, Modifiers, Node, NodeId, RepeatPolicy, Style, TEXT_CURSOR_DOWN_ACTION_ID,
@@ -113,6 +113,7 @@ pub struct Composer<Message> {
     placeholder: String,
     style: TextAreaStyle,
     selection_style: Style,
+    width_profile: WidthProfile<'static>,
     wrap_width: Option<usize>,
     min_rows: u32,
     max_rows: u32,
@@ -149,6 +150,7 @@ impl<Message: 'static> Composer<Message> {
                 reverse: true,
                 ..Style::default()
             },
+            width_profile: WidthProfile::MODERN,
             wrap_width: None,
             min_rows: DEFAULT_MIN_ROWS,
             max_rows: DEFAULT_MAX_ROWS,
@@ -193,6 +195,15 @@ impl<Message: 'static> Composer<Message> {
     #[must_use]
     pub const fn selection_style(mut self, style: Style) -> Self {
         self.selection_style = style;
+        self
+    }
+
+    /// Sets the terminal cell-width policy used by editing and layout
+    ///
+    /// Pass `ViewContext::width_profile` to keep the widget aligned with its Runtime
+    #[must_use]
+    pub const fn width_profile(mut self, profile: WidthProfile<'static>) -> Self {
+        self.width_profile = profile;
         self
     }
 
@@ -298,6 +309,7 @@ impl<Message: 'static> Composer<Message> {
             self.wrap_width,
             self.min_rows,
             self.max_rows,
+            self.width_profile,
         )
     }
 
@@ -313,6 +325,7 @@ impl<Message: 'static> Composer<Message> {
             self.on_redo.is_some(),
             &self.state.text_area,
             self.wrap_width,
+            self.width_profile,
         );
         let (has_up, has_down) = text_directions(&text);
         let leading = composer_leading_descriptors(
@@ -347,6 +360,7 @@ impl<Message: 'static> Composer<Message> {
         .placeholder(self.placeholder)
         .style(self.style)
         .selection_style(self.selection_style)
+        .width_profile(self.width_profile)
         .boundary_navigation(TextAreaBoundaryNavigation::Bubble)
         .viewport(self.viewport_id, self.caret_id, Length::Fixed(rows));
         if let Some(width) = self.wrap_width {
@@ -365,6 +379,7 @@ impl<Message: 'static> Composer<Message> {
             has_redo,
             &self.state.text_area,
             self.wrap_width,
+            self.width_profile,
         );
         let (has_up, has_down) = text_directions(&text_descriptors);
         let previous = (!has_up)
@@ -404,6 +419,7 @@ fn composer_text_descriptors(
     has_redo: bool,
     state: &TextAreaState,
     wrap_width: Option<usize>,
+    profile: WidthProfile<'static>,
 ) -> [ActionDescriptor; TEXT_ACTION_COUNT] {
     let mut descriptors = text_area_action_descriptors(
         enabled,
@@ -412,6 +428,7 @@ fn composer_text_descriptors(
         TextAreaBoundaryNavigation::Bubble,
         state,
         wrap_width,
+        profile,
     );
     let line_break = descriptors
         .iter_mut()
@@ -557,10 +574,12 @@ fn composer_visible_rows(
     wrap_width: Option<usize>,
     min_rows: u32,
     max_rows: u32,
+    profile: WidthProfile<'static>,
 ) -> u32 {
     let minimum = min_rows.max(1);
     let maximum = max_rows.max(minimum);
-    let content = u32::try_from(text_area_visual_line_count(state, wrap_width)).unwrap_or(u32::MAX);
+    let content =
+        u32::try_from(text_area_visual_line_count(state, wrap_width, profile)).unwrap_or(u32::MAX);
     content.clamp(minimum, maximum)
 }
 

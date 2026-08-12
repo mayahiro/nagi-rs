@@ -3,10 +3,12 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
+use nagi_text::WidthProfile;
+
 use crate::terminal_unix::{TerminalError, TerminalSession};
 use crate::{
     App, Capabilities, Event, EventAction, MouseTracking, QueueFull, Runtime, RuntimeConfig,
-    RuntimeError, RuntimeEventError, Size, SystemClock, TimedInputDecoder,
+    RuntimeError, RuntimeEventError, RuntimeNotice, Size, SystemClock, TimedInputDecoder,
 };
 
 /// Settings for [`run_terminal`]
@@ -26,11 +28,17 @@ pub struct TerminalOptions {
     pub task_limit: usize,
     /// Maximum pending values retained by each subscription source
     pub subscription_capacity: usize,
+    /// Maximum retained asynchronous lifecycle notices
+    pub runtime_notice_capacity: usize,
     /// Smallest interval between non-urgent rendered frames
     ///
     /// The default limits rendering to 120 frames per second. Zero disables
     /// the limit.
     pub minimum_frame_interval: Duration,
+    /// Terminal cell-width policy used by the complete view
+    ///
+    /// A Custom override must return stable widths for this Runtime's lifetime
+    pub width_profile: WidthProfile<'static>,
 }
 
 impl Default for TerminalOptions {
@@ -43,7 +51,9 @@ impl Default for TerminalOptions {
             queue_capacity: crate::DEFAULT_QUEUE_CAPACITY,
             task_limit: crate::DEFAULT_TASK_LIMIT,
             subscription_capacity: crate::DEFAULT_SUBSCRIPTION_CAPACITY,
+            runtime_notice_capacity: crate::DEFAULT_RUNTIME_NOTICE_CAPACITY,
             minimum_frame_interval: Duration::from_nanos(8_333_334),
+            width_profile: WidthProfile::MODERN,
         }
     }
 }
@@ -113,14 +123,39 @@ impl From<RuntimeEventError> for RunError {
 pub fn run_terminal<Application, Mapper>(
     app: Application,
     options: TerminalOptions,
-    mut map_event: Mapper,
+    map_event: Mapper,
 ) -> Result<Application, RunError>
 where
     Application: App,
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
 {
+    run_terminal_with_notice_handler(app, options, map_event, |_| {})
+}
+
+/// Runs an application while synchronously observing recovered failures and
+/// unexpected asynchronous lifecycle transitions
+///
+/// The terminal session restores raw mode and screen state on normal, error,
+/// and panic exits. The returned application contains its final state
+pub fn run_terminal_with_notice_handler<Application, Mapper, Handler>(
+    app: Application,
+    options: TerminalOptions,
+    mut map_event: Mapper,
+    mut handle_notice: Handler,
+) -> Result<Application, RunError>
+where
+    Application: App,
+    Mapper: FnMut(Event) -> EventAction<Application::Message>,
+    Handler: FnMut(&RuntimeNotice),
+{
     let mut session = TerminalSession::open(options.mouse_tracking).map_err(run_terminal_error)?;
-    let result = run_terminal_session(&mut session, app, options, &mut map_event);
+    let result = run_terminal_session(
+        &mut session,
+        app,
+        options,
+        &mut map_event,
+        &mut handle_notice,
+    );
     let restoration = session.finish().map_err(run_terminal_error);
     match (result, restoration) {
         (Err(error), _) => Err(error),
@@ -129,15 +164,17 @@ where
     }
 }
 
-fn run_terminal_session<Application, Mapper>(
+fn run_terminal_session<Application, Mapper, Handler>(
     session: &mut TerminalSession,
     app: Application,
     options: TerminalOptions,
     map_event: &mut Mapper,
+    handle_notice: &mut Handler,
 ) -> Result<Application, RunError>
 where
     Application: App,
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
+    Handler: FnMut(&RuntimeNotice),
 {
     let (columns, rows) = session.size().map_err(run_terminal_error)?;
     let clock = SystemClock::new();
@@ -145,7 +182,9 @@ where
     config.queue_capacity = options.queue_capacity;
     config.task_limit = options.task_limit;
     config.subscription_capacity = options.subscription_capacity;
+    config.runtime_notice_capacity = options.runtime_notice_capacity;
     config.minimum_frame_interval = options.minimum_frame_interval;
+    config.width_profile = options.width_profile;
     let mut runtime = Runtime::with_clock_and_wake(app, config, clock, session.wake_handle())?;
     let mut decoder = TimedInputDecoder::new(clock, options.escape_timeout);
     let mut input = [0_u8; 8_192];
@@ -155,6 +194,7 @@ where
         runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
     }
     runtime.process_pending()?;
+    handle_runtime_notices(&mut runtime, handle_notice);
     if options.focus_first {
         runtime.focus_first()?;
     }
@@ -185,25 +225,40 @@ where
 
         let mut exit = false;
         for event in events {
-            if runtime.dispatch_event(&event)?.consumed() {
-                continue;
-            }
-            match map_event(event) {
-                EventAction::Message(message) => runtime.enqueue(message)?,
-                EventAction::Exit => {
-                    exit = true;
-                    break;
+            let dispatch = runtime.dispatch_event(&event)?;
+            if !dispatch.consumed() {
+                match map_event(event) {
+                    EventAction::Message(message) => runtime.enqueue(message)?,
+                    EventAction::Exit => exit = true,
+                    EventAction::Ignore => {}
                 }
-                EventAction::Ignore => {}
+            }
+            runtime.process_queued()?;
+            if exit || runtime.exit_requested() {
+                break;
             }
         }
         runtime.process_pending()?;
+        handle_runtime_notices(&mut runtime, handle_notice);
         write_pending_frame(session, &mut runtime, options.capabilities)?;
         if exit || runtime.exit_requested() {
             break;
         }
     }
     Ok(runtime.into_app())
+}
+
+fn handle_runtime_notices<Application, C, Handler>(
+    runtime: &mut Runtime<Application, C>,
+    handler: &mut Handler,
+) where
+    Application: App,
+    C: crate::Clock,
+    Handler: FnMut(&RuntimeNotice),
+{
+    for notice in runtime.drain_runtime_notices() {
+        handler(&notice);
+    }
 }
 
 fn nearest_terminal_deadline(deadlines: [Option<Duration>; 4]) -> Option<Duration> {

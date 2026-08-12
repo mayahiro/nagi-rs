@@ -101,6 +101,7 @@ pub struct Help<Message> {
     separator: String,
     show_disabled: bool,
     style: HelpStyle,
+    width_profile: WidthProfile<'static>,
     message: PhantomData<fn() -> Message>,
 }
 
@@ -114,6 +115,7 @@ impl<Message> Help<Message> {
             separator: " • ".to_owned(),
             show_disabled: false,
             style: HelpStyle::default(),
+            width_profile: WidthProfile::MODERN,
             message: PhantomData,
         }
     }
@@ -170,6 +172,15 @@ impl<Message> Help<Message> {
         self
     }
 
+    /// Sets the terminal cell-width policy used by full-mode alignment
+    ///
+    /// Pass `ViewContext::width_profile` to keep the widget aligned with its Runtime
+    #[must_use]
+    pub const fn width_profile(mut self, profile: WidthProfile<'static>) -> Self {
+        self.width_profile = profile;
+        self
+    }
+
     /// Builds the public semantic node for this help view
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
@@ -179,7 +190,7 @@ impl<Message> Help<Message> {
             .filter(|binding| binding.enabled || self.show_disabled)
             .collect();
         if self.mode == HelpMode::Full {
-            return full_node(bindings, self.style);
+            return full_node(bindings, self.style, self.width_profile);
         }
         let mut parts = Vec::with_capacity(bindings.len().saturating_mul(4));
         for (index, binding) in bindings.into_iter().enumerate() {
@@ -199,10 +210,14 @@ impl<Message> Help<Message> {
     }
 }
 
-fn full_node<Message>(bindings: Vec<HelpBinding>, style: HelpStyle) -> Node<Message> {
+fn full_node<Message>(
+    bindings: Vec<HelpBinding>,
+    style: HelpStyle,
+    profile: WidthProfile<'static>,
+) -> Node<Message> {
     let key_width = bindings
         .iter()
-        .map(|binding| text_width(&binding.key, WidthProfile::MODERN))
+        .map(|binding| text_width(&binding.key, profile))
         .max()
         .unwrap_or(0);
     Node::column(bindings.into_iter().map(|binding| {
@@ -211,7 +226,7 @@ fn full_node<Message>(bindings: Vec<HelpBinding>, style: HelpStyle) -> Node<Mess
             key_style = key_style.merged(style.disabled);
             description_style = description_style.merged(style.disabled);
         }
-        let padding = key_width.saturating_sub(text_width(&binding.key, WidthProfile::MODERN));
+        let padding = key_width.saturating_sub(text_width(&binding.key, profile));
         Node::row([
             Node::styled_text(format!("{}{}", binding.key, " ".repeat(padding)), key_style),
             Node::text("  "),

@@ -134,6 +134,7 @@ impl ParagraphLayoutCache {
         max_width: u32,
         bounded: bool,
         mode: WrapMode,
+        profile: WidthProfile<'static>,
     ) -> ParagraphLayout<'_> {
         let key = ParagraphLayoutKey {
             max_width,
@@ -145,7 +146,7 @@ impl ParagraphLayoutCache {
             .iter()
             .position(|entry| entry.as_ref().is_some_and(|entry| entry.key == key));
         if entry_index.is_none() {
-            let units = self.units.get_or_insert_with(|| span_units(spans));
+            let units = self.units.get_or_insert_with(|| span_units(spans, profile));
             let lines = layout_lines(units, max_width, bounded, mode);
             let size = paragraph_layout_size(&lines);
             let index = self
@@ -225,7 +226,7 @@ fn layout_lines(
     lines
 }
 
-fn span_units(spans: &[TextSpan]) -> Vec<ParagraphUnit> {
+fn span_units(spans: &[TextSpan], profile: WidthProfile<'static>) -> Vec<ParagraphUnit> {
     let capacity = spans
         .iter()
         .try_fold(0_usize, |total, span| {
@@ -246,7 +247,7 @@ fn span_units(spans: &[TextSpan]) -> Vec<ParagraphUnit> {
                 });
                 continue;
             }
-            let width = grapheme_width(grapheme.text(), WidthProfile::MODERN)
+            let width = grapheme_width(grapheme.text(), profile)
                 .max(1)
                 .min(u32::MAX as usize) as u32;
             units.push(ParagraphUnit {

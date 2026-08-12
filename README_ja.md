@@ -68,11 +68,13 @@ nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 ```
 
-`nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、frame、activeなresolved actionを操作できます
+`nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、Runtime notice、frame、activeなresolved actionを操作できます
 
 `nagi-cli-test`はprocess起動やsignal handler設定を行わず、argvとprocess serviceを注入してoutputとExit Statusを取得します
 
 共有の[event-driven application architecture](https://github.com/mayahiro/nagi/blob/main/docs/EVENT_DRIVEN_APPLICATIONS_ja.md)では、第2のUI loopを作らずprocess outputとtimerをNagiへ渡す方法を説明します
+
+`RuntimeConfig::width_profile`と`TerminalOptions::width_profile`はCoreのmeasure、render、hit geometry、cursor配置で使うcell幅policyを1個選択します。幅計算を行うWidget builderには`ViewContext::width_profile`を渡します。予期しないasync lifecycle transitionは上限付きRuntime notice queueまたはterminal notice-handler entry pointから観測できます
 
 ## Example
 
@@ -107,13 +109,13 @@ TUIのterminal inputとoutputはterminalへ接続されている必要があり�
 
 `Node::virtual_flow`は可変item heightとstable anchorをappend、prepend、削除、streaming更新、幅変更にまたがって保持し、visible fragmentとCell単位の上限付きoverscanだけを構築します。Intrinsic高は0のためlayout `Length`を割り当てます。`VirtualFeed`はdomain stateを所有せず、末尾追従とApplication制御のempty、loading、unread slotを追加します
 
-`TextArea`はdefaultでno-wrap挙動を維持します。`soft_wrap`はvisual-line navigationを追加し、`boundary_navigation`はvisual boundaryのUpとDownをpass-throughへ切り替えられ、`viewport`はTab stopを増やさずapplication suppliedのcaret IDへ追従します
+`TextArea`はdefaultでno-wrap挙動を維持します。`soft_wrap`はvisual-line navigationを追加し、`boundary_navigation`はvisual boundaryのUpとDownをpass-throughへ切り替えられ、`viewport`はTab stopを増やさずapplication suppliedのzero-width typed cursor anchorへ追従します。Cursorはcaret graphemeを描かず後続textを移動しません
 
 `Composer`は`TextArea`へcontrolled submitとhistory recall、自動row境界、任意のvalidation content、挿入制限を加えます。Applicationはmessageの意味、history persistence、sensitive value policyを引き続き所有します
 
 `SelectableText`はimmutableなstyled contentへgrapheme境界に揃えたcontrolled keyboard selectionを加えます。Copy actionはApplication Messageを発行し、clipboard I/O、pointer selection、redaction policyはApplicationの責務として維持します
 
-`Disclosure`はexpanded stateをApplicationに維持し、expanded時だけbodyを構築します。Core Modal scopeはdefaultでentry時に最初のdescendantへfocusし、close時に以前のfocusへ戻り、両方のtargetを設定できます
+`Disclosure`はexpanded stateをApplicationに維持し、expanded時だけbodyを構築します。Core Modal scopeはdefaultでentry時に最初のdescendantへfocusし、close時に以前のfocusへ戻り、両方のtargetを設定できます。Modalがunhandled raw Eventとterminal fallback mappingも止める必要がある場合は`Node::block_unhandled_events`でopt-inのhard input boundaryを追加します
 
 `Dialog`はapplication-defined action list、lazy controlled details、明示的なdefaultとcancel target、focus policy、Cell幅によるaction wrappingを構成します。`ConfirmDialog`はdefaultを明示する二action convenienceです
 
