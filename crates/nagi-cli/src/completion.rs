@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::command::{Argument, Command, OptionKind, OptionSpec};
 use crate::diagnostic::Diagnostic;
+use crate::lifecycle::Deprecation;
 use crate::runtime::CancellationToken;
 
 /// Identifies the syntax target being completed
@@ -208,6 +209,7 @@ pub struct CompletionCandidate {
     value: Arc<str>,
     display_label: Option<Arc<str>>,
     description: Option<Arc<str>>,
+    deprecation: Option<Deprecation>,
     kind: CompletionCandidateKind,
     append_space: bool,
 }
@@ -219,6 +221,7 @@ impl CompletionCandidate {
             value: Arc::from(value.into()),
             display_label: None,
             description: None,
+            deprecation: None,
             kind: CompletionCandidateKind::Value,
             append_space: true,
         }
@@ -269,6 +272,11 @@ impl CompletionCandidate {
         self.description.as_deref()
     }
 
+    /// Returns replacement metadata for a deprecated static candidate
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
+    }
+
     /// Returns the semantic candidate kind
     pub const fn kind(&self) -> CompletionCandidateKind {
         self.kind
@@ -287,6 +295,11 @@ impl CompletionCandidate {
         value.push_str(prefix);
         value.push_str(&self.value);
         self.value = Arc::from(value);
+        self
+    }
+
+    fn with_deprecation(mut self, deprecation: Option<Deprecation>) -> Self {
+        self.deprecation = deprecation;
         self
     }
 }
@@ -446,6 +459,8 @@ struct EngineOption {
     short: Option<char>,
     kind: OptionKind,
     help: String,
+    hidden: bool,
+    deprecation: Option<Deprecation>,
     inherited: bool,
     repeated: bool,
     possible_values: Vec<String>,
@@ -466,6 +481,8 @@ struct EngineCommand {
     name: String,
     aliases: Vec<String>,
     description: String,
+    hidden: bool,
+    deprecation: Option<Deprecation>,
     options: Vec<EngineOption>,
     arguments: Vec<EngineArgument>,
     subcommands: Vec<EngineCommand>,
@@ -492,6 +509,8 @@ impl EngineCommand {
             name: command.name.clone(),
             aliases: command.aliases.clone(),
             description: command.about.clone(),
+            hidden: command.hidden,
+            deprecation: command.deprecation.clone(),
             options: command.options.iter().map(EngineOption::snapshot).collect(),
             arguments: command
                 .arguments
@@ -513,6 +532,8 @@ impl EngineOption {
             short: option.short,
             kind: option.kind,
             help: option.help.clone(),
+            hidden: option.hidden,
+            deprecation: option.deprecation.clone(),
             inherited: option.inherited,
             repeated: option.repeated,
             possible_values: option.parser.possible_values().to_vec(),
@@ -1018,7 +1039,7 @@ impl<'engine> CompletionState<'engine> {
         if completing_word && self.options_enabled && !self.positional_started {
             self.push_subcommands(&mut candidates, current_bytes);
             if self.commands.len() == 1
-                && !self.root.subcommands.is_empty()
+                && self.root.subcommands.iter().any(|command| !command.hidden)
                 && b"help".starts_with(current_bytes)
             {
                 candidates.push(
@@ -1113,12 +1134,14 @@ impl<'engine> CompletionState<'engine> {
         let option = &self.commands[scope_index].options[option_index];
         let target = CompletionTarget::option(self.target_path(scope_index), option.id.clone());
         let mut candidates = Vec::new();
-        self.push_values(
-            &mut candidates,
-            &option.possible_values,
-            &value_prefix,
-            &prefix,
-        );
+        if !option.hidden {
+            self.push_values(
+                &mut candidates,
+                &option.possible_values,
+                &value_prefix,
+                &prefix,
+            );
+        }
         Resolution {
             command_path,
             command_id_path,
@@ -1127,7 +1150,7 @@ impl<'engine> CompletionState<'engine> {
             value_prefix,
             partial: self.partial,
             candidates,
-            provider: option.provider.clone(),
+            provider: (!option.hidden).then(|| option.provider.clone()).flatten(),
         }
     }
 
@@ -1152,11 +1175,15 @@ impl<'engine> CompletionState<'engine> {
 
     fn push_subcommands(&self, candidates: &mut Vec<CompletionCandidate>, prefix: &[u8]) {
         for command in &self.active().subcommands {
+            if command.hidden {
+                continue;
+            }
             if command.name.as_bytes().starts_with(prefix) {
                 candidates.push(
                     CompletionCandidate::new(command.name.clone())
                         .with_kind(CompletionCandidateKind::Command)
-                        .with_description(command.description.clone()),
+                        .with_description(command.description.clone())
+                        .with_deprecation(command.deprecation.clone()),
                 );
             }
             for alias in &command.aliases {
@@ -1164,7 +1191,8 @@ impl<'engine> CompletionState<'engine> {
                     candidates.push(
                         CompletionCandidate::new(alias.clone())
                             .with_kind(CompletionCandidateKind::Command)
-                            .with_description(command.description.clone()),
+                            .with_description(command.description.clone())
+                            .with_deprecation(command.deprecation.clone()),
                     );
                 }
             }
@@ -1178,6 +1206,9 @@ impl<'engine> CompletionState<'engine> {
                 if scope_index != active && !option.inherited {
                     continue;
                 }
+                if option.hidden {
+                    continue;
+                }
                 if option.kind != OptionKind::Count
                     && !option.repeated
                     && self.option_seen(scope_index, option)
@@ -1189,7 +1220,8 @@ impl<'engine> CompletionState<'engine> {
                         candidates.push(
                             CompletionCandidate::new(format!("--{long}"))
                                 .with_kind(CompletionCandidateKind::Option)
-                                .with_description(option.help.clone()),
+                                .with_description(option.help.clone())
+                                .with_deprecation(option.deprecation.clone()),
                         );
                     }
                 }
@@ -1199,7 +1231,8 @@ impl<'engine> CompletionState<'engine> {
                         candidates.push(
                             CompletionCandidate::new(format!("-{short}"))
                                 .with_kind(CompletionCandidateKind::Option)
-                                .with_description(option.help.clone()),
+                                .with_description(option.help.clone())
+                                .with_deprecation(option.deprecation.clone()),
                         );
                     }
                 }

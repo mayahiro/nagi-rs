@@ -129,9 +129,13 @@ fn signed_difference(left: usize, right: usize) -> i64 {
     }
 }
 
-fn benchmark_command(unrelated_branches: usize) -> Command {
+fn benchmark_command(unrelated_branches: usize, deprecated: bool) -> Command {
+    let mut verbose = OptionSpec::count("verbose").long("verbose").inherited();
+    if deprecated {
+        verbose = verbose.deprecated("--log-level");
+    }
     let mut root = Command::new("root")
-        .option(OptionSpec::count("verbose").long("verbose").inherited())
+        .option(verbose)
         .subcommand(Command::new("run"));
     for branch_index in 0..unrelated_branches {
         let mut branch = Command::new(format!("branch-{branch_index}"));
@@ -156,8 +160,8 @@ fn benchmark_arguments() -> Vec<String> {
         .collect()
 }
 
-fn sample(unrelated_branches: usize) -> Vec<Sample> {
-    let command = benchmark_command(unrelated_branches);
+fn sample(unrelated_branches: usize, deprecated: bool) -> Vec<Sample> {
+    let command = benchmark_command(unrelated_branches, deprecated);
     let arguments = benchmark_arguments();
     let mut samples = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
@@ -168,6 +172,10 @@ fn sample(unrelated_branches: usize) -> Vec<Sample> {
             panic!("benchmark parse did not produce an Invocation");
         };
         assert_eq!(invocation.count("verbose"), Some(OPTION_OCCURRENCES as u64));
+        assert_eq!(
+            invocation.deprecation_notices().len(),
+            usize::from(deprecated)
+        );
         black_box(&invocation);
         drop(invocation);
         samples.push(read_metrics(started.elapsed(), baseline));
@@ -205,9 +213,10 @@ fn report(label: &str, samples: Vec<Sample>) {
 }
 
 fn main() {
-    report("cli-inherited-selected-path", sample(0));
+    report("cli-inherited-selected-path", sample(0, false));
     report(
         "cli-inherited-100-unrelated-branches",
-        sample(UNRELATED_BRANCHES),
+        sample(UNRELATED_BRANCHES, false),
     );
+    report("cli-deprecated-1000-occurrences", sample(0, true));
 }

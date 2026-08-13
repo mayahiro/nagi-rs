@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::completion::CompletionProvider;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, display_os};
 use crate::help::{HelpBlock, HelpExample, HelpLink, HelpSection, UsageVariantDefinition};
+use crate::lifecycle::{Deprecation, valid_replacement};
 use crate::parser::Invocation;
 use crate::runtime::Handler;
 use crate::value::{ValueParser, raw_parser};
@@ -57,6 +58,8 @@ pub struct OptionSpec {
     pub(crate) kind: OptionKind,
     pub(crate) parser: Arc<dyn ValueParser>,
     pub(crate) help: String,
+    pub(crate) hidden: bool,
+    pub(crate) deprecation: Option<Deprecation>,
     pub(crate) inherited: bool,
     pub(crate) required: bool,
     pub(crate) repeated: bool,
@@ -91,6 +94,8 @@ impl OptionSpec {
             kind,
             parser: raw_parser(),
             help: String::new(),
+            hidden: false,
+            deprecation: None,
             inherited: false,
             required: false,
             repeated: false,
@@ -117,6 +122,20 @@ impl OptionSpec {
     /// Sets the help description
     pub fn help(mut self, help: impl Into<String>) -> Self {
         self.help = help.into();
+        self
+    }
+
+    /// Omits this option from Help, completion, and derived documentation
+    /// while preserving explicit argv parsing
+    pub const fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
+    }
+
+    /// Marks this option deprecated with an application-provided replacement
+    /// hint while preserving parsing
+    pub fn deprecated(mut self, replacement: impl Into<String>) -> Self {
+        self.deprecation = Some(Deprecation::new(replacement));
         self
     }
 
@@ -221,6 +240,16 @@ impl OptionSpec {
     /// Reports whether this option is visible in selected descendant commands
     pub const fn is_inherited(&self) -> bool {
         self.inherited
+    }
+
+    /// Reports whether this option is omitted from generated projections
+    pub const fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Returns replacement metadata when this option is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
     }
 }
 
@@ -414,6 +443,8 @@ pub struct Command {
     pub(crate) name: String,
     pub(crate) aliases: Vec<String>,
     pub(crate) about: String,
+    pub(crate) hidden: bool,
+    pub(crate) deprecation: Option<Deprecation>,
     pub(crate) version: Option<String>,
     pub(crate) options: Vec<OptionSpec>,
     pub(crate) arguments: Vec<Argument>,
@@ -439,6 +470,8 @@ impl Command {
             name,
             aliases: Vec::new(),
             about: String::new(),
+            hidden: false,
+            deprecation: None,
             version: None,
             options: Vec::new(),
             arguments: Vec::new(),
@@ -471,6 +504,20 @@ impl Command {
     /// Sets the short command description
     pub fn about(mut self, about: impl Into<String>) -> Self {
         self.about = about.into();
+        self
+    }
+
+    /// Omits this command from parent Help, completion, and derived
+    /// documentation while preserving explicit selection and direct Help
+    pub const fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
+    }
+
+    /// Marks this command deprecated with an application-provided replacement
+    /// hint while preserving parsing and handler execution
+    pub fn deprecated(mut self, replacement: impl Into<String>) -> Self {
+        self.deprecation = Some(Deprecation::new(replacement));
         self
     }
 
@@ -587,6 +634,16 @@ impl Command {
         &self.about
     }
 
+    /// Reports whether this command is omitted from parent projections
+    pub const fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Returns replacement metadata when this command is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
+    }
+
     /// Validates the entire graph without consuming argv
     pub fn validate(&self) -> Result<(), Diagnostic> {
         validate_command(
@@ -676,6 +733,16 @@ fn validate_command(
             command.name
         ));
     }
+    if command
+        .deprecation
+        .as_ref()
+        .is_some_and(|deprecation| !valid_replacement(deprecation.replacement()))
+    {
+        return invalid(format!(
+            "command '{}' has an invalid deprecation replacement",
+            command.name
+        ));
+    }
     if !root && command.version.is_some() {
         return invalid(format!(
             "child command '{}' declares a version",
@@ -710,6 +777,16 @@ fn validate_command(
         local_ids.insert(option.id.clone());
         if option.long.is_none() && option.short.is_none() {
             return invalid(format!("option '{}' has no spelling", option.id));
+        }
+        if option
+            .deprecation
+            .as_ref()
+            .is_some_and(|deprecation| !valid_replacement(deprecation.replacement()))
+        {
+            return invalid(format!(
+                "option '{}' has an invalid deprecation replacement",
+                option.id
+            ));
         }
         if let Some(long) = &option.long {
             if !valid_name(long) || reserved_long(long) || !longs.insert(long.clone()) {

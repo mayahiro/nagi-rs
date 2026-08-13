@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCategory, ExitStatus};
 use crate::help::{HelpDocument, HelpRenderer, PlainHelpRenderer};
+use crate::lifecycle::{DeprecationNotice, DeprecationNoticeRenderer};
 
 /// Maps semantic Diagnostic categories to process statuses
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +117,7 @@ pub struct RuntimePolicy {
     exit_codes: ExitCodePolicy,
     help_renderer: Arc<dyn HelpRenderer>,
     diagnostic_renderer: Arc<dyn DiagnosticRenderer>,
+    deprecation_notice_renderer: Option<Arc<dyn DeprecationNoticeRenderer>>,
 }
 
 impl RuntimePolicy {
@@ -143,6 +145,22 @@ impl RuntimePolicy {
         self
     }
 
+    /// Returns a copy that renders Invocation deprecation notices before
+    /// handler execution
+    pub fn with_deprecation_notice_renderer<R>(mut self, renderer: R) -> Self
+    where
+        R: DeprecationNoticeRenderer + 'static,
+    {
+        self.deprecation_notice_renderer = Some(Arc::new(renderer));
+        self
+    }
+
+    /// Returns a copy without automatic deprecation notice output
+    pub fn without_deprecation_notice_renderer(mut self) -> Self {
+        self.deprecation_notice_renderer = None;
+        self
+    }
+
     /// Returns the configured exit-code mapping
     pub const fn exit_code_policy(&self) -> ExitCodePolicy {
         self.exit_codes
@@ -158,6 +176,13 @@ impl RuntimePolicy {
         self.diagnostic_renderer.render_diagnostic(diagnostic)
     }
 
+    /// Renders one deprecation notice when notice output is enabled
+    pub fn render_deprecation_notice(&self, notice: &DeprecationNotice) -> Option<String> {
+        self.deprecation_notice_renderer
+            .as_ref()
+            .map(|renderer| renderer.render_deprecation_notice(notice))
+    }
+
     /// Returns the configured process status for one Diagnostic
     pub fn status_for_diagnostic(&self, diagnostic: &Diagnostic) -> ExitStatus {
         self.exit_codes.status_for(diagnostic.category())
@@ -170,6 +195,7 @@ impl Default for RuntimePolicy {
             exit_codes: ExitCodePolicy::default(),
             help_renderer: Arc::new(PlainHelpRenderer),
             diagnostic_renderer: Arc::new(PlainDiagnosticRenderer::default()),
+            deprecation_notice_renderer: None,
         }
     }
 }

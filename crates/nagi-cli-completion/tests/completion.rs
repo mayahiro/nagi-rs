@@ -124,6 +124,30 @@ fn protocol_handles_static_and_dynamic_candidates() {
 }
 
 #[test]
+fn protocol_decorates_deprecated_static_candidates() {
+    let engine = CompletionEngine::new(
+        &Command::new("qed")
+            .subcommand(Command::new("old").about("Old command").deprecated("run"))
+            .subcommand(Command::new("run")),
+    )
+    .expect("completion command must be valid");
+    let mut output = Vec::new();
+    assert!(
+        handle(
+            &CancellationToken::new(),
+            &engine,
+            [PROTOCOL_TOKEN, "bash", "o"],
+            &mut output,
+        )
+        .expect("Bash protocol must succeed")
+    );
+    assert_eq!(
+        String::from_utf8(output).expect("protocol is UTF-8"),
+        "old\told\tOld command [deprecated: use run]\tcommand\tspace\n"
+    );
+}
+
+#[test]
 fn protocol_passes_through_and_reports_errors() {
     let engine = completion_engine(false);
     let mut output = Vec::new();

@@ -5,6 +5,7 @@ use crate::command::{
     generated_usage_syntax, option_description, option_display, option_label, usage_command_line,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::lifecycle::Deprecation;
 
 #[derive(Clone)]
 pub(crate) struct UsageVariantDefinition {
@@ -73,6 +74,7 @@ pub struct HelpEntry {
     id: String,
     label: String,
     description: String,
+    deprecation: Option<Deprecation>,
 }
 
 /// One option inherited from an ancestor in a Help Document
@@ -108,6 +110,11 @@ impl HelpInheritedOption {
     pub fn description(&self) -> &str {
         self.entry.description()
     }
+
+    /// Returns replacement metadata when this inherited option is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.entry.deprecation()
+    }
 }
 
 impl HelpEntry {
@@ -120,7 +127,13 @@ impl HelpEntry {
             id: id.into(),
             label: label.into(),
             description: description.into(),
+            deprecation: None,
         }
+    }
+
+    pub(crate) fn with_deprecation(mut self, deprecation: Option<Deprecation>) -> Self {
+        self.deprecation = deprecation;
+        self
     }
 
     /// Returns the stable command, argument, option, or generated entry identifier
@@ -136,6 +149,11 @@ impl HelpEntry {
     /// Returns the entry description
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Returns replacement metadata when this entry is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
     }
 }
 
@@ -348,6 +366,7 @@ impl HelpOptionRelation {
 pub struct HelpDocument {
     command_path: Vec<String>,
     description: String,
+    deprecation: Option<Deprecation>,
     usage: Vec<String>,
     usage_variants: Vec<HelpUsageVariant>,
     commands: Vec<HelpEntry>,
@@ -371,6 +390,11 @@ impl HelpDocument {
     /// Returns the command description
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Returns replacement metadata when the selected command is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
     }
 
     /// Returns rendered usage lines
@@ -456,6 +480,11 @@ impl HelpRenderer for PlainHelpRenderer {
             output.push_str(&document.description);
             output.push_str("\n\n");
         }
+        if let Some(deprecation) = &document.deprecation {
+            output.push_str("Deprecated: use ");
+            output.push_str(deprecation.replacement());
+            output.push_str("\n\n");
+        }
 
         output.push_str("Usage:\n");
         for usage in &document.usage {
@@ -478,6 +507,7 @@ impl HelpRenderer for PlainHelpRenderer {
                 description.push_str(&option.command_path.join(" "));
                 description.push(']');
                 HelpEntry::identified(option.id(), option.label(), description)
+                    .with_deprecation(option.entry.deprecation.clone())
             })
             .collect::<Vec<_>>();
         render_entry_section(&mut output, "Inherited Options", &inherited_options);
@@ -555,9 +585,13 @@ impl Command {
         let mut commands = command
             .subcommands
             .iter()
-            .map(|child| HelpEntry::identified(&child.id, &child.name, &child.about))
+            .filter(|child| !child.hidden)
+            .map(|child| {
+                HelpEntry::identified(&child.id, &child.name, &child.about)
+                    .with_deprecation(child.deprecation.clone())
+            })
             .collect::<Vec<_>>();
-        if path.len() == 1 && !command.subcommands.is_empty() {
+        if path.len() == 1 && command.subcommands.iter().any(|child| !child.hidden) {
             commands.push(HelpEntry::identified(
                 "help",
                 "help",
@@ -574,18 +608,47 @@ impl Command {
             .collect();
         let mut options = Vec::with_capacity(command.options.len() + 2);
         let mut option_relations = Vec::new();
-        for option in &command.options {
-            options.push(HelpEntry::identified(
-                &option.id,
-                option_label(option),
-                option_description(option),
-            ));
-            option_relations.extend(option.requires.iter().map(|relation| {
-                help_option_relation(command, option, relation, HelpOptionRelationKind::Requires)
-            }));
-            option_relations.extend(option.conflicts.iter().map(|relation| {
-                help_option_relation(command, option, relation, HelpOptionRelationKind::Conflicts)
-            }));
+        for option in command.options.iter().filter(|option| !option.hidden) {
+            options.push(
+                HelpEntry::identified(&option.id, option_label(option), option_description(option))
+                    .with_deprecation(option.deprecation.clone()),
+            );
+            option_relations.extend(
+                option
+                    .requires
+                    .iter()
+                    .filter(|relation| {
+                        command
+                            .option_by_id(&relation.id)
+                            .is_some_and(|target| !target.hidden)
+                    })
+                    .map(|relation| {
+                        help_option_relation(
+                            command,
+                            option,
+                            relation,
+                            HelpOptionRelationKind::Requires,
+                        )
+                    }),
+            );
+            option_relations.extend(
+                option
+                    .conflicts
+                    .iter()
+                    .filter(|relation| {
+                        command
+                            .option_by_id(&relation.id)
+                            .is_some_and(|target| !target.hidden)
+                    })
+                    .map(|relation| {
+                        help_option_relation(
+                            command,
+                            option,
+                            relation,
+                            HelpOptionRelationKind::Conflicts,
+                        )
+                    }),
+            );
         }
         options.push(HelpEntry::identified("help", "-h, --help", "Print help"));
         if self.version.is_some() {
@@ -602,7 +665,11 @@ impl Command {
             .take(command_lineage.len().saturating_sub(1))
             .enumerate()
         {
-            for option in ancestor.options.iter().filter(|option| option.inherited) {
+            for option in ancestor
+                .options
+                .iter()
+                .filter(|option| option.inherited && !option.hidden)
+            {
                 inherited_options.push(HelpInheritedOption {
                     command_path: path[..=scope_index].to_vec(),
                     command_id_path: command_id_path[..=scope_index].to_vec(),
@@ -610,7 +677,8 @@ impl Command {
                         &option.id,
                         option_label(option),
                         option_description(option),
-                    ),
+                    )
+                    .with_deprecation(option.deprecation.clone()),
                 });
             }
         }
@@ -618,6 +686,13 @@ impl Command {
         let option_groups = command
             .option_groups
             .iter()
+            .filter(|group| {
+                group.options.iter().all(|id| {
+                    command
+                        .option_by_id(id)
+                        .is_some_and(|option| !option.hidden)
+                })
+            })
             .map(|group| HelpOptionGroup {
                 id: group.id.clone(),
                 kind: group.kind,
@@ -640,6 +715,7 @@ impl Command {
         Ok(HelpDocument {
             command_path: path.to_vec(),
             description: command.about.clone(),
+            deprecation: command.deprecation.clone(),
             usage,
             usage_variants,
             commands,
@@ -676,7 +752,8 @@ fn help_usage_variants(
     };
     match command.subcommand_usage {
         SubcommandUsageMode::Auto
-            if !command.subcommands.is_empty() && !command.subcommand_required =>
+            if command.subcommands.iter().any(|child| !child.hidden)
+                && !command.subcommand_required =>
         {
             variants.push(HelpUsageVariant::new(
                 command_id_path.to_vec(),
@@ -686,7 +763,7 @@ fn help_usage_variants(
             ));
         }
         SubcommandUsageMode::Expanded => {
-            for child in &command.subcommands {
+            for child in command.subcommands.iter().filter(|child| !child.hidden) {
                 let mut child_id_path = command_id_path.to_vec();
                 child_id_path.push(child.id.clone());
                 variants.extend(direct_usage_variants(
@@ -763,6 +840,14 @@ fn render_entries(output: &mut String, entries: &[HelpEntry]) {
             output.push(' ');
         }
         output.push_str(&entry.description);
+        if let Some(deprecation) = &entry.deprecation {
+            if !entry.description.is_empty() {
+                output.push(' ');
+            }
+            output.push_str("[deprecated: use ");
+            output.push_str(deprecation.replacement());
+            output.push(']');
+        }
         output.push('\n');
     }
 }

@@ -9,6 +9,7 @@ use crate::command::{
     quote_value,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticTarget};
+use crate::lifecycle::DeprecationNotice;
 use crate::value::{ParsedValue, ValueSource};
 
 #[derive(Clone, Debug)]
@@ -131,6 +132,7 @@ pub struct Invocation {
     command_id_path: Vec<String>,
     scopes: Vec<InvocationScopeData>,
     current_scope: usize,
+    deprecation_notices: Vec<DeprecationNotice>,
 }
 
 impl Invocation {
@@ -142,6 +144,16 @@ impl Invocation {
     /// Returns the stable root-to-leaf command-ID path
     pub fn command_id_path(&self) -> &[String] {
         &self.command_id_path
+    }
+
+    /// Returns deprecated Command and Option uses in deterministic first-use
+    /// order
+    ///
+    /// A deprecated root Command comes first. Subsequent targets follow their
+    /// first successful argv occurrence. Each stable target occurs at most
+    /// once. Environment and default value resolution do not produce notices
+    pub fn deprecation_notices(&self) -> &[DeprecationNotice] {
+        &self.deprecation_notices
     }
 
     /// Returns the current stable path where unqualified lookup starts
@@ -511,6 +523,7 @@ struct Parser<'command> {
     positional_index: usize,
     positional_started: bool,
     options_enabled: bool,
+    deprecation_notices: Vec<DeprecationNotice>,
 }
 
 impl<'command> Parser<'command> {
@@ -519,7 +532,7 @@ impl<'command> Parser<'command> {
         arguments: Vec<OsString>,
         environment: BTreeMap<OsString, OsString>,
     ) -> Self {
-        Self {
+        let mut parser = Self {
             root,
             arguments,
             environment,
@@ -530,7 +543,17 @@ impl<'command> Parser<'command> {
             positional_index: 0,
             positional_started: false,
             options_enabled: true,
+            deprecation_notices: Vec::new(),
+        };
+        if let Some(deprecation) = &root.deprecation {
+            parser.push_deprecation_notice(DeprecationNotice::command(
+                vec![root.name.clone()],
+                vec![root.id.clone()],
+                root.name.clone(),
+                deprecation,
+            ));
         }
+        parser
     }
 
     fn parse(mut self) -> Result<ParseResult, Diagnostic> {
@@ -581,6 +604,7 @@ impl<'command> Parser<'command> {
                 .collect(),
             current_scope: self.scopes.len() - 1,
             scopes: std::mem::take(&mut self.scopes),
+            deprecation_notices: std::mem::take(&mut self.deprecation_notices),
         };
         self.run_validators(&mut invocation)?;
         Ok(ParseResult::Invocation(invocation))
@@ -691,7 +715,20 @@ impl<'command> Parser<'command> {
         let command = self.commands[scope_index];
         let option = &command.options[option_index];
         self.index += 1;
-        self.apply_option(scope_index, option, attached)?;
+        let first_occurrence = self.apply_option(scope_index, option, attached)?;
+        if first_occurrence {
+            let option = &self.commands[scope_index].options[option_index];
+            if let Some(deprecation) = option.deprecation.clone() {
+                let value_id = option.id.clone();
+                self.push_deprecation_notice(DeprecationNotice::option(
+                    self.command_path.clone(),
+                    self.command_id_path(scope_index),
+                    value_id,
+                    format!("--{name}"),
+                    &deprecation,
+                ));
+            }
+        }
         Ok(None)
     }
 
@@ -732,10 +769,36 @@ impl<'command> Parser<'command> {
             if option.kind == OptionKind::Value {
                 let attached = (offset + 1 < bytes.len())
                     .then(|| OsString::from_vec(bytes[offset + 1..].to_vec()));
-                self.apply_option(scope_index, option, attached)?;
+                let first_occurrence = self.apply_option(scope_index, option, attached)?;
+                if first_occurrence {
+                    let option = &self.commands[scope_index].options[option_index];
+                    if let Some(deprecation) = option.deprecation.clone() {
+                        let value_id = option.id.clone();
+                        self.push_deprecation_notice(DeprecationNotice::option(
+                            self.command_path.clone(),
+                            self.command_id_path(scope_index),
+                            value_id,
+                            format!("-{short}"),
+                            &deprecation,
+                        ));
+                    }
+                }
                 return Ok(None);
             }
-            self.apply_option(scope_index, option, None)?;
+            let first_occurrence = self.apply_option(scope_index, option, None)?;
+            if first_occurrence {
+                let option = &self.commands[scope_index].options[option_index];
+                if let Some(deprecation) = option.deprecation.clone() {
+                    let value_id = option.id.clone();
+                    self.push_deprecation_notice(DeprecationNotice::option(
+                        self.command_path.clone(),
+                        self.command_id_path(scope_index),
+                        value_id,
+                        format!("-{short}"),
+                        &deprecation,
+                    ));
+                }
+            }
             offset += 1;
         }
         Ok(None)
@@ -746,8 +809,8 @@ impl<'command> Parser<'command> {
         scope_index: usize,
         option: &OptionSpec,
         attached: Option<OsString>,
-    ) -> Result<(), Diagnostic> {
-        match option.kind {
+    ) -> Result<bool, Diagnostic> {
+        let first_occurrence = match option.kind {
             OptionKind::Flag => {
                 if attached.is_some() {
                     return Err(self.error_with_targets(
@@ -769,6 +832,7 @@ impl<'command> Parser<'command> {
                 self.scopes[scope_index]
                     .values
                     .insert(option.id.clone(), InvocationValue::Flag);
+                true
             }
             OptionKind::Count => {
                 if attached.is_some() {
@@ -781,11 +845,13 @@ impl<'command> Parser<'command> {
                 match self.scopes[scope_index].values.entry(option.id.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(InvocationValue::Count(1));
+                        true
                     }
                     std::collections::btree_map::Entry::Occupied(mut entry) => {
                         if let InvocationValue::Count(count) = entry.get_mut() {
                             *count = count.saturating_add(1);
                         }
+                        false
                     }
                 }
             }
@@ -805,7 +871,8 @@ impl<'command> Parser<'command> {
                         value
                     }
                 };
-                if !option.repeated && self.scopes[scope_index].values.contains_key(&option.id) {
+                let duplicate = self.scopes[scope_index].values.contains_key(&option.id);
+                if !option.repeated && duplicate {
                     return Err(self.error_with_targets(
                         DiagnosticCode::DuplicateOption,
                         format!(
@@ -823,9 +890,10 @@ impl<'command> Parser<'command> {
                     self.option_target(scope_index, &option.id),
                 )?;
                 self.push_value(scope_index, &option.id, parsed);
+                !duplicate
             }
-        }
-        Ok(())
+        };
+        Ok(first_occurrence)
     }
 
     fn visible_long_option(&self, name: &str) -> Option<(usize, usize)> {
@@ -870,12 +938,26 @@ impl<'command> Parser<'command> {
         }) else {
             return false;
         };
+        let deprecation = command.deprecation.clone();
+        let supplied_spelling = name.to_owned();
         self.commands.push(command);
         self.command_path.push(command.name.clone());
         self.scopes.push(InvocationScopeData::new(command));
         self.positional_index = 0;
         self.positional_started = false;
+        if let Some(deprecation) = deprecation {
+            self.push_deprecation_notice(DeprecationNotice::command(
+                self.command_path.clone(),
+                self.current_command_id_path(),
+                supplied_spelling,
+                &deprecation,
+            ));
+        }
         true
+    }
+
+    fn push_deprecation_notice(&mut self, notice: DeprecationNotice) {
+        self.deprecation_notices.push(notice);
     }
 
     fn parse_positional(&mut self, raw: OsString) -> Result<(), Diagnostic> {

@@ -190,9 +190,16 @@ fn write_protocol<W: Write>(
     output: &mut W,
 ) -> io::Result<()> {
     for candidate in candidates {
-        let description = candidate
+        let base_description = candidate
             .description()
             .unwrap_or_else(|| candidate.display_label());
+        let decorated_description = candidate.deprecation().map(|deprecation| {
+            format!(
+                "{base_description} [deprecated: use {}]",
+                deprecation.replacement()
+            )
+        });
+        let description = decorated_description.as_deref().unwrap_or(base_description);
         if shell == Shell::Fish {
             writeln!(output, "{}\t{description}", candidate.value())?;
             continue;

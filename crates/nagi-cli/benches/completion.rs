@@ -13,6 +13,7 @@ const ITERATIONS: usize = 12;
 const REQUESTS_PER_ITERATION: usize = 1_000;
 const UNRELATED_BRANCHES: usize = 100;
 const OPTIONS_PER_BRANCH: usize = 8;
+const HIDDEN_DECLARATIONS: usize = 1_000;
 
 struct TrackingAllocator;
 
@@ -168,6 +169,43 @@ fn sample(unrelated_branches: usize) -> Vec<Sample> {
     samples
 }
 
+fn hidden_command(declarations: usize) -> Command {
+    let mut root = Command::new("root");
+    for index in 0..declarations {
+        root = root
+            .option(
+                OptionSpec::flag(format!("hidden-option-{index}"))
+                    .long(format!("hidden-option-{index}"))
+                    .hidden(),
+            )
+            .subcommand(Command::new(format!("hidden-command-{index}")).hidden());
+    }
+    root
+}
+
+fn sample_hidden(declarations: usize) -> Vec<Sample> {
+    let engine = CompletionEngine::new(&hidden_command(declarations)).unwrap();
+    let cancellation = CancellationToken::new();
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let baseline = reset_metrics();
+        let started = Instant::now();
+        for _ in 0..REQUESTS_PER_ITERATION {
+            let result = engine
+                .complete(
+                    &cancellation,
+                    CompletionInput::new(std::iter::empty::<&str>(), ""),
+                )
+                .unwrap();
+            assert_eq!(result.candidates().len(), 2);
+            black_box(&result);
+            drop(result);
+        }
+        samples.push(read_metrics(started.elapsed(), baseline));
+    }
+    samples
+}
+
 fn report(label: &str, samples: Vec<Sample>) {
     let mut elapsed: Vec<_> = samples
         .iter()
@@ -205,5 +243,10 @@ fn main() {
     report(
         "cli-completion-100-unrelated-branches",
         sample(UNRELATED_BRANCHES),
+    );
+    report("cli-completion-no-visible-declarations", sample_hidden(0));
+    report(
+        "cli-completion-1000-hidden-pairs",
+        sample_hidden(HIDDEN_DECLARATIONS),
     );
 }

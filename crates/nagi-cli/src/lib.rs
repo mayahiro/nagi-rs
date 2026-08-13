@@ -35,6 +35,7 @@ mod completion;
 mod diagnostic;
 mod diagnostic_json;
 mod help;
+mod lifecycle;
 mod parser;
 mod policy;
 mod runtime;
@@ -61,6 +62,10 @@ pub use help::{
     HelpBlock, HelpDocument, HelpEntry, HelpExample, HelpInheritedOption, HelpLink,
     HelpOptionGroup, HelpOptionRelation, HelpOptionRelationKind, HelpRenderer, HelpSection,
     HelpUsageVariant, PlainHelpRenderer,
+};
+pub use lifecycle::{
+    Deprecation, DeprecationNotice, DeprecationNoticeRenderer, DeprecationTargetKind,
+    PlainDeprecationNoticeRenderer,
 };
 pub use parser::{
     Invocation, InvocationScope, ParseResult, ValueAccessError, ValueAccessErrorKind,

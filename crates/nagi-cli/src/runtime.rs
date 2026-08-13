@@ -338,6 +338,11 @@ impl Command {
                     .status_for(crate::diagnostic::DiagnosticCategory::Cancellation),
             ));
         }
+        for notice in invocation.deprecation_notices() {
+            if let Some(rendered) = policy.render_deprecation_notice(notice) {
+                context.stderr().write_all(rendered.as_bytes())?;
+            }
+        }
         let command = self
             .command_at_path(invocation.command_path())
             .expect("the checked canonical path identifies a command");
