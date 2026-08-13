@@ -25,6 +25,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nagi-cli-status"
+version = "0.2.7"
+dependencies = [
+ "nagi-text",
+]
+
+[[package]]
 name = "nagi-cli-test"
 version = "0.2.7"
 dependencies = [

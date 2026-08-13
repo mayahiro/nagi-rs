@@ -54,6 +54,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-cli` | Localと継承Option、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、handlerを含まないcompletion解決、段階実行Runtime Policy、process統合 |
 | `nagi-cli-completion` | Bash、Zsh、Fish、PowerShell generatorと予約済みcompletion protocol |
 | `nagi-cli-prompt` | 注入可能なI/Oを持つ任意の行指向Confirm、Select、Input、Secret |
+| `nagi-cli-status` | 注入可能なI/Oを持つ任意の同期TTY status、spinner、progress、plain-log fallback |
 | `nagi-cli-test` | ProcessなしのCLI input注入とoutput取得 |
 
 [Nagi semantic specification](https://github.com/mayahiro/nagi/tree/main/spec)がGo実装と共有する挙動を定義します
@@ -117,6 +118,7 @@ Rust repository rootから実行します
 | [CLI段階導入](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
 | [CLI軽量prompt](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
+| [CLI TTY-aware status](crates/nagi-cli-status/examples/status/README.md) | `cargo run -p nagi-cli-status --example status` |
 
 ## 制約
 
@@ -154,9 +156,9 @@ Core `Node::split_pane`はhorizontalまたはverticalな二paneを1 Cellのdivid
 
 CLI process統合はLinuxとmacOSへ対応し、Unix argument valueを保持してSIGINTを協調的cancellationへ変換します
 
-Shell固有生成と行指向Promptは任意crateです
+Shell固有生成、行指向Prompt、同期Status Reporterは任意crateです
 
-Completion installation、dynamic candidate I/O、credential管理、approval policyはApplicationが所有します
+Completion installation、dynamic candidate I/O、credential管理、approval policy、status更新時点、progressの意味はApplicationが所有します
 
 設定file読み込みとCLIからTUIへの統合は提供しません
 
