@@ -10,6 +10,7 @@ use crate::command::{
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticTarget};
 use crate::lifecycle::DeprecationNotice;
+use crate::value::REDACTED_VALUE;
 use crate::value::{ParsedValue, ValueSource};
 
 #[derive(Clone, Debug)]
@@ -26,6 +27,8 @@ enum InvocationValue {
 struct InvocationDefinition {
     kind: OptionKind,
     repeated: bool,
+    sensitive: bool,
+    argument: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +46,8 @@ impl InvocationScopeData {
                 InvocationDefinition {
                     kind: option.kind,
                     repeated: option.repeated,
+                    sensitive: option.sensitive,
+                    argument: false,
                 },
             );
         }
@@ -52,6 +57,8 @@ impl InvocationScopeData {
                 InvocationDefinition {
                     kind: OptionKind::Value,
                     repeated: argument.repeated,
+                    sensitive: argument.sensitive,
+                    argument: true,
                 },
             );
         }
@@ -257,6 +264,13 @@ impl Invocation {
         })
     }
 
+    /// Reports whether the nearest visible Value declaration is Sensitive
+    pub fn value_is_sensitive(&self, id: &str) -> bool {
+        self.lookup(id).is_some_and(|(definition, _)| {
+            definition.kind == OptionKind::Value && definition.sensitive
+        })
+    }
+
     /// Returns the first platform-native raw value
     pub fn raw_value(&self, id: &str) -> Option<&OsStr> {
         self.parsed_values(id)?.first().map(ParsedValue::raw)
@@ -303,6 +317,31 @@ impl Invocation {
             }
         }
         None
+    }
+
+    pub(crate) fn mark_sensitive_target(&self, target: DiagnosticTarget) -> DiagnosticTarget {
+        let scope_index = if target.command_id_path().is_empty() {
+            Some(self.current_scope)
+        } else {
+            self.scopes.iter().enumerate().find_map(|(index, _)| {
+                (self.command_id_path[..=index] == *target.command_id_path()).then_some(index)
+            })
+        };
+        let Some(scope_index) = scope_index else {
+            return target;
+        };
+        let Some(definition) = self.scopes[scope_index].definitions.get(target.value_id()) else {
+            return target;
+        };
+        let target_is_argument = matches!(
+            target.kind(),
+            crate::diagnostic::DiagnosticTargetKind::Argument
+        );
+        target.with_sensitive(
+            definition.kind == OptionKind::Value
+                && definition.argument == target_is_argument
+                && definition.sensitive,
+        )
     }
 }
 
@@ -402,6 +441,14 @@ impl InvocationScope<'_> {
             .definitions
             .get(id)
             .is_some_and(|definition| definition.kind == OptionKind::Value && definition.repeated)
+    }
+
+    /// Reports whether one local Value declaration is Sensitive
+    pub fn value_is_sensitive(&self, id: &str) -> bool {
+        self.data()
+            .definitions
+            .get(id)
+            .is_some_and(|definition| definition.kind == OptionKind::Value && definition.sensitive)
     }
 
     /// Iterates local IDs that have a value in sorted order
@@ -887,6 +934,7 @@ impl<'command> Parser<'command> {
                     &option.parser,
                     raw,
                     ValueSource::CommandLine,
+                    option.sensitive,
                     self.option_target(scope_index, &option.id),
                 )?;
                 self.push_value(scope_index, &option.id, parsed);
@@ -985,6 +1033,7 @@ impl<'command> Parser<'command> {
             &argument.parser,
             raw,
             ValueSource::CommandLine,
+            argument.sensitive,
             DiagnosticTarget::argument(&argument.id),
         )?;
         self.push_value(self.scopes.len() - 1, &argument.id, parsed);
@@ -1021,6 +1070,7 @@ impl<'command> Parser<'command> {
                         &option.parser,
                         raw,
                         source,
+                        option.sensitive,
                         DiagnosticTarget::option(&option.id)
                             .with_command_id_path(self.command_id_path(command_index)),
                     )?;
@@ -1147,10 +1197,12 @@ impl<'command> Parser<'command> {
             for validator in &command.validators {
                 if let Err(diagnostic) = validator.validate(invocation) {
                     invocation.current_scope = invocation.scopes.len() - 1;
-                    return Err(diagnostic
+                    let diagnostic = diagnostic
                         .with_default_target_path(&invocation.command_id_path[..=command_index])
+                        .map_targets(|target| invocation.mark_sensitive_target(target))
                         .with_command_path(self.command_path.clone())
-                        .with_usage(self.root.usage_for_path(&self.command_path)));
+                        .with_usage(self.root.usage_for_path(&self.command_path));
+                    return Err(diagnostic);
                 }
             }
         }
@@ -1164,16 +1216,18 @@ impl<'command> Parser<'command> {
         parser: &std::sync::Arc<dyn crate::value::ValueParser>,
         raw: OsString,
         source: ValueSource,
+        sensitive: bool,
         target: DiagnosticTarget,
     ) -> Result<ParsedValue, Diagnostic> {
         let typed = parser.parse(&raw).map_err(|reason| {
-            self.error_with_targets(
-                DiagnosticCode::InvalidValue,
-                format!("invalid value {} for '{id}': {reason}", quote_value(&raw)),
-                [target],
-            )
+            let message = if sensitive {
+                format!("invalid value {REDACTED_VALUE} for '{id}'")
+            } else {
+                format!("invalid value {} for '{id}': {reason}", quote_value(&raw))
+            };
+            self.error_with_targets(DiagnosticCode::InvalidValue, message, [target])
         })?;
-        Ok(ParsedValue::new(raw, source, typed))
+        Ok(ParsedValue::new(raw, source, typed, sensitive))
     }
 
     fn push_value(&mut self, scope_index: usize, id: &str, value: ParsedValue) {
@@ -1208,12 +1262,39 @@ impl<'command> Parser<'command> {
     {
         let mut diagnostic = Diagnostic::new(code, message);
         for target in targets {
-            diagnostic = diagnostic.with_target(target);
+            diagnostic = diagnostic.with_target(self.mark_sensitive_target(target));
         }
         diagnostic
             .with_default_target_path(&self.current_command_id_path())
             .with_command_path(self.command_path.clone())
             .with_usage(self.root.usage_for_path(&self.command_path))
+    }
+
+    fn mark_sensitive_target(&self, target: DiagnosticTarget) -> DiagnosticTarget {
+        let scope_index = if target.command_id_path().is_empty() {
+            Some(self.commands.len().saturating_sub(1))
+        } else {
+            self.commands.iter().enumerate().find_map(|(index, _)| {
+                (self.command_id_path(index) == target.command_id_path()).then_some(index)
+            })
+        };
+        let Some(scope_index) = scope_index else {
+            return target;
+        };
+        let command = self.commands[scope_index];
+        let sensitive = match target.kind() {
+            crate::diagnostic::DiagnosticTargetKind::Option => command
+                .options
+                .iter()
+                .find(|option| option.id == target.value_id())
+                .is_some_and(|option| option.sensitive),
+            crate::diagnostic::DiagnosticTargetKind::Argument => command
+                .arguments
+                .iter()
+                .find(|argument| argument.id == target.value_id())
+                .is_some_and(|argument| argument.sensitive),
+        };
+        target.with_sensitive(sensitive)
     }
 
     fn command_id_path(&self, index: usize) -> Vec<String> {

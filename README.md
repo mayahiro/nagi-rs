@@ -53,7 +53,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-tui` | Terminal Presentation Rules, bounded Content-to-Node projection, App lifecycle, semantic nodes, scoped key maps, layout, events, Effects, Subscriptions, and terminal loop |
 | `nagi-tui-widgets` | 31 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
-| `nagi-cli` | Local and inherited options, generic Hidden and Deprecated lifecycle metadata, command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics with stable JSON rendering, handler-free completion resolution, staged Runtime Policy, and process integration |
+| `nagi-cli` | Local and inherited options, generic Hidden, Deprecated, and Sensitive metadata, command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics with stable JSON rendering, handler-free completion resolution, staged Runtime Policy, and process integration |
 | `nagi-cli-completion` | Bash, Zsh, Fish, and PowerShell generators plus the reserved completion protocol |
 | `nagi-cli-prompt` | Optional line-oriented Confirm, Select, Input, and Secret prompts with injected I/O |
 | `nagi-cli-status` | Optional synchronous TTY status, spinner, progress, and plain-log fallback with injected I/O |
@@ -63,7 +63,8 @@ The [Nagi semantic specifications](https://github.com/mayahiro/nagi/tree/main/sp
 define behavior shared with the Go implementations. The
 [public CLI API guide](https://github.com/mayahiro/nagi/blob/main/docs/CLI_API.md)
 explains inherited options, command-local scopes, completion, Help
-presentation, lifecycle metadata, structured validators, and staged adoption
+presentation, lifecycle and Sensitive Value metadata, structured validators,
+and staged adoption
 
 ## Testing applications
 
@@ -141,6 +142,7 @@ Run commands from the Rust repository root
 | [CLI staged adoption](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
 | [CLI JSON Diagnostic](crates/nagi-cli/examples/json_diagnostic/README.md) | `cargo run -p nagi-cli --example json_diagnostic` |
 | [CLI command lifecycle](crates/nagi-cli/examples/lifecycle/README.md) | `cargo run -p nagi-cli --example lifecycle -- --legacy old` |
+| [CLI Sensitive Value](crates/nagi-cli/examples/sensitive_values/README.md) | `cargo run -p nagi-cli --example sensitive_values -- --token demo-token` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
 | [CLI lightweight prompts](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
 | [CLI TTY-aware status](crates/nagi-cli-status/examples/status/README.md) | `cargo run -p nagi-cli-status --example status` |
@@ -241,6 +243,8 @@ values, and converts SIGINT into cooperative cancellation. Shell-specific
 generation, line-oriented Prompt, and synchronous Status Reporter are optional
 crates. Applications own completion installation, dynamic candidate I/O,
 credential handling, approval policy, status timing, and progress meaning.
+Sensitive Value metadata redacts framework projections but does not zeroize
+memory or hide process arguments from the operating system or shell history.
 Configuration-file loading and CLI-to-TUI integration are not
 provided. The portable graph does not model arbitrary invocation grammars.
 Help-only Usage Variants can document validator-backed forms without changing

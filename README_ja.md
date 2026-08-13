@@ -51,7 +51,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-tui` | Terminal Presentation Rules、上限付きContentからNodeへのprojection、App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
 | `nagi-tui-widgets` | Public TUI APIから構築した31個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
-| `nagi-cli` | Localと継承Option、汎用HiddenとDeprecated lifecycle metadata、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、stable JSON renderingを持つtarget付きDiagnostic、handlerを含まないcompletion解決、段階実行Runtime Policy、process統合 |
+| `nagi-cli` | Localと継承Option、汎用Hidden、Deprecated、Sensitive metadata、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、stable JSON renderingを持つtarget付きDiagnostic、handlerを含まないcompletion解決、段階実行Runtime Policy、process統合 |
 | `nagi-cli-completion` | Bash、Zsh、Fish、PowerShell generatorと予約済みcompletion protocol |
 | `nagi-cli-prompt` | 注入可能なI/Oを持つ任意の行指向Confirm、Select、Input、Secret |
 | `nagi-cli-status` | 注入可能なI/Oを持つ任意の同期TTY status、spinner、progress、plain-log fallback |
@@ -59,7 +59,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 
 [Nagi semantic specification](https://github.com/mayahiro/nagi/tree/main/spec)がGo実装と共有する挙動を定義します
 
-[Public CLI API guide](https://github.com/mayahiro/nagi/blob/main/docs/CLI_API_ja.md)では継承Option、command-local scope、completion、Help presentation、lifecycle metadata、structured validator、段階導入を説明します
+[Public CLI API guide](https://github.com/mayahiro/nagi/blob/main/docs/CLI_API_ja.md)では継承Option、command-local scope、completion、Help presentation、lifecycleとSensitive Value metadata、structured validator、段階導入を説明します
 
 ## Application test
 
@@ -118,6 +118,7 @@ Rust repository rootから実行します
 | [CLI段階導入](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
 | [CLI JSON Diagnostic](crates/nagi-cli/examples/json_diagnostic/README.md) | `cargo run -p nagi-cli --example json_diagnostic` |
 | [CLI Command lifecycle](crates/nagi-cli/examples/lifecycle/README.md) | `cargo run -p nagi-cli --example lifecycle -- --legacy old` |
+| [CLI Sensitive Value](crates/nagi-cli/examples/sensitive_values/README.md) | `cargo run -p nagi-cli --example sensitive_values -- --token demo-token` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
 | [CLI軽量prompt](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
 | [CLI TTY-aware status](crates/nagi-cli-status/examples/status/README.md) | `cargo run -p nagi-cli-status --example status` |
@@ -161,6 +162,8 @@ CLI process統合はLinuxとmacOSへ対応し、Unix argument valueを保持し�
 Shell固有生成、行指向Prompt、同期Status Reporterは任意crateです
 
 Completion installation、dynamic candidate I/O、credential管理、approval policy、status更新時点、progressの意味はApplicationが所有します
+
+Sensitive Value metadataはframework projectionをredactしますが、memoryをzeroizeせず、OSのprocess argumentまたはshell historyから値を隠しません
 
 設定file読み込みとCLIからTUIへの統合は提供しません
 

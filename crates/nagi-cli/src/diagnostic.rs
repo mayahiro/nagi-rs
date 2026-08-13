@@ -86,6 +86,7 @@ pub struct DiagnosticTarget {
     kind: DiagnosticTargetKind,
     command_id_path: Vec<String>,
     value_id: String,
+    sensitive: bool,
 }
 
 impl DiagnosticTarget {
@@ -95,6 +96,7 @@ impl DiagnosticTarget {
             kind: DiagnosticTargetKind::Option,
             command_id_path: Vec::new(),
             value_id: value_id.into(),
+            sensitive: false,
         }
     }
 
@@ -104,6 +106,7 @@ impl DiagnosticTarget {
             kind: DiagnosticTargetKind::Argument,
             command_id_path: Vec::new(),
             value_id: value_id.into(),
+            sensitive: false,
         }
     }
 
@@ -126,6 +129,16 @@ impl DiagnosticTarget {
     /// Returns the command-local value ID
     pub fn value_id(&self) -> &str {
         &self.value_id
+    }
+
+    /// Reports whether this target identifies a Sensitive Value declaration
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
+
+    pub(crate) const fn with_sensitive(mut self, sensitive: bool) -> Self {
+        self.sensitive = sensitive;
+        self
     }
 
     pub(crate) fn set_default_path(&mut self, path: &[String]) {
@@ -308,6 +321,18 @@ impl Diagnostic {
         if let Some(metadata) = self.metadata.as_deref_mut() {
             for target in &mut metadata.targets {
                 target.set_default_path(path);
+            }
+        }
+        self
+    }
+
+    pub(crate) fn map_targets(
+        mut self,
+        mut map: impl FnMut(DiagnosticTarget) -> DiagnosticTarget,
+    ) -> Self {
+        if let Some(metadata) = self.metadata.as_deref_mut() {
+            for target in &mut metadata.targets {
+                *target = map(target.clone());
             }
         }
         self

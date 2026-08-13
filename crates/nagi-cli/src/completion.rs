@@ -8,6 +8,9 @@ use crate::command::{Argument, Command, OptionKind, OptionSpec};
 use crate::diagnostic::Diagnostic;
 use crate::lifecycle::Deprecation;
 use crate::runtime::CancellationToken;
+use crate::value::REDACTED_VALUE;
+
+const OPAQUE_COMPLETION_INPUT: &str = "<opaque>";
 
 /// Identifies the syntax target being completed
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -26,6 +29,7 @@ pub struct CompletionTarget {
     kind: CompletionTargetKind,
     command_id_path: Vec<String>,
     value_id: Option<String>,
+    sensitive: bool,
 }
 
 impl CompletionTarget {
@@ -34,22 +38,25 @@ impl CompletionTarget {
             kind: CompletionTargetKind::Command,
             command_id_path,
             value_id: None,
+            sensitive: false,
         }
     }
 
-    fn option(command_id_path: Vec<String>, value_id: String) -> Self {
+    fn option(command_id_path: Vec<String>, value_id: String, sensitive: bool) -> Self {
         Self {
             kind: CompletionTargetKind::Option,
             command_id_path,
             value_id: Some(value_id),
+            sensitive,
         }
     }
 
-    fn argument(command_id_path: Vec<String>, value_id: String) -> Self {
+    fn argument(command_id_path: Vec<String>, value_id: String, sensitive: bool) -> Self {
         Self {
             kind: CompletionTargetKind::Argument,
             command_id_path,
             value_id: Some(value_id),
+            sensitive,
         }
     }
 
@@ -67,6 +74,11 @@ impl CompletionTarget {
     pub fn value_id(&self) -> Option<&str> {
         self.value_id.as_deref()
     }
+
+    /// Reports whether the active value declaration is Sensitive
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
 }
 
 /// Identifies how one partial argv occurrence was represented
@@ -81,11 +93,26 @@ pub enum CompletionOccurrenceKind {
 }
 
 /// One recognized raw occurrence before the active completion token
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CompletionOccurrence {
     target: CompletionTarget,
     kind: CompletionOccurrenceKind,
     raw: Option<OsString>,
+}
+
+impl fmt::Debug for CompletionOccurrence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CompletionOccurrence");
+        debug
+            .field("target", &self.target)
+            .field("kind", &self.kind);
+        if self.target.sensitive && self.raw.is_some() {
+            debug.field("raw", &Some(REDACTED_VALUE));
+        } else {
+            debug.field("raw", &self.raw);
+        }
+        debug.finish()
+    }
 }
 
 impl CompletionOccurrence {
@@ -106,10 +133,20 @@ impl CompletionOccurrence {
 }
 
 /// Tokenized shell input for one completion request
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct CompletionInput {
     arguments: Vec<OsString>,
     current: OsString,
+}
+
+impl fmt::Debug for CompletionInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionInput")
+            .field("arguments", &OPAQUE_COMPLETION_INPUT)
+            .field("current", &OPAQUE_COMPLETION_INPUT)
+            .finish()
+    }
 }
 
 impl CompletionInput {
@@ -139,7 +176,7 @@ impl CompletionInput {
 }
 
 /// One normalized request passed to a dynamic completion provider
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CompletionRequest {
     arguments: Vec<OsString>,
     current: OsString,
@@ -148,6 +185,28 @@ pub struct CompletionRequest {
     target: CompletionTarget,
     prefix: OsString,
     partial: Vec<CompletionOccurrence>,
+}
+
+impl fmt::Debug for CompletionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CompletionRequest");
+        debug.field("arguments", &OPAQUE_COMPLETION_INPUT);
+        if self.target.sensitive {
+            debug
+                .field("current", &REDACTED_VALUE)
+                .field("prefix", &REDACTED_VALUE);
+        } else {
+            debug
+                .field("current", &self.current)
+                .field("prefix", &self.prefix);
+        }
+        debug
+            .field("command_path", &self.command_path)
+            .field("command_id_path", &self.command_id_path)
+            .field("target", &self.target)
+            .field("partial", &self.partial)
+            .finish()
+    }
 }
 
 impl CompletionRequest {
@@ -460,6 +519,7 @@ struct EngineOption {
     kind: OptionKind,
     help: String,
     hidden: bool,
+    sensitive: bool,
     deprecation: Option<Deprecation>,
     inherited: bool,
     repeated: bool,
@@ -471,6 +531,7 @@ struct EngineOption {
 struct EngineArgument {
     id: String,
     repeated: bool,
+    sensitive: bool,
     possible_values: Vec<String>,
     provider: Option<Arc<dyn CompletionProvider>>,
 }
@@ -526,6 +587,11 @@ impl EngineCommand {
 
 impl EngineOption {
     fn snapshot(option: &OptionSpec) -> Self {
+        let possible_values = if option.sensitive {
+            Vec::new()
+        } else {
+            option.parser.possible_values().to_vec()
+        };
         Self {
             id: option.id.clone(),
             long: option.long.clone(),
@@ -533,22 +599,33 @@ impl EngineOption {
             kind: option.kind,
             help: option.help.clone(),
             hidden: option.hidden,
+            sensitive: option.sensitive,
             deprecation: option.deprecation.clone(),
             inherited: option.inherited,
             repeated: option.repeated,
-            possible_values: option.parser.possible_values().to_vec(),
-            provider: option.completion_provider.clone(),
+            possible_values,
+            provider: (!option.sensitive)
+                .then(|| option.completion_provider.clone())
+                .flatten(),
         }
     }
 }
 
 impl EngineArgument {
     fn snapshot(argument: &Argument) -> Self {
+        let possible_values = if argument.sensitive {
+            Vec::new()
+        } else {
+            argument.parser.possible_values().to_vec()
+        };
         Self {
             id: argument.id.clone(),
             repeated: argument.repeated,
-            possible_values: argument.parser.possible_values().to_vec(),
-            provider: argument.completion_provider.clone(),
+            sensitive: argument.sensitive,
+            possible_values,
+            provider: (!argument.sensitive)
+                .then(|| argument.completion_provider.clone())
+                .flatten(),
         }
     }
 }
@@ -895,7 +972,11 @@ impl<'engine> CompletionState<'engine> {
         };
         self.positional_started = true;
         self.partial.push(CompletionOccurrence {
-            target: CompletionTarget::argument(self.command_id_path(), argument.id.clone()),
+            target: CompletionTarget::argument(
+                self.command_id_path(),
+                argument.id.clone(),
+                argument.sensitive,
+            ),
             kind: CompletionOccurrenceKind::Value,
             raw: Some(raw.to_owned()),
         });
@@ -912,7 +993,11 @@ impl<'engine> CompletionState<'engine> {
         raw: Option<OsString>,
     ) {
         self.partial.push(CompletionOccurrence {
-            target: CompletionTarget::option(self.target_path(scope_index), option.id.clone()),
+            target: CompletionTarget::option(
+                self.target_path(scope_index),
+                option.id.clone(),
+                option.sensitive,
+            ),
             kind,
             raw,
         });
@@ -1053,7 +1138,9 @@ impl<'engine> CompletionState<'engine> {
         if completing_word {
             if let Some(argument) = self.active().arguments.get(self.positional_index) {
                 value_target = Some((argument, command_id_path.clone()));
-                self.push_values(&mut candidates, &argument.possible_values, "", current);
+                if !argument.sensitive {
+                    self.push_values(&mut candidates, &argument.possible_values, "", current);
+                }
             }
         }
 
@@ -1063,8 +1150,10 @@ impl<'engine> CompletionState<'engine> {
 
         let (target, provider) = match value_target {
             Some((argument, path)) => (
-                CompletionTarget::argument(path, argument.id.clone()),
-                argument.provider.clone(),
+                CompletionTarget::argument(path, argument.id.clone(), argument.sensitive),
+                (!argument.sensitive)
+                    .then(|| argument.provider.clone())
+                    .flatten(),
             ),
             None => (CompletionTarget::command(command_id_path.clone()), None),
         };
@@ -1132,9 +1221,13 @@ impl<'engine> CompletionState<'engine> {
         let command_id_path = self.command_id_path();
         let command_path = self.command_path.clone();
         let option = &self.commands[scope_index].options[option_index];
-        let target = CompletionTarget::option(self.target_path(scope_index), option.id.clone());
+        let target = CompletionTarget::option(
+            self.target_path(scope_index),
+            option.id.clone(),
+            option.sensitive,
+        );
         let mut candidates = Vec::new();
-        if !option.hidden {
+        if !option.hidden && !option.sensitive {
             self.push_values(
                 &mut candidates,
                 &option.possible_values,
@@ -1150,7 +1243,9 @@ impl<'engine> CompletionState<'engine> {
             value_prefix,
             partial: self.partial,
             candidates,
-            provider: (!option.hidden).then(|| option.provider.clone()).flatten(),
+            provider: (!option.hidden && !option.sensitive)
+                .then(|| option.provider.clone())
+                .flatten(),
         }
     }
 

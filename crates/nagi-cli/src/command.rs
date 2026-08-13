@@ -8,7 +8,7 @@ use crate::help::{HelpBlock, HelpExample, HelpLink, HelpSection, UsageVariantDef
 use crate::lifecycle::{Deprecation, valid_replacement};
 use crate::parser::Invocation;
 use crate::runtime::Handler;
-use crate::value::{ValueParser, raw_parser};
+use crate::value::{REDACTED_VALUE, ValueParser, raw_parser};
 
 /// The storage and parsing behavior of an option
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +59,7 @@ pub struct OptionSpec {
     pub(crate) parser: Arc<dyn ValueParser>,
     pub(crate) help: String,
     pub(crate) hidden: bool,
+    pub(crate) sensitive: bool,
     pub(crate) deprecation: Option<Deprecation>,
     pub(crate) inherited: bool,
     pub(crate) required: bool,
@@ -95,6 +96,7 @@ impl OptionSpec {
             parser: raw_parser(),
             help: String::new(),
             hidden: false,
+            sensitive: false,
             deprecation: None,
             inherited: false,
             required: false,
@@ -129,6 +131,15 @@ impl OptionSpec {
     /// while preserving explicit argv parsing
     pub const fn hidden(mut self) -> Self {
         self.hidden = true;
+        self
+    }
+
+    /// Marks this Value option for redaction in framework-controlled display
+    ///
+    /// Raw and typed Invocation access remains unchanged. Graph validation
+    /// rejects this metadata on Flag and Count options
+    pub const fn sensitive(mut self) -> Self {
+        self.sensitive = true;
         self
     }
 
@@ -247,6 +258,11 @@ impl OptionSpec {
         self.hidden
     }
 
+    /// Reports whether this Value option is marked for display redaction
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
+
     /// Returns replacement metadata when this option is deprecated
     pub fn deprecation(&self) -> Option<&Deprecation> {
         self.deprecation.as_ref()
@@ -259,6 +275,7 @@ pub struct Argument {
     pub(crate) id: String,
     pub(crate) parser: Arc<dyn ValueParser>,
     pub(crate) help: String,
+    pub(crate) sensitive: bool,
     pub(crate) required: bool,
     pub(crate) repeated: bool,
     pub(crate) completion_provider: Option<Arc<dyn CompletionProvider>>,
@@ -271,6 +288,7 @@ impl Argument {
             id: id.into(),
             parser: raw_parser(),
             help: String::new(),
+            sensitive: false,
             required: false,
             repeated: false,
             completion_provider: None,
@@ -301,6 +319,13 @@ impl Argument {
         self
     }
 
+    /// Marks this positional value for redaction in framework-controlled
+    /// display while preserving raw and typed Invocation access
+    pub const fn sensitive(mut self) -> Self {
+        self.sensitive = true;
+        self
+    }
+
     /// Requires this positional argument
     pub fn required(mut self) -> Self {
         self.required = true;
@@ -316,6 +341,11 @@ impl Argument {
     /// Returns the stable value identifier
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Reports whether this positional value is marked for display redaction
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
     }
 }
 
@@ -818,7 +848,8 @@ fn validate_command(
             && (option.repeated
                 || option.environment.is_some()
                 || option.default.is_some()
-                || option.completion_provider.is_some())
+                || option.completion_provider.is_some()
+                || option.sensitive)
         {
             return invalid(format!(
                 "non-value option '{}' has value-only configuration",
@@ -1081,16 +1112,20 @@ pub(crate) fn option_description(option: &OptionSpec) -> String {
         append_note(&mut description, &format!("env: {environment}"));
     }
     if let Some(default) = &option.default {
-        append_note(
-            &mut description,
-            &format!("default: {}", display_os(default)),
-        );
+        let default = if option.sensitive {
+            REDACTED_VALUE.to_owned()
+        } else {
+            display_os(default)
+        };
+        append_note(&mut description, &format!("default: {default}"));
     }
     if !option.parser.possible_values().is_empty() {
-        append_note(
-            &mut description,
-            &format!("possible: {}", option.parser.possible_values().join(", ")),
-        );
+        let possible = if option.sensitive {
+            REDACTED_VALUE.to_owned()
+        } else {
+            option.parser.possible_values().join(", ")
+        };
+        append_note(&mut description, &format!("possible: {possible}"));
     }
     description
 }

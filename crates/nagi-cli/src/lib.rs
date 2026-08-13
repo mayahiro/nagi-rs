@@ -17,6 +17,11 @@
 //! [`Diagnostic`] with application codes, option or argument targets, and
 //! remediation hints
 //!
+//! [`OptionSpec::sensitive`] and [`Argument::sensitive`] attach generic
+//! presentation metadata. Framework Help, parser Diagnostics, Debug output,
+//! and completion redact or suppress those values while explicit Invocation
+//! access preserves the original raw and typed data
+//!
 //! [`CompletionEngine`] snapshots the validated graph without handlers and
 //! resolves static candidates plus only the active Option or Argument
 //! [`CompletionProvider`]. Shell-specific generation remains in the optional
@@ -75,6 +80,6 @@ pub use runtime::{
     CancellationHandle, CancellationToken, Context, Handler, Outcome, cancellation_pair,
 };
 pub use value::{
-    ParsedValue, ValueParser, ValueSource, integer_parser, possible_values_parser, raw_parser,
-    string_parser, value_parser,
+    ParsedValue, REDACTED_VALUE, ValueParser, ValueSource, integer_parser, possible_values_parser,
+    raw_parser, string_parser, value_parser,
 };

@@ -160,6 +160,23 @@ fn benchmark_arguments() -> Vec<String> {
         .collect()
 }
 
+fn benchmark_value_command(sensitive: bool) -> Command {
+    let mut token = OptionSpec::value("token").long("token").repeated();
+    if sensitive {
+        token = token.sensitive();
+    }
+    Command::new("root").option(token)
+}
+
+fn benchmark_value_arguments() -> Vec<String> {
+    let mut arguments = Vec::with_capacity(OPTION_OCCURRENCES * 2);
+    for _ in 0..OPTION_OCCURRENCES {
+        arguments.push("--token".to_owned());
+        arguments.push("value".to_owned());
+    }
+    arguments
+}
+
 fn sample(unrelated_branches: usize, deprecated: bool) -> Vec<Sample> {
     let command = benchmark_command(unrelated_branches, deprecated);
     let arguments = benchmark_arguments();
@@ -176,6 +193,30 @@ fn sample(unrelated_branches: usize, deprecated: bool) -> Vec<Sample> {
             invocation.deprecation_notices().len(),
             usize::from(deprecated)
         );
+        black_box(&invocation);
+        drop(invocation);
+        samples.push(read_metrics(started.elapsed(), baseline));
+    }
+    samples
+}
+
+fn sample_values(sensitive: bool) -> Vec<Sample> {
+    let command = benchmark_value_command(sensitive);
+    let arguments = benchmark_value_arguments();
+    let mut samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let baseline = reset_metrics();
+        let started = Instant::now();
+        let result = command.parse(arguments.iter().map(String::as_str)).unwrap();
+        let ParseResult::Invocation(invocation) = result else {
+            panic!("benchmark parse did not produce an Invocation");
+        };
+        let values = invocation
+            .parsed_values("token")
+            .expect("benchmark values must be present");
+        assert_eq!(values.len(), OPTION_OCCURRENCES);
+        assert_eq!(values[0].is_sensitive(), sensitive);
+        assert_eq!(values[OPTION_OCCURRENCES - 1].is_sensitive(), sensitive);
         black_box(&invocation);
         drop(invocation);
         samples.push(read_metrics(started.elapsed(), baseline));
@@ -219,4 +260,6 @@ fn main() {
         sample(UNRELATED_BRANCHES, false),
     );
     report("cli-deprecated-1000-occurrences", sample(0, true));
+    report("cli-value-1000-occurrences", sample_values(false));
+    report("cli-sensitive-value-1000-occurrences", sample_values(true));
 }

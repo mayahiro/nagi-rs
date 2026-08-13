@@ -3,6 +3,9 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::sync::Arc;
 
+/// Stable marker used when a framework projection hides a Sensitive value
+pub const REDACTED_VALUE: &str = "<redacted>";
+
 /// The source that supplied a parsed command value
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueSource {
@@ -20,6 +23,7 @@ pub struct ParsedValue {
     raw: OsString,
     source: ValueSource,
     typed: Arc<dyn Any + Send + Sync>,
+    sensitive: bool,
 }
 
 impl ParsedValue {
@@ -27,8 +31,14 @@ impl ParsedValue {
         raw: OsString,
         source: ValueSource,
         typed: Arc<dyn Any + Send + Sync>,
+        sensitive: bool,
     ) -> Self {
-        Self { raw, source, typed }
+        Self {
+            raw,
+            source,
+            typed,
+            sensitive,
+        }
     }
 
     /// Returns the platform-native value before typed parsing
@@ -41,6 +51,11 @@ impl ParsedValue {
         self.source
     }
 
+    /// Reports whether framework-controlled display must redact this value
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
+
     /// Returns the typed parser result when it has type `T`
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         self.typed.downcast_ref()
@@ -49,11 +64,13 @@ impl ParsedValue {
 
 impl fmt::Debug for ParsedValue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ParsedValue")
-            .field("raw", &self.raw)
-            .field("source", &self.source)
-            .finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("ParsedValue");
+        if self.sensitive {
+            debug.field("raw", &REDACTED_VALUE);
+        } else {
+            debug.field("raw", &self.raw);
+        }
+        debug.field("source", &self.source).finish_non_exhaustive()
     }
 }
 

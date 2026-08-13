@@ -370,6 +370,7 @@ impl Command {
             Err(diagnostic) => {
                 let mut diagnostic = diagnostic
                     .with_default_target_path(invocation.value_scope_id_path())
+                    .map_targets(|target| invocation.mark_sensitive_target(target))
                     .with_command_path(invocation.command_path().to_vec());
                 if diagnostic.category() == crate::diagnostic::DiagnosticCategory::Usage {
                     diagnostic =

@@ -74,6 +74,7 @@ pub struct HelpEntry {
     id: String,
     label: String,
     description: String,
+    sensitive: bool,
     deprecation: Option<Deprecation>,
 }
 
@@ -111,6 +112,11 @@ impl HelpInheritedOption {
         self.entry.description()
     }
 
+    /// Reports whether this inherited Value option is Sensitive
+    pub const fn is_sensitive(&self) -> bool {
+        self.entry.is_sensitive()
+    }
+
     /// Returns replacement metadata when this inherited option is deprecated
     pub fn deprecation(&self) -> Option<&Deprecation> {
         self.entry.deprecation()
@@ -127,8 +133,14 @@ impl HelpEntry {
             id: id.into(),
             label: label.into(),
             description: description.into(),
+            sensitive: false,
             deprecation: None,
         }
+    }
+
+    pub(crate) const fn with_sensitive(mut self, sensitive: bool) -> Self {
+        self.sensitive = sensitive;
+        self
     }
 
     pub(crate) fn with_deprecation(mut self, deprecation: Option<Deprecation>) -> Self {
@@ -149,6 +161,11 @@ impl HelpEntry {
     /// Returns the entry description
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Reports whether this entry describes a Sensitive Value declaration
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
     }
 
     /// Returns replacement metadata when this entry is deprecated
@@ -507,6 +524,7 @@ impl HelpRenderer for PlainHelpRenderer {
                 description.push_str(&option.command_path.join(" "));
                 description.push(']');
                 HelpEntry::identified(option.id(), option.label(), description)
+                    .with_sensitive(option.entry.sensitive)
                     .with_deprecation(option.entry.deprecation.clone())
             })
             .collect::<Vec<_>>();
@@ -604,6 +622,7 @@ impl Command {
             .iter()
             .map(|argument| {
                 HelpEntry::identified(&argument.id, argument_label(argument), &argument.help)
+                    .with_sensitive(argument.sensitive)
             })
             .collect();
         let mut options = Vec::with_capacity(command.options.len() + 2);
@@ -611,6 +630,7 @@ impl Command {
         for option in command.options.iter().filter(|option| !option.hidden) {
             options.push(
                 HelpEntry::identified(&option.id, option_label(option), option_description(option))
+                    .with_sensitive(option.sensitive)
                     .with_deprecation(option.deprecation.clone()),
             );
             option_relations.extend(
@@ -678,6 +698,7 @@ impl Command {
                         option_label(option),
                         option_description(option),
                     )
+                    .with_sensitive(option.sensitive)
                     .with_deprecation(option.deprecation.clone()),
                 });
             }
