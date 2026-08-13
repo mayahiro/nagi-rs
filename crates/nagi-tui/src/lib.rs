@@ -105,7 +105,8 @@ pub use subscription::{
 pub use subscription_supervisor::SubscriptionDiagnostics;
 pub use supervisor::EffectDiagnostics;
 pub use terminal::{
-    RunError, TerminalClipboard, TerminalOptions, run_terminal, run_terminal_with_notice_handler,
+    InvalidInlineViewportHeight, RunError, TerminalClipboard, TerminalOptions, TerminalViewport,
+    run_terminal, run_terminal_with_notice_handler,
 };
 pub use virtual_flow::{
     DuplicateVirtualFlowItemKey, VirtualFlowAnchor, VirtualFlowAnchorAffinity, VirtualFlowItem,

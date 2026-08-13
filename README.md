@@ -91,9 +91,14 @@ Unexpected asynchronous lifecycle transitions are available through the
 bounded Runtime notice queue or the terminal notice-handler entry point
 
 `Effect::suspend_terminal` runs an application-owned blocking task after the
-standard runner restores the ordinary terminal and leaves the alternate screen.
-Returning from the task resumes configured modes, resets pending input, and
-forces a full redraw
+standard runner restores the ordinary terminal and leaves its configured
+viewport. Returning from the task resumes a full-screen viewport or reserves a
+fresh inline region, resets pending decoder state, and forces a full redraw
+
+`TerminalViewport::inline(height)` runs the same Runtime in a bounded region of
+the main screen and leaves its final frame in terminal history. The standard
+runner owns cursor discovery, resize placement, coordinate translation, and
+restoration
 
 ## Examples
 
@@ -112,6 +117,7 @@ Run commands from the Rust repository root
 | [Diff view](crates/nagi-tui-widgets/examples/diff_view/README.md) | `cargo run -p nagi-tui-widgets --example diff_view` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
 | [Terminal suspend and resume](crates/nagi-tui/examples/terminal_suspend/README.md) | `cargo run -p nagi-tui --example terminal_suspend` |
+| [Inline terminal viewport](crates/nagi-tui/examples/inline_terminal/README.md) | `cargo run -p nagi-tui --example inline_terminal` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
 | [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
 | [Widget gallery](crates/nagi-tui-widgets/examples/widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example widget_gallery` |

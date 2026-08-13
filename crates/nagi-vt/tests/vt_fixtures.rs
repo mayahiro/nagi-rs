@@ -7,6 +7,7 @@ use std::fmt::Write;
 use nagi_vt::{
     Capabilities, CursorShape, Decoder, EraseMode, Event, KeyAction, KeyCode, KeyProtocol,
     Modifiers, MouseButton, MouseKind, MouseTracking, SgrColor, SgrStyle, TerminalOp, encode,
+    encode_at,
 };
 
 #[test]
@@ -61,6 +62,47 @@ fn output_matches_shared_fixtures() {
             record.id
         );
     }
+}
+
+#[test]
+fn output_origin_matches_shared_fixtures() {
+    let Some(records) = support::load(
+        "vt/output-origin.txt",
+        "vt-output-origin",
+        &["capabilities", "origin", "operations", "expected"],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let capabilities = match record.field("capabilities") {
+            "modern" => Capabilities::MODERN,
+            "baseline" => Capabilities::BASELINE,
+            value => panic!("unknown capabilities {value}"),
+        };
+        let [origin_x, origin_y] = pair(record.field("origin"));
+        assert_eq!(
+            encode_at(
+                &fixture_operations(record.field("operations")),
+                capabilities,
+                origin_x,
+                origin_y,
+            ),
+            record.decoded("expected"),
+            "case {}",
+            record.id
+        );
+    }
+}
+
+fn pair(value: &str) -> [u32; 2] {
+    let mut fields = value.split(',');
+    let result = [
+        unsigned(fields.next().expect("pair has first value")),
+        unsigned(fields.next().expect("pair has second value")),
+    ];
+    assert!(fields.next().is_none(), "pair has exactly two values");
+    result
 }
 
 fn decode_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Vec<Event> {
@@ -212,6 +254,8 @@ fn fixture_operations(value: &str) -> Vec<TerminalOp> {
                     dx: signed(dx),
                     dy: signed(dy),
                 },
+                ["request-cursor-position"] => TerminalOp::RequestCursorPosition,
+                ["next-line"] => TerminalOp::NextLine,
                 ["set-style", style] => TerminalOp::SetStyle(fixture_style(style)),
                 ["reset-style"] => TerminalOp::ResetStyle,
                 ["write", text] => TerminalOp::WriteText(fixture_scalar_text(text)),

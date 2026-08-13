@@ -1,4 +1,4 @@
-//! Standalone OSC 52 clipboard encoding benchmark
+//! Standalone clipboard and viewport-output encoding benchmark
 
 #![allow(unsafe_code)]
 
@@ -7,11 +7,12 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use nagi_vt::{Capabilities, TerminalOp, append_encoded, encode};
+use nagi_vt::{Capabilities, TerminalOp, append_encoded, append_encoded_at, encode, encode_at};
 
 const SAMPLE_COUNT: usize = 12;
 const SMALL_CALLS_PER_SAMPLE: usize = 10_000;
 const LARGE_CALLS_PER_SAMPLE: usize = 4;
+const VIEWPORT_CALLS_PER_SAMPLE: usize = 10_000;
 
 struct TrackingAllocator;
 
@@ -161,6 +162,23 @@ fn sample(text: String, calls_per_sample: usize, mode: BufferMode) -> Vec<Sample
     samples
 }
 
+fn sample_viewport_origin(operations: &[TerminalOp]) -> Vec<Sample> {
+    let mut reusable = encode_at(operations, Capabilities::BASELINE, 0, 17);
+    reusable.clear();
+    let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+    for _ in 0..SAMPLE_COUNT {
+        let baseline = reset_metrics();
+        let started = Instant::now();
+        for _ in 0..VIEWPORT_CALLS_PER_SAMPLE {
+            reusable.clear();
+            append_encoded_at(&mut reusable, operations, Capabilities::BASELINE, 0, 17);
+            black_box(&reusable);
+        }
+        samples.push(read_metrics(started.elapsed(), baseline));
+    }
+    samples
+}
+
 fn report(label: &str, input_bytes: usize, calls_per_sample: usize, samples: Vec<Sample>) {
     let mut elapsed: Vec<_> = samples.iter().map(|sample| sample.elapsed).collect();
     let mut allocations: Vec<_> = samples.iter().map(|sample| sample.allocations).collect();
@@ -208,4 +226,19 @@ fn main() {
             sample(text, calls, BufferMode::Reused),
         );
     }
+
+    let viewport_operations = [
+        TerminalOp::HideCursor,
+        TerminalOp::MoveTo { x: 0, y: 0 },
+        TerminalOp::WriteText("status".to_owned()),
+        TerminalOp::MoveTo { x: 0, y: 1 },
+        TerminalOp::WriteText("ready".to_owned()),
+        TerminalOp::MoveTo { x: 0, y: 0 },
+    ];
+    report(
+        "viewport-origin-reused",
+        "statusready".len(),
+        VIEWPORT_CALLS_PER_SAMPLE,
+        sample_viewport_origin(&viewport_operations),
+    );
 }

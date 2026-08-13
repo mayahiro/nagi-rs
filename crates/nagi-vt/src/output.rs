@@ -139,6 +139,10 @@ pub enum TerminalOp {
         /// Vertical delta, positive downward
         dy: i32,
     },
+    /// Request a one-based cursor position report from the terminal
+    RequestCursorPosition,
+    /// Move to column zero of the next line, scrolling when necessary
+    NextLine,
     /// Apply a complete SGR style after resetting prior style state
     SetStyle(SgrStyle),
     /// Reset all SGR style state
@@ -187,24 +191,60 @@ pub fn encode(operations: &[TerminalOp], capabilities: Capabilities) -> Vec<u8> 
     output
 }
 
+/// Encodes terminal operations after translating absolute positions by an origin
+///
+/// Relative movement and every non-position operation are unchanged. Coordinate
+/// addition saturates at `u32::MAX`.
+#[must_use]
+pub fn encode_at(
+    operations: &[TerminalOp],
+    capabilities: Capabilities,
+    origin_x: u32,
+    origin_y: u32,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    append_encoded_at(&mut output, operations, capabilities, origin_x, origin_y);
+    output
+}
+
 /// Appends deterministic terminal encoding to `destination`
 pub fn append_encoded(
     destination: &mut Vec<u8>,
     operations: &[TerminalOp],
     capabilities: Capabilities,
 ) {
+    append_encoded_at(destination, operations, capabilities, 0, 0);
+}
+
+/// Appends deterministic terminal encoding with an absolute-position origin
+///
+/// Relative movement and every non-position operation are unchanged. Coordinate
+/// addition saturates at `u32::MAX`.
+pub fn append_encoded_at(
+    destination: &mut Vec<u8>,
+    operations: &[TerminalOp],
+    capabilities: Capabilities,
+    origin_x: u32,
+    origin_y: u32,
+) {
     for operation in operations {
-        encode_operation(destination, operation, capabilities);
+        encode_operation(destination, operation, capabilities, origin_x, origin_y);
     }
 }
 
-fn encode_operation(output: &mut Vec<u8>, operation: &TerminalOp, capabilities: Capabilities) {
+fn encode_operation(
+    output: &mut Vec<u8>,
+    operation: &TerminalOp,
+    capabilities: Capabilities,
+    origin_x: u32,
+    origin_y: u32,
+) {
     match operation {
         TerminalOp::MoveTo { x, y } => {
             output.extend_from_slice(b"\x1B[");
-            push_decimal(output, u64::from(*y) + 1);
+            push_decimal(output, u64::from(y.saturating_add(origin_y)) + 1);
             output.push(b';');
-            push_decimal(output, u64::from(*x) + 1);
+            push_decimal(output, u64::from(x.saturating_add(origin_x)) + 1);
             output.push(b'H');
         }
         TerminalOp::MoveRelative { dx, dy } => {
@@ -219,6 +259,8 @@ fn encode_operation(output: &mut Vec<u8>, operation: &TerminalOp, capabilities: 
                 write_csi_count(output, dx.unsigned_abs(), 'D');
             }
         }
+        TerminalOp::RequestCursorPosition => output.extend_from_slice(b"\x1B[6n"),
+        TerminalOp::NextLine => output.extend_from_slice(b"\x1BE"),
         TerminalOp::SetStyle(style) => write_style(output, *style, capabilities),
         TerminalOp::ResetStyle => output.extend_from_slice(b"\x1B[0m"),
         TerminalOp::WriteText(text) => write_safe_text(output, text),
@@ -435,7 +477,7 @@ fn push_decimal(output: &mut Vec<u8>, mut value: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capabilities, TerminalOp, append_encoded, encode};
+    use super::{Capabilities, TerminalOp, append_encoded, encode, encode_at};
 
     #[test]
     fn text_cannot_inject_terminal_controls() {
@@ -474,6 +516,26 @@ mod tests {
             Capabilities::BASELINE,
         );
         assert_eq!(output, b"prefix:\x1B[4;3Hok");
+    }
+
+    #[test]
+    fn origin_only_translates_absolute_positions_and_saturates() {
+        assert_eq!(
+            encode_at(
+                &[
+                    TerminalOp::MoveTo { x: 2, y: 3 },
+                    TerminalOp::MoveRelative { dx: 1, dy: -1 },
+                    TerminalOp::MoveTo {
+                        x: u32::MAX,
+                        y: u32::MAX,
+                    },
+                ],
+                Capabilities::BASELINE,
+                5,
+                7,
+            ),
+            b"\x1B[11;8H\x1B[1A\x1B[1C\x1B[4294967296;4294967296H"
+        );
     }
 
     #[test]

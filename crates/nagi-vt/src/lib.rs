@@ -14,6 +14,6 @@ pub use event::{
 pub use input::{Decoder, MAX_PASTE_BYTES, MAX_SEQUENCE_BYTES};
 pub use output::{
     Capabilities, CursorShape, EraseMode, MouseTracking, SgrColor, SgrStyle, TerminalOp,
-    append_encoded, encode,
+    append_encoded, append_encoded_at, encode, encode_at,
 };
 pub use style::{Attributes, Color, Style};

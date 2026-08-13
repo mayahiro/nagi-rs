@@ -78,7 +78,9 @@ nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 
 `RuntimeConfig::width_profile`と`TerminalOptions::width_profile`はCoreのmeasure、render、hit geometry、cursor配置で使うcell幅policyを1個選択します。幅計算を行うWidget builderには`ViewContext::width_profile`を渡します。予期しないasync lifecycle transitionは上限付きRuntime notice queueまたはterminal notice-handler entry pointから観測できます
 
-`Effect::suspend_terminal`は標準runnerが通常terminalを復元してalternate screenを離れた後にApplication所有のblocking taskを実行します。Task return後は設定済みmodeを再開し、pending inputをresetしてfull redrawを強制します
+`Effect::suspend_terminal`は標準runnerが通常terminalを復元して設定済みviewportを離れた後にApplication所有のblocking taskを実行します。Task return後はfull-screen viewportを再開するか新しいinline領域を確保し、pending decoder stateをresetしてfull redrawを強制します
+
+`TerminalViewport::inline(height)`は同じRuntimeをmain screenの上限付き領域で実行し、最終frameをterminal historyへ残します。標準runnerがcursor取得、resize配置、座標変換、復元を所有します
 
 ## Example
 
@@ -97,6 +99,7 @@ Rust repository rootから実行します
 | [Diff view](crates/nagi-tui-widgets/examples/diff_view/README.md) | `cargo run -p nagi-tui-widgets --example diff_view` |
 | [Event-driven log viewer](crates/nagi-tui/examples/log_viewer/README.md) | `cargo run -p nagi-tui --example log_viewer` |
 | [Terminal suspendとresume](crates/nagi-tui/examples/terminal_suspend/README.md) | `cargo run -p nagi-tui --example terminal_suspend` |
+| [Inline terminal viewport](crates/nagi-tui/examples/inline_terminal/README.md) | `cargo run -p nagi-tui --example inline_terminal` |
 | [Virtual scroll](crates/nagi-tui/examples/virtual_scroll/README.md) | `cargo run -p nagi-tui --example virtual_scroll` |
 | [Variable-height feed](crates/nagi-tui-widgets/examples/virtual_feed/README.md) | `cargo run -p nagi-tui-widgets --example virtual_feed` |
 | [Widget gallery](crates/nagi-tui-widgets/examples/widget_gallery/README.md) | `cargo run -p nagi-tui-widgets --example widget_gallery` |

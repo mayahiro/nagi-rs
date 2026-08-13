@@ -12,6 +12,64 @@ use crate::{
     TimedInputDecoder,
 };
 
+/// Error returned when an inline terminal viewport has no rows
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidInlineViewportHeight;
+
+impl fmt::Display for InvalidInlineViewportHeight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an inline terminal viewport requires a positive height")
+    }
+}
+
+impl Error for InvalidInlineViewportHeight {}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TerminalViewportKind {
+    #[default]
+    Fullscreen,
+    Inline,
+}
+
+/// Screen region owned by the standard terminal runner
+///
+/// The default is a full-screen alternate-screen viewport.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalViewport {
+    kind: TerminalViewportKind,
+    inline_height: u16,
+}
+
+impl TerminalViewport {
+    /// Full-screen alternate-screen ownership
+    pub const FULLSCREEN: Self = Self {
+        kind: TerminalViewportKind::Fullscreen,
+        inline_height: 0,
+    };
+
+    /// Creates a main-screen viewport with a positive requested row count
+    ///
+    /// The terminal runner clamps this height to the current terminal height.
+    pub const fn inline(height: u16) -> Result<Self, InvalidInlineViewportHeight> {
+        if height == 0 {
+            return Err(InvalidInlineViewportHeight);
+        }
+        Ok(Self {
+            kind: TerminalViewportKind::Inline,
+            inline_height: height,
+        })
+    }
+
+    /// Returns the requested row count for an inline viewport
+    #[must_use]
+    pub const fn inline_height(self) -> Option<u16> {
+        match self.kind {
+            TerminalViewportKind::Fullscreen => None,
+            TerminalViewportKind::Inline => Some(self.inline_height),
+        }
+    }
+}
+
 /// Standard terminal handling for application clipboard requests
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TerminalClipboard {
@@ -33,6 +91,12 @@ pub struct TerminalOptions {
     pub mouse_tracking: Option<MouseTracking>,
     /// Clipboard output policy, disabled by default
     pub clipboard: TerminalClipboard,
+    /// Terminal screen region owned by the runner
+    pub viewport: TerminalViewport,
+    /// Maximum wait for an inline viewport cursor-position report
+    ///
+    /// Zero performs an immediate query check.
+    pub cursor_query_timeout: Duration,
     /// Whether to focus the first focusable node before the initial frame
     pub focus_first: bool,
     /// Maximum time to disambiguate a lone ESC from an escape sequence
@@ -62,6 +126,8 @@ impl Default for TerminalOptions {
             capabilities: Capabilities::BASELINE,
             mouse_tracking: None,
             clipboard: TerminalClipboard::Disabled,
+            viewport: TerminalViewport::FULLSCREEN,
+            cursor_query_timeout: Duration::from_millis(100),
             focus_first: false,
             escape_timeout: Duration::from_millis(25),
             queue_capacity: crate::DEFAULT_QUEUE_CAPACITY,
@@ -164,7 +230,12 @@ where
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
     Handler: FnMut(&RuntimeNotice),
 {
-    let mut session = TerminalSession::open(options.mouse_tracking).map_err(run_terminal_error)?;
+    let mut session = TerminalSession::open(
+        options.mouse_tracking,
+        options.viewport,
+        options.cursor_query_timeout,
+    )
+    .map_err(run_terminal_error)?;
     let result = run_terminal_session(
         &mut session,
         app,
@@ -192,7 +263,7 @@ where
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
     Handler: FnMut(&RuntimeNotice),
 {
-    let (columns, rows) = session.size().map_err(run_terminal_error)?;
+    let (columns, rows) = session.viewport_size().map_err(run_terminal_error)?;
     let clock = SystemClock::new();
     let mut config = RuntimeConfig::new(Size::new(u32::from(columns), u32::from(rows)));
     config.queue_capacity = options.queue_capacity;
@@ -206,7 +277,7 @@ where
     let mut input = [0_u8; 8_192];
 
     if session.take_resize() {
-        let (columns, rows) = session.size().map_err(run_terminal_error)?;
+        let (columns, rows) = session.refresh_viewport().map_err(run_terminal_error)?;
         runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
     }
     runtime.process_pending()?;
@@ -233,7 +304,7 @@ where
         ]);
         let readable = session.wait(timeout).map_err(run_terminal_error)?;
         if session.take_resize() {
-            let (columns, rows) = session.size().map_err(run_terminal_error)?;
+            let (columns, rows) = session.refresh_viewport().map_err(run_terminal_error)?;
             runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
         }
         let mut events = if readable {
@@ -249,6 +320,9 @@ where
 
         let mut exit = false;
         for event in events {
+            let Some(event) = session.localize_event(event) else {
+                continue;
+            };
             let dispatch = runtime.dispatch_event(&event)?;
             if !dispatch.consumed() {
                 match map_event(event) {
@@ -305,7 +379,7 @@ where
 
         decoder.reset();
         runtime.invalidate_terminal_surface();
-        let (columns, rows) = session.size().map_err(run_terminal_error)?;
+        let (columns, rows) = session.viewport_size().map_err(run_terminal_error)?;
         runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
         runtime.process_pending()?;
         handle_runtime_notices(runtime, handle_notice);
@@ -341,7 +415,12 @@ fn write_pending_output<Application: App>(
     let clipboard_operation = take_clipboard_operation(runtime, clipboard);
     match (frame.as_ref(), clipboard_operation.as_ref()) {
         (Some(frame), extra) => session
-            .write_operations_with_extra(frame.operations(), extra, capabilities)
+            .write_viewport_operations_with_extra(
+                frame.operations(),
+                frame.surface().cursor().map(|cursor| (cursor.x, cursor.y)),
+                extra,
+                capabilities,
+            )
             .map_err(run_terminal_error)?,
         (None, Some(operation)) => session
             .write_operations(std::slice::from_ref(operation), capabilities)
@@ -371,7 +450,8 @@ mod tests {
     use crate::{App, Effect, Node, Runtime, RuntimeConfig, Size, ViewContext, VirtualClock};
 
     use super::{
-        TerminalClipboard, TerminalOptions, nearest_terminal_deadline, take_clipboard_operation,
+        TerminalClipboard, TerminalOptions, TerminalViewport, nearest_terminal_deadline,
+        take_clipboard_operation,
     };
 
     struct ClipboardApp;
@@ -393,11 +473,24 @@ mod tests {
         let options = TerminalOptions::default();
         assert_eq!(options.mouse_tracking, None);
         assert_eq!(options.clipboard, TerminalClipboard::Disabled);
+        assert_eq!(options.viewport, TerminalViewport::FULLSCREEN);
+        assert_eq!(options.cursor_query_timeout, Duration::from_millis(100));
         assert!(!options.focus_first);
         assert_eq!(
             options.minimum_frame_interval,
             std::time::Duration::from_nanos(8_333_334)
         );
+    }
+
+    #[test]
+    fn inline_viewport_requires_positive_height() {
+        assert_eq!(
+            TerminalViewport::inline(0),
+            Err(super::InvalidInlineViewportHeight)
+        );
+        let viewport = TerminalViewport::inline(4).unwrap();
+        assert_eq!(viewport.inline_height(), Some(4));
+        assert_eq!(TerminalViewport::default().inline_height(), None);
     }
 
     #[test]
