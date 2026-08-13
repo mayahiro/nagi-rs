@@ -53,7 +53,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-tui` | Terminal Presentation Rules, bounded Content-to-Node projection, App lifecycle, semantic nodes, scoped key maps, layout, events, Effects, Subscriptions, and terminal loop |
 | `nagi-tui-widgets` | 31 standard widgets built from the public TUI API |
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
-| `nagi-cli` | Local and inherited options, command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics, handler-free completion resolution, staged Runtime Policy, and process integration |
+| `nagi-cli` | Local and inherited options, command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics with stable JSON rendering, handler-free completion resolution, staged Runtime Policy, and process integration |
 | `nagi-cli-completion` | Bash, Zsh, Fish, and PowerShell generators plus the reserved completion protocol |
 | `nagi-cli-prompt` | Optional line-oriented Confirm, Select, Input, and Secret prompts with injected I/O |
 | `nagi-cli-status` | Optional synchronous TTY status, spinner, progress, and plain-log fallback with injected I/O |
@@ -139,6 +139,7 @@ Run commands from the Rust repository root
 | [CLI basic](crates/nagi-cli/examples/basic/README.md) | `cargo run -p nagi-cli --example basic -- Nagi` |
 | [CLI subcommands](crates/nagi-cli/examples/subcommands/README.md) | `cargo run -p nagi-cli --example subcommands -- start -vv` |
 | [CLI staged adoption](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
+| [CLI JSON Diagnostic](crates/nagi-cli/examples/json_diagnostic/README.md) | `cargo run -p nagi-cli --example json_diagnostic` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
 | [CLI lightweight prompts](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
 | [CLI TTY-aware status](crates/nagi-cli-status/examples/status/README.md) | `cargo run -p nagi-cli-status --example status` |

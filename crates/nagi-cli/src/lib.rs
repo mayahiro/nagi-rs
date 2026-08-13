@@ -33,6 +33,7 @@
 mod command;
 mod completion;
 mod diagnostic;
+mod diagnostic_json;
 mod help;
 mod parser;
 mod policy;
@@ -55,6 +56,7 @@ pub use diagnostic::{
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticTarget, DiagnosticTargetKind,
     ExitStatus,
 };
+pub use diagnostic_json::{JSON_DIAGNOSTIC_SCHEMA, JsonDiagnosticRenderer};
 pub use help::{
     HelpBlock, HelpDocument, HelpEntry, HelpExample, HelpInheritedOption, HelpLink,
     HelpOptionGroup, HelpOptionRelation, HelpOptionRelationKind, HelpRenderer, HelpSection,

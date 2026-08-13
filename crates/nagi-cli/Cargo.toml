@@ -22,3 +22,7 @@ harness = false
 [[bench]]
 name = "completion"
 harness = false
+
+[[bench]]
+name = "diagnostic_json"
+harness = false

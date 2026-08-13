@@ -51,7 +51,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-tui` | Terminal Presentation Rules、上限付きContentからNodeへのprojection、App lifecycle、semantic Node、Scoped KeyMap、layout、event、Effect、Subscription、terminal loop |
 | `nagi-tui-widgets` | Public TUI APIから構築した31個の標準Widget |
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
-| `nagi-cli` | Localと継承Option、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、target付きDiagnostic、handlerを含まないcompletion解決、段階実行Runtime Policy、process統合 |
+| `nagi-cli` | Localと継承Option、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、stable JSON renderingを持つtarget付きDiagnostic、handlerを含まないcompletion解決、段階実行Runtime Policy、process統合 |
 | `nagi-cli-completion` | Bash、Zsh、Fish、PowerShell generatorと予約済みcompletion protocol |
 | `nagi-cli-prompt` | 注入可能なI/Oを持つ任意の行指向Confirm、Select、Input、Secret |
 | `nagi-cli-status` | 注入可能なI/Oを持つ任意の同期TTY status、spinner、progress、plain-log fallback |
@@ -116,6 +116,7 @@ Rust repository rootから実行します
 | [CLI basic](crates/nagi-cli/examples/basic/README.md) | `cargo run -p nagi-cli --example basic -- Nagi` |
 | [CLI subcommands](crates/nagi-cli/examples/subcommands/README.md) | `cargo run -p nagi-cli --example subcommands -- start -vv` |
 | [CLI段階導入](crates/nagi-cli/examples/staged/README.md) | `cargo run -p nagi-cli --example staged -- inspect page` |
+| [CLI JSON Diagnostic](crates/nagi-cli/examples/json_diagnostic/README.md) | `cargo run -p nagi-cli --example json_diagnostic` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
 | [CLI軽量prompt](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
 | [CLI TTY-aware status](crates/nagi-cli-status/examples/status/README.md) | `cargo run -p nagi-cli-status --example status` |
