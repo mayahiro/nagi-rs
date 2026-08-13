@@ -30,6 +30,7 @@ mod subscription;
 mod subscription_supervisor;
 mod supervisor;
 mod terminal;
+mod terminal_capability;
 #[allow(dead_code, unsafe_code)]
 mod terminal_unix;
 mod text_edit;
@@ -75,9 +76,9 @@ pub use keymap::{
 pub use layout::Length;
 pub use nagi_surface::{Point, Rect, Size, Surface};
 pub use nagi_vt::{
-    Attributes, Capabilities, Color, CursorShape, EraseMode, Event, KeyAction, KeyCode, KeyEvent,
-    KeyProtocol, Modifiers, MouseButton, MouseEvent, MouseKind, MouseTracking, SgrColor, SgrStyle,
-    Style, TerminalOp, encode,
+    Attributes, Capabilities, Color, ColorLevel, CursorShape, EraseMode, Event, KeyAction, KeyCode,
+    KeyEvent, KeyProtocol, KeyboardEnhancements, Modifiers, MouseButton, MouseEvent, MouseKind,
+    MouseTracking, SgrColor, SgrStyle, Style, TerminalOp, encode,
 };
 pub use node::{
     AnchoredOverlayFallback, AnchoredOverlayOptions, AnchoredOverlaySide, HorizontalAlignment,
@@ -107,6 +108,10 @@ pub use supervisor::EffectDiagnostics;
 pub use terminal::{
     InvalidInlineViewportHeight, RunError, TerminalClipboard, TerminalOptions, TerminalViewport,
     run_terminal, run_terminal_with_notice_handler,
+};
+pub use terminal_capability::{
+    TerminalCapabilityDetection, TerminalCapabilityProfile, TerminalColorLevel,
+    TerminalFeatureSupport, TerminalKeyboardProtocol,
 };
 pub use virtual_flow::{
     DuplicateVirtualFlowItemKey, VirtualFlowAnchor, VirtualFlowAnchorAffinity, VirtualFlowItem,

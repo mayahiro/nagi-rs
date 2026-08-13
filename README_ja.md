@@ -78,6 +78,8 @@ nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 
 `RuntimeConfig::width_profile`と`TerminalOptions::width_profile`はCoreのmeasure、render、hit geometry、cursor配置で使うcell幅policyを1個選択します。幅計算を行うWidget builderには`ViewContext::width_profile`を渡します。予期しないasync lifecycle transitionは上限付きRuntime notice queueまたはterminal notice-handler entry pointから観測できます
 
+`TerminalOptions::capability_detection`は保守的なenvironment hintとactiveなKitty keyboard queryを明示的に有効化します。Immutableな結果は`ViewContext::terminal_capabilities`から参照できます。検出は既定で無効であり、設定済みcolor outputを昇格させず上限として制約し、OSC 52やその他のoutput policyを許可しません。VTの`Capabilities::color_level`はMonochrome、ANSI 16、Indexed 256、True Color outputを選択します
+
 `Effect::suspend_terminal`は標準runnerが通常terminalを復元して設定済みviewportを離れた後にApplication所有のblocking taskを実行します。Task return後はfull-screen viewportを再開するか新しいinline領域を確保し、pending decoder stateをresetしてfull redrawを強制します
 
 `TerminalViewport::inline(height)`は同じRuntimeをmain screenの上限付き領域で実行し、最終frameをterminal historyへ残します。標準runnerがcursor取得、resize配置、座標変換、復元を所有します
@@ -91,6 +93,7 @@ Rust repository rootから実行します
 | [Source-neutral Content](crates/nagi-content/examples/content/README.md) | `cargo run -p nagi-content --example content` |
 | [Presentation RulesとContent projection](crates/nagi-tui/examples/presentation/README.md) | `cargo run -p nagi-tui --example presentation` |
 | [Counter](crates/nagi-tui/examples/counter/README.md) | `cargo run -p nagi-tui --example counter` |
+| [Terminal capability](crates/nagi-tui/examples/terminal_capabilities/README.md) | `cargo run -p nagi-tui --example terminal_capabilities` |
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
 | [Suggestion popup](crates/nagi-tui-widgets/examples/suggestion_popup/README.md) | `cargo run -p nagi-tui-widgets --example suggestion_popup` |

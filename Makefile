@@ -1,6 +1,7 @@
 .PHONY: bench build check format format-check lint test unicode
 
 bench:
+	cargo bench -p nagi-vt --bench input
 	cargo bench -p nagi-tui --bench scroll_viewport
 	cargo bench -p nagi-tui --bench content_projection
 	cargo bench -p nagi-tui --bench clipboard

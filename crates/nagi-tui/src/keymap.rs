@@ -203,7 +203,10 @@ impl KeyStroke {
     /// Creates a stroke from a normalized logical key and modifiers
     #[must_use]
     pub const fn new(code: KeyCode, modifiers: Modifiers) -> Self {
-        Self { code, modifiers }
+        Self {
+            code,
+            modifiers: modifiers.without_locks(),
+        }
     }
 
     /// Creates a Character stroke
@@ -272,6 +275,12 @@ impl fmt::Display for KeyStroke {
         if self.modifiers.meta {
             formatter.write_str("Meta+")?;
         }
+        if self.modifiers.super_key {
+            formatter.write_str("Super+")?;
+        }
+        if self.modifiers.hyper {
+            formatter.write_str("Hyper+")?;
+        }
         match self.code {
             KeyCode::Character(' ') => formatter.write_str("Space"),
             KeyCode::Character(character) if character.is_control() => {
@@ -293,6 +302,7 @@ impl fmt::Display for KeyStroke {
             KeyCode::PageUp => formatter.write_str("PageUp"),
             KeyCode::PageDown => formatter.write_str("PageDown"),
             KeyCode::Function(number) => write!(formatter, "F{number}"),
+            KeyCode::Functional(number) => write!(formatter, "Functional({number})"),
             KeyCode::Unknown => formatter.write_str("Unknown"),
         }
     }
@@ -969,6 +979,42 @@ mod tests {
         });
 
         assert!(binding.matches(&event));
+    }
+
+    #[test]
+    fn stroke_identity_ignores_locks_but_distinguishes_extended_modifiers() {
+        let with_locks = KeyStroke::new(
+            KeyCode::Enter,
+            Modifiers {
+                super_key: true,
+                caps_lock: true,
+                num_lock: true,
+                ..Modifiers::NONE
+            },
+        );
+        let without_locks = KeyStroke::new(
+            KeyCode::Enter,
+            Modifiers {
+                super_key: true,
+                ..Modifiers::NONE
+            },
+        );
+        let hyper = KeyStroke::new(
+            KeyCode::Enter,
+            Modifiers {
+                hyper: true,
+                ..Modifiers::NONE
+            },
+        );
+
+        assert_eq!(with_locks, without_locks);
+        assert_ne!(without_locks, hyper);
+        assert_eq!(without_locks.to_string(), "Super+Enter");
+        assert_eq!(hyper.to_string(), "Hyper+Enter");
+        assert_eq!(
+            KeyStroke::new(KeyCode::Functional(57_428), Modifiers::NONE).to_string(),
+            "Functional(57428)"
+        );
     }
 
     #[test]

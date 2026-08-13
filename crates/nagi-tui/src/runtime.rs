@@ -28,7 +28,7 @@ use crate::wake::WakeHandle;
 use crate::{
     App, BindingConflict, Clock, EventDispatch, EventResult, InteractionState, Node, NodeId, Point,
     Rect, ResolvedActions, ScrollOffset, Size, SubscriptionKey, Surface, SystemClock, TaskKey,
-    Timestamp,
+    TerminalCapabilityProfile, Timestamp,
 };
 
 /// The default maximum number of messages waiting in a runtime queue
@@ -62,6 +62,8 @@ pub struct RuntimeConfig {
     ///
     /// A Custom override must return stable widths for this Runtime's lifetime
     pub width_profile: WidthProfile<'static>,
+    /// Terminal features available to application views
+    pub terminal_capabilities: TerminalCapabilityProfile,
 }
 
 impl RuntimeConfig {
@@ -76,6 +78,7 @@ impl RuntimeConfig {
             runtime_notice_capacity: DEFAULT_RUNTIME_NOTICE_CAPACITY,
             minimum_frame_interval: Duration::ZERO,
             width_profile: WidthProfile::MODERN,
+            terminal_capabilities: TerminalCapabilityProfile::UNKNOWN,
         }
     }
 }
@@ -241,6 +244,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     urgent_frame: bool,
     minimum_frame_interval: Duration,
     width_profile: WidthProfile<'static>,
+    terminal_capabilities: TerminalCapabilityProfile,
     last_frame: Option<Timestamp>,
     previous_surface: Option<Arc<Surface>>,
     spare_surface: Option<Surface>,
@@ -326,6 +330,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             urgent_frame: true,
             minimum_frame_interval: config.minimum_frame_interval,
             width_profile: config.width_profile,
+            terminal_capabilities: config.terminal_capabilities,
             last_frame: None,
             previous_surface: None,
             spare_surface: None,
@@ -1059,7 +1064,12 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 KeyCode::End => TextEdit::End,
                 KeyCode::Backspace => TextEdit::Backspace,
                 KeyCode::Delete => TextEdit::Delete,
-                KeyCode::Character(_) if !key.modifiers.control && !key.modifiers.meta => {
+                KeyCode::Character(_) | KeyCode::Unknown
+                    if !key.modifiers.control
+                        && !key.modifiers.meta
+                        && !key.modifiers.super_key
+                        && !key.modifiers.hyper =>
+                {
                     TextEdit::Insert(key.text.as_deref()?)
                 }
                 _ => return None,
@@ -1368,10 +1378,13 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         if self.view_tree.is_some() {
             return Ok(());
         }
-        let view = self.app.view(crate::ViewContext::with_width_profile(
-            self.size,
-            self.width_profile,
-        ));
+        let view = self
+            .app
+            .view(crate::ViewContext::with_terminal_capabilities(
+                self.size,
+                self.width_profile,
+                self.terminal_capabilities,
+            ));
         view.prepare_virtual_flows(self.size, &mut self.interaction, self.width_profile);
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
         let mut action_index = std::mem::take(&mut self.next_action_index);
@@ -1469,10 +1482,13 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 }
             }
         }
-        let view = self.app.view(crate::ViewContext::with_width_profile(
-            self.size,
-            self.width_profile,
-        ));
+        let view = self
+            .app
+            .view(crate::ViewContext::with_terminal_capabilities(
+                self.size,
+                self.width_profile,
+                self.terminal_capabilities,
+            ));
         view.prepare_virtual_flows(self.size, &mut self.interaction, self.width_profile);
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
         let mut action_index = std::mem::take(&mut self.next_action_index);

@@ -1,6 +1,6 @@
 use nagi_text::WidthProfile;
 
-use crate::{Effect, Node, Size, Subscription};
+use crate::{Effect, Node, Size, Subscription, TerminalCapabilityProfile};
 
 /// Environment information available while rebuilding an application view
 #[derive(Clone, Copy, Debug)]
@@ -9,6 +9,8 @@ pub struct ViewContext {
     pub size: Size,
     /// Runtime terminal cell-width policy
     pub width_profile: WidthProfile<'static>,
+    /// Detected terminal features and active keyboard protocol
+    pub terminal_capabilities: TerminalCapabilityProfile,
 }
 
 impl ViewContext {
@@ -18,6 +20,7 @@ impl ViewContext {
         Self {
             size,
             width_profile: WidthProfile::MODERN,
+            terminal_capabilities: TerminalCapabilityProfile::UNKNOWN,
         }
     }
 
@@ -27,6 +30,21 @@ impl ViewContext {
         Self {
             size,
             width_profile,
+            terminal_capabilities: TerminalCapabilityProfile::UNKNOWN,
+        }
+    }
+
+    /// Creates view environment information with complete terminal context
+    #[must_use]
+    pub const fn with_terminal_capabilities(
+        size: Size,
+        width_profile: WidthProfile<'static>,
+        terminal_capabilities: TerminalCapabilityProfile,
+    ) -> Self {
+        Self {
+            size,
+            width_profile,
+            terminal_capabilities,
         }
     }
 }

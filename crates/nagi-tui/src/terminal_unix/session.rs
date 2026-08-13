@@ -6,10 +6,14 @@ use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use nagi_vt::encode;
-use nagi_vt::{Capabilities, Event, MouseTracking, TerminalOp, append_encoded, append_encoded_at};
+use nagi_vt::{
+    Capabilities, Event, KeyboardEnhancements, MouseTracking, TerminalOp, append_encoded,
+    append_encoded_at,
+};
 
 use super::system::UnixBackend;
 use super::wake::WakePipe;
+use crate::TerminalFeatureSupport;
 use crate::terminal::TerminalViewport;
 use crate::wake::WakeHandle;
 
@@ -112,6 +116,9 @@ pub(crate) struct Session<B: Backend> {
     inline_region: Option<InlineRegion>,
     raw_mode_active: bool,
     lifecycle_started: bool,
+    keyboard_detection_requested: bool,
+    keyboard_support: TerminalFeatureSupport,
+    keyboard_enhancements_active: bool,
     pending_input: Vec<u8>,
     pending_input_offset: usize,
     output_buffer: Vec<u8>,
@@ -186,6 +193,9 @@ impl<B: Backend> Session<B> {
             inline_region: None,
             raw_mode_active: false,
             lifecycle_started: false,
+            keyboard_detection_requested: false,
+            keyboard_support: TerminalFeatureSupport::Unknown,
+            keyboard_enhancements_active: false,
             pending_input: Vec::new(),
             pending_input_offset: 0,
             output_buffer: Vec::new(),
@@ -325,6 +335,28 @@ impl<B: Backend> Session<B> {
         WakeHandle::new(Arc::clone(&self.wake))
     }
 
+    pub(crate) fn enable_extended_keyboard(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<TerminalFeatureSupport> {
+        self.keyboard_detection_requested = true;
+        if self.keyboard_enhancements_active {
+            return Ok(TerminalFeatureSupport::Supported);
+        }
+        let support = self.query_extended_keyboard(timeout)?;
+        self.keyboard_support = support;
+        if support == TerminalFeatureSupport::Supported {
+            self.write_operations(
+                &[TerminalOp::PushKeyboardEnhancements(
+                    KeyboardEnhancements::NAGI,
+                )],
+                Capabilities::BASELINE,
+            )?;
+            self.keyboard_enhancements_active = true;
+        }
+        Ok(support)
+    }
+
     pub(crate) fn size(&mut self) -> Result<(u16, u16)> {
         self.backend
             .size(self.output_fd)
@@ -414,7 +446,7 @@ impl<B: Backend> Session<B> {
         }
 
         self.lifecycle_started = true;
-        let mut operations = Vec::with_capacity(6);
+        let mut operations = Vec::with_capacity(7);
         if self.viewport.inline_height().is_none() {
             operations.push(TerminalOp::EnterAlternateScreen);
         }
@@ -423,10 +455,18 @@ impl<B: Backend> Session<B> {
             operations.push(TerminalOp::EnableMouse(tracking));
         }
         operations.push(TerminalOp::EnableFocus);
+        let reactivate_keyboard = self.keyboard_detection_requested
+            && self.keyboard_support == TerminalFeatureSupport::Supported;
+        if reactivate_keyboard {
+            operations.push(TerminalOp::PushKeyboardEnhancements(
+                KeyboardEnhancements::NAGI,
+            ));
+        }
         if let Err(error) = self.write_operations(&operations, Capabilities::BASELINE) {
             let _ = self.deactivate("restore terminal mode");
             return Err(error);
         }
+        self.keyboard_enhancements_active = reactivate_keyboard;
         if let Some(height) = self.viewport.inline_height() {
             if let Err(error) = self.establish_inline_region(height, 0) {
                 let _ = self.deactivate("restore terminal mode");
@@ -507,6 +547,68 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    fn query_extended_keyboard(&mut self, timeout: Duration) -> Result<TerminalFeatureSupport> {
+        self.compact_pending_input();
+        let query_start = self.pending_input.len();
+        self.write_operations(
+            &[
+                TerminalOp::QueryKeyboardEnhancements,
+                TerminalOp::RequestPrimaryDeviceAttributes,
+            ],
+            Capabilities::BASELINE,
+        )?;
+        let started = Instant::now();
+        let mut first_wait = true;
+        let mut keyboard_response = false;
+        let mut input = [0_u8; 8_192];
+        loop {
+            let responses = take_keyboard_query_responses(&mut self.pending_input, query_start);
+            keyboard_response |= responses.keyboard;
+            if responses.device_attributes {
+                return Ok(if keyboard_response {
+                    TerminalFeatureSupport::Supported
+                } else {
+                    TerminalFeatureSupport::Unsupported
+                });
+            }
+            let elapsed = started.elapsed();
+            if !first_wait && elapsed >= timeout {
+                return Ok(if keyboard_response {
+                    TerminalFeatureSupport::Supported
+                } else {
+                    TerminalFeatureSupport::Unknown
+                });
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            first_wait = false;
+            if !self.wait_backend(Some(remaining))? {
+                return Ok(if keyboard_response {
+                    TerminalFeatureSupport::Supported
+                } else {
+                    TerminalFeatureSupport::Unknown
+                });
+            }
+            let read = self.read_backend(&mut input)?;
+            if read == 0 {
+                return Ok(if keyboard_response {
+                    TerminalFeatureSupport::Supported
+                } else {
+                    TerminalFeatureSupport::Unknown
+                });
+            }
+            if self.pending_input.len().saturating_add(read) > MAX_CURSOR_QUERY_INPUT_BYTES {
+                return Err(TerminalError::new(
+                    "query terminal capabilities",
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "terminal input exceeded the capability-query limit",
+                    ),
+                ));
+            }
+            self.pending_input.extend_from_slice(&input[..read]);
+        }
+    }
+
     fn compact_pending_input(&mut self) {
         if self.pending_input_offset == 0 {
             return;
@@ -519,12 +621,16 @@ impl<B: Backend> Session<B> {
         let mut first_error = None;
 
         if self.lifecycle_started {
-            let mut operations = vec![
+            let mut operations = Vec::with_capacity(8);
+            if self.keyboard_enhancements_active {
+                operations.push(TerminalOp::PopKeyboardEnhancements);
+            }
+            operations.extend([
                 TerminalOp::DisableMouse,
                 TerminalOp::DisableFocus,
                 TerminalOp::DisableBracketedPaste,
                 TerminalOp::ResetStyle,
-            ];
+            ]);
             if self.viewport.inline_height().is_some() {
                 self.append_inline_finish_operations(&mut operations);
                 operations.push(TerminalOp::ShowCursor);
@@ -534,6 +640,7 @@ impl<B: Backend> Session<B> {
             match self.write_operations(&operations, Capabilities::BASELINE) {
                 Ok(()) => {
                     self.lifecycle_started = false;
+                    self.keyboard_enhancements_active = false;
                     self.inline_region = None;
                 }
                 Err(error) => first_error = Some(error),
@@ -670,6 +777,68 @@ fn parse_cursor_coordinate(input: &[u8]) -> Option<u16> {
         }
     }
     u16::try_from(value).ok().filter(|value| *value != 0)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct KeyboardQueryResponses {
+    keyboard: bool,
+    device_attributes: bool,
+}
+
+fn take_keyboard_query_responses(input: &mut Vec<u8>, start: usize) -> KeyboardQueryResponses {
+    let mut responses = KeyboardQueryResponses::default();
+    let mut ranges = Vec::new();
+    let mut index = start.min(input.len());
+    while index + 2 < input.len() {
+        if input.get(index..index + 2) != Some(b"\x1B[") {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 2;
+        while end < input.len() && (0x20..=0x3F).contains(&input[end]) {
+            end += 1;
+        }
+        if end == input.len() || !(0x40..=0x7E).contains(&input[end]) {
+            index += 1;
+            continue;
+        }
+        let body = &input[index + 2..end];
+        let matched = match input[end] {
+            b'u' if keyboard_response_body(body) => {
+                if !responses.device_attributes {
+                    responses.keyboard = true;
+                }
+                true
+            }
+            b'c' if device_attributes_body(body) => {
+                responses.device_attributes = true;
+                true
+            }
+            _ => false,
+        };
+        if matched {
+            ranges.push(index..end + 1);
+        }
+        index = end + 1;
+    }
+    for range in ranges.into_iter().rev() {
+        input.drain(range);
+    }
+    responses
+}
+
+fn keyboard_response_body(body: &[u8]) -> bool {
+    body.strip_prefix(b"?")
+        .is_some_and(|flags| !flags.is_empty() && flags.iter().all(u8::is_ascii_digit))
+}
+
+fn device_attributes_body(body: &[u8]) -> bool {
+    body.strip_prefix(b"?").is_some_and(|attributes| {
+        !attributes.is_empty()
+            && attributes
+                .split(|byte| *byte == b';')
+                .all(|parameter| !parameter.is_empty() && parameter.iter().all(u8::is_ascii_digit))
+    })
 }
 
 impl<B: Backend> Drop for Session<B> {
@@ -954,6 +1123,157 @@ mod tests {
 
         session.finish().unwrap();
         assert_eq!(state.lock().unwrap().calls.last().unwrap(), "signal:off");
+    }
+
+    #[test]
+    fn extended_keyboard_query_preserves_input_and_tracks_mode_stack() {
+        let (backend, state) = fake();
+        state
+            .lock()
+            .unwrap()
+            .reads
+            .push_back(b"user\x1B[?0u\x1B[?1;2c".to_vec());
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+
+        assert_eq!(
+            session
+                .enable_extended_keyboard(Duration::from_millis(100))
+                .unwrap(),
+            TerminalFeatureSupport::Supported
+        );
+        let mut pending = [0_u8; 8];
+        let read = session.read(&mut pending).unwrap();
+        assert_eq!(&pending[..read], b"user");
+
+        let query = encode(
+            &[
+                TerminalOp::QueryKeyboardEnhancements,
+                TerminalOp::RequestPrimaryDeviceAttributes,
+            ],
+            Capabilities::BASELINE,
+        );
+        let push = encode(
+            &[TerminalOp::PushKeyboardEnhancements(
+                KeyboardEnhancements::NAGI,
+            )],
+            Capabilities::BASELINE,
+        );
+        assert_eq!(state.lock().unwrap().writes[1..3], [query, push]);
+
+        session.suspend().unwrap();
+        let leave = state.lock().unwrap().writes.last().unwrap().clone();
+        assert!(leave.starts_with(b"\x1B[<u"));
+        session.resume().unwrap();
+        let enter = state.lock().unwrap().writes.last().unwrap().clone();
+        assert!(enter.ends_with(b"\x1B[>27u"));
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn device_attributes_without_keyboard_reply_are_unsupported() {
+        let (backend, state) = fake();
+        state
+            .lock()
+            .unwrap()
+            .reads
+            .push_back(b"x\x1B[?1;2c".to_vec());
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+
+        assert_eq!(
+            session
+                .enable_extended_keyboard(Duration::from_millis(100))
+                .unwrap(),
+            TerminalFeatureSupport::Unsupported
+        );
+        assert_eq!(state.lock().unwrap().writes.len(), 2);
+        let mut pending = [0_u8; 8];
+        let read = session.read(&mut pending).unwrap();
+        assert_eq!(&pending[..read], b"x");
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn zero_timeout_performs_one_read_and_preserves_unknown_input() {
+        let (backend, _state) = fake();
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+
+        assert_eq!(
+            session.enable_extended_keyboard(Duration::ZERO).unwrap(),
+            TerminalFeatureSupport::Unknown
+        );
+        let mut pending = [0_u8; 8];
+        let read = session.read(&mut pending).unwrap();
+        assert_eq!(&pending[..read], b"input");
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn keyboard_reply_without_device_attributes_is_supported_at_timeout() {
+        let (backend, state) = fake();
+        state.lock().unwrap().reads.push_back(b"\x1B[?27u".to_vec());
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+
+        assert_eq!(
+            session.enable_extended_keyboard(Duration::ZERO).unwrap(),
+            TerminalFeatureSupport::Supported
+        );
+        assert_eq!(state.lock().unwrap().writes.len(), 3);
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn keyboard_query_rejects_input_above_the_retained_limit() {
+        let (backend, state) = fake();
+        for _ in 0..9 {
+            state.lock().unwrap().reads.push_back(vec![b'x'; 8_192]);
+        }
+        let mut session = Session::start(backend, 0, 1, None).unwrap();
+
+        let error = session
+            .enable_extended_keyboard(Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(error.operation(), "query terminal capabilities");
+        assert!(error.to_string().contains("capability-query limit"));
+        session.finish().unwrap();
+    }
+
+    #[test]
+    fn keyboard_query_extraction_is_chunk_agnostic_and_retains_other_bytes() {
+        let mut input = b"before\x1B[?27u-middle\x1B[?1;2c-after".to_vec();
+        let responses = take_keyboard_query_responses(&mut input, 6);
+
+        assert_eq!(
+            responses,
+            KeyboardQueryResponses {
+                keyboard: true,
+                device_attributes: true,
+            }
+        );
+        assert_eq!(input, b"before-middle-after");
+    }
+
+    #[test]
+    fn keyboard_reply_after_device_attributes_does_not_establish_support() {
+        let mut input = b"before\x1B[?1;2c-middle\x1B[?27u-after".to_vec();
+        let responses = take_keyboard_query_responses(&mut input, 6);
+
+        assert_eq!(
+            responses,
+            KeyboardQueryResponses {
+                keyboard: false,
+                device_attributes: true,
+            }
+        );
+        assert_eq!(input, b"before-middle-after");
+    }
+
+    #[test]
+    fn keyboard_query_ignores_malformed_device_attributes() {
+        let mut input = b"before\x1B[?;2c-after".to_vec();
+        let responses = take_keyboard_query_responses(&mut input, 6);
+
+        assert_eq!(responses, KeyboardQueryResponses::default());
+        assert_eq!(input, b"before\x1B[?;2c-after");
     }
 
     #[test]

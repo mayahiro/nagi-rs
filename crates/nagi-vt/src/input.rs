@@ -1,7 +1,9 @@
 use std::mem;
 use std::str;
 
-use crate::{Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind};
+use crate::{
+    Event, KeyAction, KeyCode, KeyEvent, KeyProtocol, Modifiers, MouseButton, MouseEvent, MouseKind,
+};
 
 const ESC: u8 = 0x1B;
 const PASTE_START: &[u8] = b"\x1B[200~";
@@ -44,8 +46,10 @@ enum State {
 #[derive(Debug)]
 pub struct Decoder {
     state: State,
+    sequence_scratch: Vec<u8>,
     utf8_pending: Vec<u8>,
     invalid_text_run: bool,
+    kitty_keyboard_mode: bool,
 }
 
 impl Decoder {
@@ -54,9 +58,19 @@ impl Decoder {
     pub fn new() -> Self {
         Self {
             state: State::Ground,
+            sequence_scratch: Vec::new(),
             utf8_pending: Vec::with_capacity(4),
             invalid_text_run: false,
+            kitty_keyboard_mode: false,
         }
+    }
+
+    /// Selects Kitty modifier semantics for otherwise ambiguous function-key sequences
+    ///
+    /// Unambiguous CSI-u reports are decoded as Kitty input in either mode. The
+    /// configured mode applies to every sequence completed after this call.
+    pub fn set_kitty_keyboard_mode(&mut self, enabled: bool) {
+        self.kitty_keyboard_mode = enabled;
     }
 
     /// Consumes one arbitrary byte chunk and returns all completed events
@@ -115,9 +129,11 @@ impl Decoder {
                     events.push(Event::UnknownSequence(bytes));
                 } else if (0x40..=0x7E).contains(&byte) {
                     if bytes.as_slice() == PASTE_START {
-                        self.state = State::Paste(Vec::new());
+                        bytes.clear();
+                        self.state = State::Paste(bytes);
                     } else {
-                        events.push(parse_csi(bytes));
+                        events.push(parse_csi(&bytes, self.kitty_keyboard_mode));
+                        self.recycle_sequence(bytes);
                     }
                 } else if !(0x20..=0x3F).contains(&byte) {
                     events.push(Event::UnknownSequence(bytes));
@@ -128,7 +144,8 @@ impl Decoder {
             State::Ss3(mut bytes) => {
                 bytes.push(byte);
                 if (0x40..=0x7E).contains(&byte) {
-                    events.push(parse_ss3(bytes));
+                    events.push(parse_ss3(&bytes));
+                    self.recycle_sequence(bytes);
                 } else if bytes.len() > MAX_SEQUENCE_BYTES || !(0x20..=0x3F).contains(&byte) {
                     events.push(Event::UnknownSequence(bytes));
                 } else {
@@ -142,12 +159,14 @@ impl Decoder {
                 if expected.is_none() || !valid_utf8_prefix(payload) {
                     events.push(Event::UnknownSequence(bytes));
                 } else if payload.len() == expected.unwrap_or_default() {
-                    match str::from_utf8(payload)
+                    if let Some(character) = str::from_utf8(payload)
                         .ok()
                         .and_then(|text| text.chars().next())
                     {
-                        Some(character) => events.push(alt_character_event(character)),
-                        None => events.push(Event::UnknownSequence(bytes)),
+                        events.push(alt_character_event(character));
+                        self.recycle_sequence(bytes);
+                    } else {
+                        events.push(Event::UnknownSequence(bytes));
                     }
                 } else {
                     self.state = State::AltUtf8(bytes);
@@ -182,6 +201,7 @@ impl Decoder {
                     } else {
                         events.push(Event::Paste(normalize_utf8(&bytes)));
                     }
+                    self.recycle_sequence(bytes);
                 } else if bytes.len() > MAX_PASTE_BYTES + PASTE_END.len() - 1 {
                     let keep_from = bytes.len().saturating_sub(PASTE_END.len() - 1);
                     let tail = bytes.split_off(keep_from);
@@ -217,19 +237,27 @@ impl Decoder {
 
     fn process_escape(&mut self, byte: u8, events: &mut Vec<Event>) {
         match byte {
-            b'[' => self.state = State::Csi(vec![ESC, b'[']),
-            b'O' => self.state = State::Ss3(vec![ESC, b'O']),
+            b'[' => {
+                let bytes = self.start_sequence(b'[');
+                self.state = State::Csi(bytes);
+            }
+            b'O' => {
+                let bytes = self.start_sequence(b'O');
+                self.state = State::Ss3(bytes);
+            }
             b']' => {
+                let bytes = self.start_sequence(b']');
                 self.state = State::ControlString {
                     kind: ControlKind::Osc,
-                    bytes: vec![ESC, b']'],
+                    bytes,
                     saw_escape: false,
                 };
             }
             b'P' | b'^' | b'_' => {
+                let bytes = self.start_sequence(byte);
                 self.state = State::ControlString {
                     kind: ControlKind::Other,
-                    bytes: vec![ESC, byte],
+                    bytes,
                     saw_escape: false,
                 };
             }
@@ -243,9 +271,24 @@ impl Decoder {
             }
             0x20..=0x7E => events.push(alt_character_event(char::from(byte))),
             _ if utf8_expected(byte).is_some() => {
-                self.state = State::AltUtf8(vec![ESC, byte]);
+                let bytes = self.start_sequence(byte);
+                self.state = State::AltUtf8(bytes);
             }
             _ => events.push(Event::UnknownSequence(vec![ESC, byte])),
+        }
+    }
+
+    fn start_sequence(&mut self, second: u8) -> Vec<u8> {
+        let mut bytes = mem::take(&mut self.sequence_scratch);
+        bytes.clear();
+        bytes.extend_from_slice(&[ESC, second]);
+        bytes
+    }
+
+    fn recycle_sequence(&mut self, mut bytes: Vec<u8>) {
+        if bytes.capacity() <= MAX_SEQUENCE_BYTES {
+            bytes.clear();
+            self.sequence_scratch = bytes;
         }
     }
 
@@ -347,13 +390,26 @@ fn valid_utf8_prefix(bytes: &[u8]) -> bool {
     true
 }
 
-fn parse_csi(bytes: Vec<u8>) -> Event {
+fn parse_csi(bytes: &[u8], kitty_keyboard_mode: bool) -> Event {
     let final_byte = *bytes.last().unwrap_or(&0);
     let body = &bytes[2..bytes.len().saturating_sub(1)];
     if body.first() == Some(&b'<') && matches!(final_byte, b'M' | b'm') {
-        return parse_sgr_mouse(&bytes, &body[1..], final_byte)
+        return parse_sgr_mouse(bytes, &body[1..], final_byte)
             .map(Event::Mouse)
-            .unwrap_or(Event::UnknownSequence(bytes));
+            .unwrap_or_else(|| Event::UnknownSequence(bytes.to_vec()));
+    }
+
+    if final_byte == b'u' {
+        if keyboard_enhancement_response(body) {
+            return Event::TerminalResponse(bytes.to_vec());
+        }
+        return parse_kitty_key(body)
+            .map(Event::Key)
+            .unwrap_or_else(|| Event::UnknownSequence(bytes.to_vec()));
+    }
+
+    if let Some(key) = parse_kitty_legacy_function(body, final_byte, kitty_keyboard_mode) {
+        return Event::Key(key);
     }
 
     if body.is_empty() {
@@ -419,15 +475,15 @@ fn parse_csi(bytes: Vec<u8>) -> Event {
             .as_ref()
             .is_some_and(|params| params.len() == 2 && params.iter().all(|value| *value != 0))
     {
-        return Event::TerminalResponse(bytes);
+        return Event::TerminalResponse(bytes.to_vec());
     }
     if matches!(final_byte, b'c' | b'n' | b't') {
-        return Event::TerminalResponse(bytes);
+        return Event::TerminalResponse(bytes.to_vec());
     }
-    Event::UnknownSequence(bytes)
+    Event::UnknownSequence(bytes.to_vec())
 }
 
-fn parse_ss3(bytes: Vec<u8>) -> Event {
+fn parse_ss3(bytes: &[u8]) -> Event {
     let final_byte = *bytes.last().unwrap_or(&0);
     let code = match final_byte {
         b'A' => Some(KeyCode::Up),
@@ -443,7 +499,7 @@ fn parse_ss3(bytes: Vec<u8>) -> Event {
         _ => None,
     };
     code.map(|code| key_event(code, Modifiers::NONE))
-        .unwrap_or(Event::UnknownSequence(bytes))
+        .unwrap_or_else(|| Event::UnknownSequence(bytes.to_vec()))
 }
 
 fn parse_params(body: &[u8]) -> Option<Vec<u32>> {
@@ -480,7 +536,164 @@ fn xterm_modifiers(value: u32) -> Option<Modifiers> {
         alt: bits & 2 != 0,
         control: bits & 4 != 0,
         meta: bits & 8 != 0,
+        ..Modifiers::NONE
     })
+}
+
+fn keyboard_enhancement_response(body: &[u8]) -> bool {
+    body.strip_prefix(b"?")
+        .is_some_and(|flags| !flags.is_empty() && flags.iter().all(u8::is_ascii_digit))
+}
+
+fn parse_kitty_key(body: &[u8]) -> Option<KeyEvent> {
+    let text = str::from_utf8(body).ok()?;
+    let mut fields = text.split(';');
+    let code_field = fields.next()?;
+    let modifier_field = fields.next();
+    let text_field = fields.next();
+    if fields.next().is_some() {
+        return None;
+    }
+
+    let mut code_fields = code_field.split(':');
+    let number = parse_required_decimal(code_fields.next()?)?;
+    if code_fields.next().is_some() {
+        return None;
+    }
+    let (modifiers, action) = parse_kitty_modifiers(modifier_field.unwrap_or(""))?;
+    let associated_text = match text_field {
+        Some(field) => Some(parse_kitty_text(field)?),
+        None => None,
+    };
+    if number == 0
+        && associated_text
+            .as_deref()
+            .is_none_or(|text| text.is_empty())
+    {
+        return None;
+    }
+    Some(KeyEvent {
+        code: kitty_key_code(number)?,
+        modifiers,
+        action,
+        text: associated_text,
+        protocol: KeyProtocol::Kitty,
+    })
+}
+
+fn parse_kitty_legacy_function(
+    body: &[u8],
+    final_byte: u8,
+    kitty_keyboard_mode: bool,
+) -> Option<KeyEvent> {
+    if !matches!(
+        final_byte,
+        b'A' | b'B' | b'C' | b'D' | b'F' | b'H' | b'P' | b'Q' | b'S' | b'~'
+    ) {
+        return None;
+    }
+    let text = str::from_utf8(body).ok()?;
+    let mut fields = text.split(';');
+    let number = parse_required_decimal(fields.next()?)?;
+    let modifier_field = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let modifier_number = modifier_field.split(':').next()?.parse::<u32>().ok()?;
+    if !kitty_keyboard_mode && !modifier_field.contains(':') && modifier_number <= 16 {
+        return None;
+    }
+    let (modifiers, action) = parse_kitty_modifiers(modifier_field)?;
+    let code = if final_byte == b'~' {
+        tilde_key(number)?
+    } else {
+        if number != 1 {
+            return None;
+        }
+        match final_byte {
+            b'A' => KeyCode::Up,
+            b'B' => KeyCode::Down,
+            b'C' => KeyCode::Right,
+            b'D' => KeyCode::Left,
+            b'F' => KeyCode::End,
+            b'H' => KeyCode::Home,
+            b'P' => KeyCode::Function(1),
+            b'Q' => KeyCode::Function(2),
+            b'S' => KeyCode::Function(4),
+            _ => return None,
+        }
+    };
+    Some(KeyEvent {
+        code,
+        modifiers,
+        action,
+        text: None,
+        protocol: KeyProtocol::Kitty,
+    })
+}
+
+fn parse_kitty_modifiers(field: &str) -> Option<(Modifiers, KeyAction)> {
+    let mut parts = field.split(':');
+    let modifier = match parts.next()? {
+        "" => 1,
+        value => parse_required_decimal(value)?,
+    };
+    let action = match parts.next() {
+        None | Some("") | Some("1") => KeyAction::Press,
+        Some("2") => KeyAction::Repeat,
+        Some("3") => KeyAction::Release,
+        Some(_) => return None,
+    };
+    if parts.next().is_some() || !(1..=256).contains(&modifier) {
+        return None;
+    }
+    let bits = modifier - 1;
+    Some((
+        Modifiers {
+            shift: bits & 1 != 0,
+            alt: bits & 2 != 0,
+            control: bits & 4 != 0,
+            super_key: bits & 8 != 0,
+            hyper: bits & 16 != 0,
+            meta: bits & 32 != 0,
+            caps_lock: bits & 64 != 0,
+            num_lock: bits & 128 != 0,
+        },
+        action,
+    ))
+}
+
+fn parse_kitty_text(field: &str) -> Option<String> {
+    if field.is_empty() {
+        return Some(String::new());
+    }
+    let mut output = String::new();
+    for value in field.split(':') {
+        let number = parse_required_decimal(value)?;
+        if matches!(number, 0x00..=0x1F | 0x7F..=0x9F) {
+            return None;
+        }
+        output.push(char::from_u32(number)?);
+    }
+    Some(output)
+}
+
+fn parse_required_decimal(value: &str) -> Option<u32> {
+    (!value.is_empty()).then(|| value.parse().ok()).flatten()
+}
+
+fn kitty_key_code(number: u32) -> Option<KeyCode> {
+    match number {
+        0 => Some(KeyCode::Unknown),
+        9 => Some(KeyCode::Tab),
+        13 => Some(KeyCode::Enter),
+        27 => Some(KeyCode::Escape),
+        127 => Some(KeyCode::Backspace),
+        57_376..=57_398 => Some(KeyCode::Function((number - 57_363) as u8)),
+        57_344..=63_743 => Some(KeyCode::Functional(number)),
+        0x00..=0x1F | 0x7F..=0x9F => None,
+        _ => char::from_u32(number).map(KeyCode::Character),
+    }
 }
 
 fn tilde_key(code: u32) -> Option<KeyCode> {
@@ -518,6 +731,7 @@ fn parse_sgr_mouse(raw: &[u8], body: &[u8], final_byte: u8) -> Option<MouseEvent
         alt: encoded & 8 != 0,
         control: encoded & 16 != 0,
         meta: false,
+        ..Modifiers::NONE
     };
     let base = encoded & 3;
     let motion = encoded & 32 != 0;
@@ -649,7 +863,7 @@ fn normalize_utf8(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decoder, Event, MAX_PASTE_BYTES, PASTE_END, PASTE_START};
+    use super::{Decoder, Event, MAX_PASTE_BYTES, MAX_SEQUENCE_BYTES, PASTE_END, PASTE_START};
 
     #[test]
     fn text_event_boundaries_do_not_follow_chunks() {
@@ -677,6 +891,21 @@ mod tests {
     }
 
     #[test]
+    fn recognized_csi_reuses_bounded_sequence_storage() {
+        let input = b"\x1B[97;2:1;65u";
+        let mut decoder = Decoder::new();
+        assert_eq!(decoder.feed(input).len(), 1);
+        let pointer = decoder.sequence_scratch.as_ptr();
+        let capacity = decoder.sequence_scratch.capacity();
+        assert!(capacity >= input.len());
+
+        assert_eq!(decoder.feed(input).len(), 1);
+        assert_eq!(decoder.sequence_scratch.as_ptr(), pointer);
+        assert_eq!(decoder.sequence_scratch.capacity(), capacity);
+        assert!(capacity <= MAX_SEQUENCE_BYTES);
+    }
+
+    #[test]
     fn oversized_paste_is_bounded_and_recovers_at_terminator() {
         let mut input = PASTE_START.to_vec();
         input.resize(PASTE_START.len() + MAX_PASTE_BYTES + 1, b'x');
@@ -687,6 +916,7 @@ mod tests {
 
         assert_eq!(events, [Event::UnknownSequence(PASTE_START.to_vec())]);
         assert!(!decoder.has_pending());
+        assert!(decoder.sequence_scratch.capacity() <= MAX_SEQUENCE_BYTES);
     }
 
     #[test]

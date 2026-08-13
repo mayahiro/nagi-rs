@@ -8,5 +8,10 @@ license.workspace = true
 readme.workspace = true
 repository.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "allow"
+
+[[bench]]
+name = "input"
+harness = false

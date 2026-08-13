@@ -9,6 +9,14 @@ pub struct Modifiers {
     pub control: bool,
     /// Meta modifier when distinguished from Alt
     pub meta: bool,
+    /// Super modifier, commonly the Windows, Linux, or Command key
+    pub super_key: bool,
+    /// Hyper modifier
+    pub hyper: bool,
+    /// Caps Lock state reported by an extended keyboard protocol
+    pub caps_lock: bool,
+    /// Num Lock state reported by an extended keyboard protocol
+    pub num_lock: bool,
 }
 
 impl Modifiers {
@@ -18,7 +26,19 @@ impl Modifiers {
         alt: false,
         control: false,
         meta: false,
+        super_key: false,
+        hyper: false,
+        caps_lock: false,
+        num_lock: false,
     };
+
+    /// Returns the shortcut modifier state without lock-key state
+    #[must_use]
+    pub const fn without_locks(mut self) -> Self {
+        self.caps_lock = false;
+        self.num_lock = false;
+        self
+    }
 }
 
 /// A normalized logical key
@@ -56,6 +76,8 @@ pub enum KeyCode {
     PageDown,
     /// A numbered function key
     Function(u8),
+    /// A protocol-defined functional key without a common logical mapping
+    Functional(u32),
     /// A control key without a more precise logical identity
     Unknown,
 }
@@ -79,6 +101,8 @@ pub enum KeyAction {
 pub enum KeyProtocol {
     /// Traditional C0, CSI, or SS3 terminal input
     Legacy,
+    /// Kitty keyboard protocol CSI input
+    Kitty,
     /// The protocol was not identifiable
     #[default]
     Unknown,

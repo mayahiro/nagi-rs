@@ -90,6 +90,13 @@ placement. Pass `ViewContext::width_profile` to width-sensitive widget builders.
 Unexpected asynchronous lifecycle transitions are available through the
 bounded Runtime notice queue or the terminal notice-handler entry point
 
+`TerminalOptions::capability_detection` explicitly enables conservative
+environment hints and an active Kitty keyboard query. The immutable result is
+available as `ViewContext::terminal_capabilities`. Detection is disabled by
+default, bounds configured color output without promoting it, and never
+grants OSC 52 or another output policy. VT `Capabilities::color_level` selects
+Monochrome, ANSI 16, Indexed 256, or True Color output
+
 `Effect::suspend_terminal` runs an application-owned blocking task after the
 standard runner restores the ordinary terminal and leaves its configured
 viewport. Returning from the task resumes a full-screen viewport or reserves a
@@ -109,6 +116,7 @@ Run commands from the Rust repository root
 | [Source-neutral content](crates/nagi-content/examples/content/README.md) | `cargo run -p nagi-content --example content` |
 | [Presentation Rules and Content projection](crates/nagi-tui/examples/presentation/README.md) | `cargo run -p nagi-tui --example presentation` |
 | [Counter](crates/nagi-tui/examples/counter/README.md) | `cargo run -p nagi-tui --example counter` |
+| [Terminal capabilities](crates/nagi-tui/examples/terminal_capabilities/README.md) | `cargo run -p nagi-tui --example terminal_capabilities` |
 | [Command palette](crates/nagi-tui/examples/command_palette/README.md) | `cargo run -p nagi-tui --example command_palette` |
 | [Async search](crates/nagi-tui/examples/async_search/README.md) | `cargo run -p nagi-tui --example async_search` |
 | [Suggestion popup](crates/nagi-tui-widgets/examples/suggestion_popup/README.md) | `cargo run -p nagi-tui-widgets --example suggestion_popup` |

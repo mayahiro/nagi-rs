@@ -5,11 +5,13 @@ use std::time::Duration;
 
 use nagi_text::WidthProfile;
 
+use crate::terminal_capability::process_environment_profile;
 use crate::terminal_unix::{TerminalError, TerminalSession};
 use crate::{
     App, Capabilities, Event, EventAction, MouseTracking, QueueFull, Runtime, RuntimeConfig,
-    RuntimeError, RuntimeEventError, RuntimeNotice, Size, SystemClock, TerminalOp,
-    TimedInputDecoder,
+    RuntimeError, RuntimeEventError, RuntimeNotice, Size, SystemClock, TerminalCapabilityDetection,
+    TerminalCapabilityProfile, TerminalColorLevel, TerminalFeatureSupport,
+    TerminalKeyboardProtocol, TerminalOp, TimedInputDecoder,
 };
 
 /// Error returned when an inline terminal viewport has no rows
@@ -87,6 +89,12 @@ pub enum TerminalClipboard {
 pub struct TerminalOptions {
     /// Optional output capabilities used by the VT encoder
     pub capabilities: Capabilities,
+    /// Capability detection policy, disabled by default
+    pub capability_detection: TerminalCapabilityDetection,
+    /// Maximum wait for active terminal capability queries
+    ///
+    /// Zero performs an immediate query check.
+    pub capability_query_timeout: Duration,
     /// SGR mouse tracking policy, or `None` to preserve terminal text selection
     pub mouse_tracking: Option<MouseTracking>,
     /// Clipboard output policy, disabled by default
@@ -124,6 +132,8 @@ impl Default for TerminalOptions {
     fn default() -> Self {
         Self {
             capabilities: Capabilities::BASELINE,
+            capability_detection: TerminalCapabilityDetection::Disabled,
+            capability_query_timeout: Duration::from_millis(100),
             mouse_tracking: None,
             clipboard: TerminalClipboard::Disabled,
             viewport: TerminalViewport::FULLSCREEN,
@@ -263,6 +273,8 @@ where
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
     Handler: FnMut(&RuntimeNotice),
 {
+    let terminal_capabilities = detect_terminal_capabilities(session, options)?;
+    let output_capabilities = resolved_output_capabilities(options, terminal_capabilities);
     let (columns, rows) = session.viewport_size().map_err(run_terminal_error)?;
     let clock = SystemClock::new();
     let mut config = RuntimeConfig::new(Size::new(u32::from(columns), u32::from(rows)));
@@ -272,8 +284,12 @@ where
     config.runtime_notice_capacity = options.runtime_notice_capacity;
     config.minimum_frame_interval = options.minimum_frame_interval;
     config.width_profile = options.width_profile;
+    config.terminal_capabilities = terminal_capabilities;
     let mut runtime = Runtime::with_clock_and_wake(app, config, clock, session.wake_handle())?;
     let mut decoder = TimedInputDecoder::new(clock, options.escape_timeout);
+    decoder.set_kitty_keyboard_mode(
+        terminal_capabilities.keyboard_protocol() == TerminalKeyboardProtocol::Kitty,
+    );
     let mut input = [0_u8; 8_192];
 
     if session.take_resize() {
@@ -291,7 +307,7 @@ where
     write_pending_output(
         session,
         &mut runtime,
-        options.capabilities,
+        output_capabilities,
         options.clipboard,
     )?;
 
@@ -347,7 +363,7 @@ where
         write_pending_output(
             session,
             &mut runtime,
-            options.capabilities,
+            output_capabilities,
             options.clipboard,
         )?;
         if exit || runtime.exit_requested() {
@@ -355,6 +371,45 @@ where
         }
     }
     Ok(runtime.into_app())
+}
+
+fn detect_terminal_capabilities(
+    session: &mut TerminalSession,
+    options: TerminalOptions,
+) -> Result<TerminalCapabilityProfile, RunError> {
+    if options.capability_detection == TerminalCapabilityDetection::Disabled {
+        return Ok(TerminalCapabilityProfile::UNKNOWN);
+    }
+    let profile = process_environment_profile();
+    let keyboard = session
+        .enable_extended_keyboard(options.capability_query_timeout)
+        .map_err(run_terminal_error)?;
+    Ok(profile.with_extended_keyboard(
+        keyboard,
+        if keyboard == TerminalFeatureSupport::Supported {
+            TerminalKeyboardProtocol::Kitty
+        } else {
+            TerminalKeyboardProtocol::Legacy
+        },
+    ))
+}
+
+fn resolved_output_capabilities(
+    options: TerminalOptions,
+    profile: TerminalCapabilityProfile,
+) -> Capabilities {
+    let mut capabilities = options.capabilities;
+    if options.capability_detection == TerminalCapabilityDetection::Enabled {
+        let detected = match profile.color_level() {
+            TerminalColorLevel::Unknown => nagi_vt::ColorLevel::Indexed256,
+            TerminalColorLevel::Monochrome => nagi_vt::ColorLevel::Monochrome,
+            TerminalColorLevel::Ansi16 => nagi_vt::ColorLevel::Ansi16,
+            TerminalColorLevel::Indexed256 => nagi_vt::ColorLevel::Indexed256,
+            TerminalColorLevel::TrueColor => nagi_vt::ColorLevel::TrueColor,
+        };
+        capabilities.color_level = capabilities.color_level.min(detected);
+    }
+    capabilities
 }
 
 fn run_pending_terminal_tasks<Application, Handler>(
@@ -451,7 +506,7 @@ mod tests {
 
     use super::{
         TerminalClipboard, TerminalOptions, TerminalViewport, nearest_terminal_deadline,
-        take_clipboard_operation,
+        resolved_output_capabilities, take_clipboard_operation,
     };
 
     struct ClipboardApp;
@@ -473,12 +528,59 @@ mod tests {
         let options = TerminalOptions::default();
         assert_eq!(options.mouse_tracking, None);
         assert_eq!(options.clipboard, TerminalClipboard::Disabled);
+        assert_eq!(
+            options.capability_detection,
+            crate::TerminalCapabilityDetection::Disabled
+        );
+        assert_eq!(options.capability_query_timeout, Duration::from_millis(100));
         assert_eq!(options.viewport, TerminalViewport::FULLSCREEN);
         assert_eq!(options.cursor_query_timeout, Duration::from_millis(100));
         assert!(!options.focus_first);
         assert_eq!(
             options.minimum_frame_interval,
             std::time::Duration::from_nanos(8_333_334)
+        );
+    }
+
+    #[test]
+    fn detected_color_level_bounds_explicit_encoder_level() {
+        let mut options = TerminalOptions {
+            capabilities: crate::Capabilities::MODERN,
+            capability_detection: crate::TerminalCapabilityDetection::Enabled,
+            ..TerminalOptions::default()
+        };
+        let indexed = crate::TerminalCapabilityProfile::UNKNOWN
+            .with_color_level(crate::TerminalColorLevel::Indexed256);
+        assert_eq!(
+            resolved_output_capabilities(options, indexed).color_level,
+            crate::ColorLevel::Indexed256
+        );
+
+        let ansi = crate::TerminalCapabilityProfile::UNKNOWN
+            .with_color_level(crate::TerminalColorLevel::Ansi16);
+        assert_eq!(
+            resolved_output_capabilities(options, ansi).color_level,
+            crate::ColorLevel::Ansi16
+        );
+
+        let monochrome = crate::TerminalCapabilityProfile::UNKNOWN
+            .with_color_level(crate::TerminalColorLevel::Monochrome);
+        assert_eq!(
+            resolved_output_capabilities(options, monochrome).color_level,
+            crate::ColorLevel::Monochrome
+        );
+
+        let true_color = crate::TerminalCapabilityProfile::UNKNOWN
+            .with_color_level(crate::TerminalColorLevel::TrueColor);
+        assert_eq!(
+            resolved_output_capabilities(options, true_color).color_level,
+            crate::ColorLevel::TrueColor
+        );
+
+        options.capabilities = crate::Capabilities::BASELINE;
+        assert_eq!(
+            resolved_output_capabilities(options, true_color).color_level,
+            crate::ColorLevel::Indexed256
         );
     }
 
