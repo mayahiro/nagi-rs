@@ -55,6 +55,7 @@ The complete source and behavior are documented with the examples below
 | `nagi-tui-test` | Virtual input, resize, time, effects, subscriptions, and frame inspection |
 | `nagi-cli` | Local and inherited options, generic Hidden, Deprecated, and Sensitive metadata, command-local typed Invocation scopes, structured Help with controllable Usage Variants, targeted Diagnostics with stable JSON rendering, handler-free completion resolution, staged Runtime Policy, and process integration |
 | `nagi-cli-completion` | Bash, Zsh, Fish, and PowerShell generators plus the reserved completion protocol |
+| `nagi-cli-document` | Optional deterministic CommonMark and section 1 man Help renderers |
 | `nagi-cli-prompt` | Optional line-oriented Confirm, Select, Input, and Secret prompts with injected I/O |
 | `nagi-cli-status` | Optional synchronous TTY status, spinner, progress, and plain-log fallback with injected I/O |
 | `nagi-cli-test` | Process-free CLI input injection and output capture |
@@ -144,6 +145,7 @@ Run commands from the Rust repository root
 | [CLI command lifecycle](crates/nagi-cli/examples/lifecycle/README.md) | `cargo run -p nagi-cli --example lifecycle -- --legacy old` |
 | [CLI Sensitive Value](crates/nagi-cli/examples/sensitive_values/README.md) | `cargo run -p nagi-cli --example sensitive_values -- --token demo-token` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
+| [CLI derived Help documents](crates/nagi-cli-document/examples/documentation/README.md) | `cargo run -p nagi-cli-document --example documentation -- markdown` |
 | [CLI lightweight prompts](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
 | [CLI TTY-aware status](crates/nagi-cli-status/examples/status/README.md) | `cargo run -p nagi-cli-status --example status` |
 

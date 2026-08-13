@@ -15,6 +15,7 @@ bench:
 	cargo bench -p nagi-cli --bench inherited_options
 	cargo bench -p nagi-cli --bench completion
 	cargo bench -p nagi-cli --bench diagnostic_json
+	cargo bench -p nagi-cli-document --bench document
 	cargo bench -p nagi-cli-prompt --bench prompt
 	cargo bench -p nagi-cli-status --bench status
 

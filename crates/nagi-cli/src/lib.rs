@@ -17,6 +17,10 @@
 //! [`Diagnostic`] with application codes, option or argument targets, and
 //! remediation hints
 //!
+//! [`Command::visit_help_documents`] validates once and streams structured
+//! Help for every visible command. Deterministic Markdown and man rendering
+//! remains in the optional `nagi-cli-document` crate
+//!
 //! [`OptionSpec::sensitive`] and [`Argument::sensitive`] attach generic
 //! presentation metadata. Framework Help, parser Diagnostics, Debug output,
 //! and completion redact or suppress those values while explicit Invocation

@@ -53,6 +53,56 @@ fn parent_options_are_not_recognized_after_child_selection() {
 }
 
 #[test]
+fn help_documents_visit_visible_preorder_and_stop_early() {
+    let command = Command::new("root")
+        .subcommand(
+            Command::new("alpha")
+                .subcommand(Command::new("alpha-child"))
+                .subcommand(
+                    Command::new("alpha-hidden")
+                        .hidden()
+                        .subcommand(Command::new("hidden-descendant")),
+                ),
+        )
+        .subcommand(Command::new("beta"));
+
+    let mut paths = Vec::new();
+    command
+        .visit_help_documents(|document| {
+            paths.push(document.command_path().join("/"));
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        paths,
+        ["root", "root/alpha", "root/alpha/alpha-child", "root/beta"]
+    );
+
+    let mut stopped = Vec::new();
+    command
+        .visit_help_documents(|document| {
+            stopped.push(document.command_path().join("/"));
+            stopped.len() < 2
+        })
+        .unwrap();
+    assert_eq!(stopped, ["root", "root/alpha"]);
+
+    let direct = command
+        .help_document(&["root".to_owned(), "alpha".to_owned()])
+        .unwrap();
+    let mut visited = None;
+    command
+        .visit_help_documents(|document| {
+            if document.command_path() == ["root", "alpha"] {
+                visited = Some(document.clone());
+            }
+            true
+        })
+        .unwrap();
+    assert_eq!(visited.as_ref(), Some(&direct));
+}
+
+#[test]
 fn inherited_options_keep_declaration_scope_validation() {
     let required = Command::new("root")
         .id("root-id")

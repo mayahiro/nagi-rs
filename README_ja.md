@@ -53,6 +53,7 @@ cargo run -p nagi-cli --example basic -- Nagi
 | `nagi-tui-test` | Virtual input、resize、time、Effect、Subscription、frame検査 |
 | `nagi-cli` | Localと継承Option、汎用Hidden、Deprecated、Sensitive metadata、command-local typed Invocation scope、制御可能なUsage Variant付きstructured Help、stable JSON renderingを持つtarget付きDiagnostic、handlerを含まないcompletion解決、段階実行Runtime Policy、process統合 |
 | `nagi-cli-completion` | Bash、Zsh、Fish、PowerShell generatorと予約済みcompletion protocol |
+| `nagi-cli-document` | 任意の決定的なCommonMarkとsection 1 man Help renderer |
 | `nagi-cli-prompt` | 注入可能なI/Oを持つ任意の行指向Confirm、Select、Input、Secret |
 | `nagi-cli-status` | 注入可能なI/Oを持つ任意の同期TTY status、spinner、progress、plain-log fallback |
 | `nagi-cli-test` | ProcessなしのCLI input注入とoutput取得 |
@@ -120,6 +121,7 @@ Rust repository rootから実行します
 | [CLI Command lifecycle](crates/nagi-cli/examples/lifecycle/README.md) | `cargo run -p nagi-cli --example lifecycle -- --legacy old` |
 | [CLI Sensitive Value](crates/nagi-cli/examples/sensitive_values/README.md) | `cargo run -p nagi-cli --example sensitive_values -- --token demo-token` |
 | [CLI shell completion](crates/nagi-cli-completion/examples/completion/README.md) | `cargo run -p nagi-cli-completion --example completion -- generate bash` |
+| [CLI Help派生document](crates/nagi-cli-document/examples/documentation/README.md) | `cargo run -p nagi-cli-document --example documentation -- markdown` |
 | [CLI軽量prompt](crates/nagi-cli-prompt/examples/prompt/README.md) | `cargo run -p nagi-cli-prompt --example prompt` |
 | [CLI TTY-aware status](crates/nagi-cli-status/examples/status/README.md) | `cargo run -p nagi-cli-status --example status` |
 
