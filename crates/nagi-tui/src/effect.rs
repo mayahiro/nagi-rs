@@ -95,8 +95,37 @@ impl CancelToken {
     }
 }
 
-/// One standard-thread task producing an application message
+/// One Effect task producing an application message
+///
+/// Run Effects execute this task on a supervised standard thread. Terminal-
+/// suspending Effects execute it on the terminal driver thread
 pub type Task<Message> = Box<dyn FnOnce(CancelToken) -> Message + Send + 'static>;
+
+/// One application-requested semantic text write to a clipboard backend
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardRequest {
+    text: String,
+}
+
+impl ClipboardRequest {
+    /// Creates a request containing owned UTF-8 text
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+
+    /// Returns the semantic UTF-8 text to copy
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Consumes the request and returns its owned UTF-8 text
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+}
 
 /// Declarative follow-up work produced by application initialization or update
 pub struct Effect<Message> {
@@ -112,6 +141,8 @@ pub(crate) enum EffectKind<Message> {
         id: NodeId,
         offset: ScrollOffset,
     },
+    SetClipboard(ClipboardRequest),
+    SuspendTerminal(Task<Message>),
     Run(Task<Message>),
     Latest {
         key: TaskKey,
@@ -135,6 +166,7 @@ pub(crate) enum RuntimeCommand {
     Exit,
     Focus(NodeId),
     ScrollTo { id: NodeId, offset: ScrollOffset },
+    SetClipboard(ClipboardRequest),
 }
 
 impl<Message> Effect<Message> {
@@ -173,6 +205,33 @@ impl<Message> Effect<Message> {
                 id: id.into(),
                 offset,
             },
+            without_redraw: false,
+        }
+    }
+
+    /// Requests that a Runtime driver copy semantic UTF-8 text
+    ///
+    /// The standard terminal driver drops this request unless OSC 52 output is
+    /// explicitly enabled. Multiple requests before a driver take are
+    /// coalesced to the latest value.
+    #[must_use]
+    pub fn set_clipboard(text: impl Into<String>) -> Self {
+        Self {
+            kind: EffectKind::SetClipboard(ClipboardRequest::new(text)),
+            without_redraw: false,
+        }
+    }
+
+    /// Runs one blocking task on the terminal driver thread while the standard
+    /// full-screen terminal session is suspended
+    ///
+    /// The task receives cooperative cancellation state and produces one
+    /// application message. Process selection, command execution, and domain
+    /// error mapping remain application responsibilities
+    #[must_use]
+    pub fn suspend_terminal(task: impl FnOnce(CancelToken) -> Message + Send + 'static) -> Self {
+        Self {
+            kind: EffectKind::SuspendTerminal(Box::new(task)),
             without_redraw: false,
         }
     }
@@ -290,6 +349,8 @@ impl<Message> fmt::Debug for Effect<Message> {
             EffectKind::Exit => "Exit",
             EffectKind::Focus(_) => "Focus",
             EffectKind::ScrollTo { .. } => "ScrollTo",
+            EffectKind::SetClipboard(_) => "SetClipboard",
+            EffectKind::SuspendTerminal(_) => "SuspendTerminal",
             EffectKind::Run(_) => "Run",
             EffectKind::Latest { .. } => "Latest",
             EffectKind::Cancel(_) => "Cancel",

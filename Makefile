@@ -1,7 +1,25 @@
 .PHONY: bench build check format format-check lint test unicode
 
 bench:
+	cargo bench -p nagi-vt --bench input
 	cargo bench -p nagi-tui --bench scroll_viewport
+	cargo bench -p nagi-tui --bench content_projection
+	cargo bench -p nagi-tui --bench clipboard
+	cargo bench -p nagi-tui --bench pointer_selection
+	cargo bench -p nagi-tui --bench terminal_task
+	cargo bench -p nagi-tui-widgets --bench suggestion_popup
+	cargo bench -p nagi-tui-widgets --bench json_inspector
+	cargo bench -p nagi-tui-widgets --bench code_view
+	cargo bench -p nagi-tui-widgets --bench diff_view
+	cargo bench -p nagi-tui-widgets --bench split_pane_drawer
+	cargo bench -p nagi-cli --bench inherited_options
+	cargo bench -p nagi-cli --bench completion
+	cargo bench -p nagi-cli --bench diagnostic_json
+	cargo bench -p nagi-cli --bench value_resolution
+	cargo bench -p nagi-cli --bench response_file
+	cargo bench -p nagi-cli-document --bench document
+	cargo bench -p nagi-cli-prompt --bench prompt
+	cargo bench -p nagi-cli-status --bench status
 
 build:
 	cargo build --workspace --all-targets

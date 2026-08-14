@@ -21,6 +21,7 @@ pub struct TimedInputDecoder<C: Clock> {
     clock: C,
     escape_timeout: Duration,
     escape_deadline: Option<Timestamp>,
+    kitty_keyboard_mode: bool,
 }
 
 impl<C: Clock> TimedInputDecoder<C> {
@@ -32,7 +33,14 @@ impl<C: Clock> TimedInputDecoder<C> {
             clock,
             escape_timeout,
             escape_deadline: None,
+            kitty_keyboard_mode: false,
         }
+    }
+
+    /// Selects Kitty semantics for otherwise ambiguous function-key sequences
+    pub fn set_kitty_keyboard_mode(&mut self, enabled: bool) {
+        self.kitty_keyboard_mode = enabled;
+        self.decoder.set_kitty_keyboard_mode(enabled);
     }
 
     /// Consumes one arbitrary input byte chunk
@@ -58,6 +66,14 @@ impl<C: Clock> TimedInputDecoder<C> {
     pub fn flush(&mut self) -> Vec<Event> {
         self.escape_deadline = None;
         self.decoder.flush_pending()
+    }
+
+    /// Discards incomplete terminal input without emitting an Event
+    pub fn reset(&mut self) {
+        self.decoder = Decoder::new();
+        self.decoder
+            .set_kitty_keyboard_mode(self.kitty_keyboard_mode);
+        self.escape_deadline = None;
     }
 
     /// Reports whether incomplete input is buffered
@@ -88,7 +104,7 @@ impl<C: Clock> TimedInputDecoder<C> {
 
 #[cfg(test)]
 mod tests {
-    use nagi_vt::{Event, KeyCode};
+    use nagi_vt::{Event, KeyAction, KeyCode, KeyProtocol};
 
     use crate::VirtualClock;
 
@@ -108,6 +124,40 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [Event::Key(key)] if key.code == KeyCode::Escape
+        ));
+    }
+
+    #[test]
+    fn reset_discards_incomplete_input() {
+        let clock = VirtualClock::new();
+        let mut decoder = TimedInputDecoder::new(clock.clone(), Duration::from_millis(25));
+        assert!(decoder.feed(b"\x1B").is_empty());
+
+        decoder.reset();
+        clock.advance(Duration::from_millis(25));
+
+        assert!(decoder.poll().is_empty());
+        assert!(!decoder.has_pending());
+    }
+
+    #[test]
+    fn reset_preserves_configured_kitty_modifier_semantics() {
+        let clock = VirtualClock::new();
+        let mut decoder = TimedInputDecoder::new(clock, Duration::from_millis(25));
+        decoder.set_kitty_keyboard_mode(true);
+        assert!(decoder.feed(b"\x1B").is_empty());
+
+        decoder.reset();
+        let events = decoder.feed(b"\x1B[1;9A");
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Key(key)]
+                if key.code == KeyCode::Up
+                    && key.modifiers.super_key
+                    && !key.modifiers.meta
+                    && key.action == KeyAction::Press
+                    && key.protocol == KeyProtocol::Kitty
         ));
     }
 }

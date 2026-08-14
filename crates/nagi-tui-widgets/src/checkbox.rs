@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use nagi_tui::{EventResult, Node, NodeId, Style};
+use nagi_tui::{Action, ActionAvailability, ActionDescriptor, EventResult, Node, NodeId, Style};
 
-use crate::event::is_activation_event;
+use crate::activate_action_descriptor;
+use crate::event::is_pointer_activation_event;
 
 /// Visual styles used by a [`Checkbox`]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,7 +32,10 @@ impl Default for CheckboxStyle {
     }
 }
 
-/// A controlled Boolean input that emits its requested next value
+/// A controlled Boolean input that emits its requested opposite value
+///
+/// Keyboard activation declares [`crate::ACTIVATE_ACTION_ID`]. Left-button
+/// press remains a raw pointer event so keyboard rebinding does not remove it
 pub struct Checkbox<Message> {
     id: NodeId,
     label: String,
@@ -74,25 +78,48 @@ impl<Message: 'static> Checkbox<Message> {
         self
     }
 
+    /// Returns the semantic activation descriptor declared by this checkbox
+    #[must_use]
+    pub fn action_descriptor(&self) -> ActionDescriptor {
+        activate_action_descriptor().with_availability(if self.enabled {
+            ActionAvailability::Enabled
+        } else {
+            ActionAvailability::DisabledPassThrough
+        })
+    }
+
     /// Builds the public semantic node for this checkbox
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
         let marker = if self.checked { 'x' } else { ' ' };
         let content = format!("[{marker}] {}", self.label);
+        let descriptor = self.action_descriptor();
         if !self.enabled {
-            return Node::styled_text(content, self.style.disabled).with_id(self.id);
+            let id = self.id;
+            return Node::styled_text(content, self.style.disabled)
+                .with_id(id.clone())
+                .on_actions(id, [Action::new(descriptor, |_| EventResult::ignored())]);
         }
 
         let id = self.id;
-        let focus_id = id.clone();
+        let action_focus_id = id.clone();
+        let pointer_focus_id = id.clone();
         let checked = self.checked;
         let on_change = self.on_change;
+        let on_pointer_change = Arc::clone(&on_change);
         Node::styled_text(content, self.style.normal)
             .focusable(id.clone())
             .with_focused_style(self.style.focused)
+            .on_actions(
+                id.clone(),
+                [Action::new(descriptor, move |_| {
+                    EventResult::message(on_change(!checked)).focus(action_focus_id.clone())
+                })],
+            )
             .on_event(id, move |event| {
-                if is_activation_event(event) {
-                    EventResult::message(on_change(!checked)).focus(focus_id.clone())
+                if is_pointer_activation_event(event) {
+                    EventResult::message(on_pointer_change(!checked))
+                        .focus(pointer_focus_id.clone())
                 } else {
                     EventResult::ignored()
                 }

@@ -12,13 +12,20 @@ fn application() -> Command {
     Command::new("service")
         .id("service-root")
         .about("Manage a service")
-        .version("0.2.7")
+        .version("0.4.0")
         .option(
             OptionSpec::value("profile")
                 .long("profile")
                 .parser(string_parser())
                 .default_value("default")
                 .help("Root configuration profile"),
+        )
+        .option(
+            OptionSpec::count("verbose")
+                .long("verbose")
+                .short('v')
+                .help("Increase verbosity")
+                .inherited(),
         )
         .require_subcommand()
         .subcommand_usage(SubcommandUsageMode::Expanded)
@@ -33,12 +40,6 @@ fn application() -> Command {
                         .parser(string_parser())
                         .default_value("service")
                         .help("Service profile"),
-                )
-                .option(
-                    OptionSpec::count("verbose")
-                        .long("verbose")
-                        .short('v')
-                        .help("Increase verbosity"),
                 )
                 .validator(|invocation: &Invocation| {
                     let profile =

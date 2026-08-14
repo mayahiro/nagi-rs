@@ -1,8 +1,98 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use nagi_tui::{Event, EventResult, KeyAction, KeyCode, Length, Node, NodeId, Style};
+use nagi_tui::{
+    Action, ActionAvailability, ActionDescriptor, Event, EventResult, KeyCode, Length, Node,
+    NodeId, Style,
+};
 
-use crate::event::is_activation_event;
+use crate::action::{
+    ACTIVATE_ACTION_ID, ACTIVATE_ACTION_LABEL, NAVIGATION_BACK_ACTION_ID,
+    NAVIGATION_BACK_ACTION_LABEL, SELECTION_FIRST_ACTION_ID, SELECTION_FIRST_ACTION_LABEL,
+    SELECTION_LAST_ACTION_ID, SELECTION_LAST_ACTION_LABEL, SELECTION_NEXT_ACTION_ID,
+    SELECTION_NEXT_ACTION_LABEL, SELECTION_NEXT_PAGE_ACTION_ID, SELECTION_NEXT_PAGE_ACTION_LABEL,
+    SELECTION_PREVIOUS_ACTION_ID, SELECTION_PREVIOUS_ACTION_LABEL,
+    SELECTION_PREVIOUS_PAGE_ACTION_ID, SELECTION_PREVIOUS_PAGE_ACTION_LABEL,
+    repeatable_action_binding,
+};
+use crate::event::is_pointer_activation_event;
+
+const FILE_PICKER_ACTION_COUNT: usize = 8;
+
+static FILE_PICKER_ACTION_DESCRIPTORS: LazyLock<[ActionDescriptor; FILE_PICKER_ACTION_COUNT]> =
+    LazyLock::new(|| {
+        [
+            ActionDescriptor::new(
+                ACTIVATE_ACTION_ID,
+                ACTIVATE_ACTION_LABEL,
+                [
+                    repeatable_action_binding(KeyCode::Enter),
+                    repeatable_action_binding(KeyCode::Character(' ')),
+                    repeatable_action_binding(KeyCode::Right),
+                ],
+            ),
+            ActionDescriptor::new(
+                SELECTION_PREVIOUS_ACTION_ID,
+                SELECTION_PREVIOUS_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Up)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_NEXT_ACTION_ID,
+                SELECTION_NEXT_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Down)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_FIRST_ACTION_ID,
+                SELECTION_FIRST_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::Home)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_LAST_ACTION_ID,
+                SELECTION_LAST_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::End)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_PREVIOUS_PAGE_ACTION_ID,
+                SELECTION_PREVIOUS_PAGE_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::PageUp)],
+            ),
+            ActionDescriptor::new(
+                SELECTION_NEXT_PAGE_ACTION_ID,
+                SELECTION_NEXT_PAGE_ACTION_LABEL,
+                [repeatable_action_binding(KeyCode::PageDown)],
+            ),
+            ActionDescriptor::new(
+                NAVIGATION_BACK_ACTION_ID,
+                NAVIGATION_BACK_ACTION_LABEL,
+                [
+                    repeatable_action_binding(KeyCode::Left),
+                    repeatable_action_binding(KeyCode::Backspace),
+                ],
+            ),
+        ]
+    });
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilePickerAction {
+    Activate,
+    Previous,
+    Next,
+    First,
+    Last,
+    PreviousPage,
+    NextPage,
+    Back,
+}
+
+const FILE_PICKER_ACTIONS: [FilePickerAction; FILE_PICKER_ACTION_COUNT] = [
+    FilePickerAction::Activate,
+    FilePickerAction::Previous,
+    FilePickerAction::Next,
+    FilePickerAction::First,
+    FilePickerAction::Last,
+    FilePickerAction::PreviousPage,
+    FilePickerAction::NextPage,
+    FilePickerAction::Back,
+];
 
 /// Application-supplied inert filesystem metadata
 ///
@@ -180,7 +270,9 @@ impl<Message: 'static> FilePicker<Message> {
         self
     }
 
-    /// Sets the handler used by Left and Backspace
+    /// Sets the navigation-back handler
+    ///
+    /// Unmodified Left and Backspace are the ordered default bindings.
     #[must_use]
     pub fn on_back(mut self, handler: impl Fn() -> Message + 'static) -> Self {
         self.on_back = Some(Arc::new(handler));
@@ -222,12 +314,29 @@ impl<Message: 'static> FilePicker<Message> {
         self
     }
 
+    /// Returns the ordered semantic actions declared by the root
+    ///
+    /// Activation and navigation back are disabled-pass-through when their
+    /// corresponding callbacks are absent.
+    #[must_use]
+    pub fn action_descriptors(&self) -> [ActionDescriptor; 8] {
+        file_picker_action_descriptors(
+            self.enabled && has_visible_entries(&self.entries, self.show_hidden),
+            self.on_open.is_some(),
+            self.on_back.is_some(),
+        )
+    }
+
     /// Builds the public semantic node for this file picker
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
+        let descriptors = self.action_descriptors();
         let visible_indices = visible_indices(&self.entries, self.show_hidden);
         let Some(selected_position) = normalized_selection(&visible_indices, self.selected) else {
-            return Node::styled_text(self.placeholder, self.style.placeholder).with_id(self.id);
+            let id = self.id;
+            return Node::styled_text(self.placeholder, self.style.placeholder)
+                .with_id(id.clone())
+                .on_actions(id, disabled_file_picker_actions(descriptors));
         };
         let (start, end) = if self.viewport_height > 0 {
             viewport_range(
@@ -239,6 +348,7 @@ impl<Message: 'static> FilePicker<Message> {
             (0, visible_indices.len())
         };
         let visible = Arc::new(visible_indices);
+        let mut descriptors = Some(descriptors);
         let mut children = Vec::with_capacity(end.saturating_sub(start));
         for position in start..end {
             let original_index = visible[position];
@@ -264,25 +374,32 @@ impl<Message: 'static> FilePicker<Message> {
                 continue;
             }
             if is_selected {
-                let visible = Arc::clone(&visible);
-                let on_select = Arc::clone(&self.on_select);
+                let id = self.id.clone();
+                let actions = file_picker_actions(
+                    descriptors
+                        .take()
+                        .expect("selected entry owns FilePicker actions"),
+                    Arc::clone(&visible),
+                    selected_position,
+                    self.viewport_height,
+                    id.clone(),
+                    Arc::clone(&self.on_select),
+                    self.on_open.as_ref().map(Arc::clone),
+                    self.on_back.as_ref().map(Arc::clone),
+                );
+                let focus_id = id.clone();
                 let on_open = self.on_open.as_ref().map(Arc::clone);
-                let on_back = self.on_back.as_ref().map(Arc::clone);
-                let focus_id = self.id.clone();
                 children.push(
                     Node::column([row.with_id(entry.id.clone())])
-                        .focusable(self.id.clone())
+                        .focusable(id.clone())
                         .with_focused_style(self.style.focused)
-                        .on_event(self.id.clone(), move |event| {
-                            selected_event_result(
+                        .on_actions(id.clone(), actions)
+                        .on_event(id, move |event| {
+                            selected_pointer_result(
                                 event,
-                                &visible,
-                                selected_position,
-                                self.viewport_height,
+                                original_index,
                                 &focus_id,
-                                &on_select,
                                 on_open.as_ref(),
-                                on_back.as_ref(),
                             )
                         }),
                 );
@@ -293,7 +410,7 @@ impl<Message: 'static> FilePicker<Message> {
             let on_select = Arc::clone(&self.on_select);
             let on_open = self.on_open.as_ref().map(Arc::clone);
             children.push(row.with_id(id.clone()).on_event(id, move |event| {
-                if !is_activation_event(event) {
+                if !is_pointer_activation_event(event) {
                     return EventResult::ignored();
                 }
                 let mut result = EventResult::consumed()
@@ -314,99 +431,169 @@ impl<Message: 'static> FilePicker<Message> {
         if self.enabled {
             root
         } else {
-            root.with_id(self.id)
+            let id = self.id;
+            root.with_id(id.clone()).on_actions(
+                id,
+                disabled_file_picker_actions(
+                    descriptors.expect("disabled FilePicker retains action descriptors"),
+                ),
+            )
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn selected_event_result<Message>(
-    event: &Event,
+fn file_picker_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; FILE_PICKER_ACTION_COUNT],
+    visible: Arc<Vec<usize>>,
+    selected: usize,
+    viewport_height: usize,
+    focus_id: NodeId,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+    on_open: Option<Arc<dyn Fn(usize) -> Message>>,
+    on_back: Option<Arc<dyn Fn() -> Message>>,
+) -> [Action<Message>; FILE_PICKER_ACTION_COUNT] {
+    std::array::from_fn(|index| {
+        let action = FILE_PICKER_ACTIONS[index];
+        let visible = Arc::clone(&visible);
+        let focus_id = focus_id.clone();
+        let on_select = Arc::clone(&on_select);
+        let on_open = on_open.as_ref().map(Arc::clone);
+        let on_back = on_back.as_ref().map(Arc::clone);
+        Action::new(descriptors[index].clone(), move |_| {
+            file_picker_action_result(
+                action,
+                &visible,
+                selected,
+                viewport_height,
+                &focus_id,
+                on_select.as_ref(),
+                on_open.as_deref(),
+                on_back.as_deref(),
+            )
+        })
+    })
+}
+
+fn disabled_file_picker_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; FILE_PICKER_ACTION_COUNT],
+) -> [Action<Message>; FILE_PICKER_ACTION_COUNT] {
+    descriptors.map(|descriptor| Action::new(descriptor, |_| EventResult::ignored()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn file_picker_action_result<Message>(
+    action: FilePickerAction,
     visible: &[usize],
     selected: usize,
     viewport_height: usize,
     focus_id: &NodeId,
-    on_select: &Arc<dyn Fn(usize) -> Message>,
-    on_open: Option<&Arc<dyn Fn(usize) -> Message>>,
-    on_back: Option<&Arc<dyn Fn() -> Message>>,
+    on_select: &dyn Fn(usize) -> Message,
+    on_open: Option<&dyn Fn(usize) -> Message>,
+    on_back: Option<&dyn Fn() -> Message>,
 ) -> EventResult<Message> {
-    if is_activation_event(event) {
-        let result = EventResult::consumed().focus(focus_id.clone());
-        return match on_open {
-            Some(on_open) => result.emit(on_open(visible[selected])),
-            None => result,
-        };
-    }
-    let Some(action) = action_for_event(selected, visible.len(), viewport_height, event) else {
+    if visible.is_empty() {
         return EventResult::ignored();
-    };
+    }
+    let selected = selected.min(visible.len().saturating_sub(1));
     let result = EventResult::consumed().focus(focus_id.clone());
     match action {
-        FilePickerAction::Select(position) if position != selected => {
-            result.emit(on_select(visible[position]))
-        }
-        FilePickerAction::Select(_) => result,
-        FilePickerAction::Open => on_open.map_or_else(EventResult::ignored, |on_open| {
+        FilePickerAction::Activate => {
+            let Some(on_open) = on_open else {
+                return EventResult::ignored();
+            };
             result.emit(on_open(visible[selected]))
-        }),
+        }
         FilePickerAction::Back => {
-            on_back.map_or_else(EventResult::ignored, |on_back| result.emit(on_back()))
+            let Some(on_back) = on_back else {
+                return EventResult::ignored();
+            };
+            result.emit(on_back())
+        }
+        _ => {
+            let position = position_for_action(selected, visible.len(), viewport_height, action)
+                .expect("selection action has a target position");
+            if position == selected {
+                result
+            } else {
+                result.emit(on_select(visible[position]))
+            }
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FilePickerAction {
-    Select(usize),
-    Open,
-    Back,
+fn selected_pointer_result<Message>(
+    event: &Event,
+    original_index: usize,
+    focus_id: &NodeId,
+    on_open: Option<&Arc<dyn Fn(usize) -> Message>>,
+) -> EventResult<Message> {
+    if !is_pointer_activation_event(event) {
+        return EventResult::ignored();
+    }
+    let result = EventResult::consumed().focus(focus_id.clone());
+    match on_open {
+        Some(on_open) => result.emit(on_open(original_index)),
+        None => result,
+    }
 }
 
-fn action_for_event(
+fn position_for_action(
     selected: usize,
     count: usize,
     viewport_height: usize,
-    event: &Event,
-) -> Option<FilePickerAction> {
+    action: FilePickerAction,
+) -> Option<usize> {
     if count == 0 {
         return None;
     }
-    let Event::Key(key) = event else {
-        return None;
-    };
-    if key.action == KeyAction::Release
-        || key.modifiers.alt
-        || key.modifiers.control
-        || key.modifiers.meta
-    {
-        return None;
-    }
     let selected = selected.min(count.saturating_sub(1));
-    match key.code {
-        KeyCode::Up => Some(FilePickerAction::Select(selected.saturating_sub(1))),
-        KeyCode::Down => Some(FilePickerAction::Select(
-            selected.saturating_add(1).min(count.saturating_sub(1)),
-        )),
-        KeyCode::Home => Some(FilePickerAction::Select(0)),
-        KeyCode::End => Some(FilePickerAction::Select(count.saturating_sub(1))),
-        KeyCode::PageUp | KeyCode::PageDown => {
+    match action {
+        FilePickerAction::Previous => Some(selected.saturating_sub(1)),
+        FilePickerAction::Next => Some(selected.saturating_add(1).min(count.saturating_sub(1))),
+        FilePickerAction::First => Some(0),
+        FilePickerAction::Last => Some(count.saturating_sub(1)),
+        FilePickerAction::PreviousPage | FilePickerAction::NextPage => {
             let step = if viewport_height == 0 {
                 count.min(10)
             } else {
                 viewport_height
             };
-            if key.code == KeyCode::PageUp {
-                Some(FilePickerAction::Select(selected.saturating_sub(step)))
+            if action == FilePickerAction::PreviousPage {
+                Some(selected.saturating_sub(step))
             } else {
-                Some(FilePickerAction::Select(
-                    selected.saturating_add(step).min(count.saturating_sub(1)),
-                ))
+                Some(selected.saturating_add(step).min(count.saturating_sub(1)))
             }
         }
-        KeyCode::Right => Some(FilePickerAction::Open),
-        KeyCode::Left | KeyCode::Backspace => Some(FilePickerAction::Back),
-        _ => None,
+        FilePickerAction::Activate | FilePickerAction::Back => None,
     }
+}
+
+fn file_picker_action_descriptors(
+    available: bool,
+    has_open: bool,
+    has_back: bool,
+) -> [ActionDescriptor; FILE_PICKER_ACTION_COUNT] {
+    std::array::from_fn(|index| {
+        let enabled = available
+            && match FILE_PICKER_ACTIONS[index] {
+                FilePickerAction::Activate => has_open,
+                FilePickerAction::Back => has_back,
+                _ => true,
+            };
+        let availability = if enabled {
+            ActionAvailability::Enabled
+        } else {
+            ActionAvailability::DisabledPassThrough
+        };
+        FILE_PICKER_ACTION_DESCRIPTORS[index]
+            .clone()
+            .with_availability(availability)
+    })
+}
+
+fn has_visible_entries(entries: &[FilePickerEntry], show_hidden: bool) -> bool {
+    entries.iter().any(|entry| show_hidden || !entry.hidden)
 }
 
 fn visible_indices(entries: &[FilePickerEntry], show_hidden: bool) -> Vec<usize> {
@@ -443,11 +630,9 @@ fn viewport_range(count: usize, selected: usize, height: usize) -> (usize, usize
 
 #[cfg(test)]
 mod tests {
-    use nagi_tui::{Event, KeyAction, KeyCode, KeyEvent, KeyProtocol, Modifiers};
-
     use super::{
-        FilePickerAction, FilePickerEntry, action_for_event, normalized_selection, viewport_range,
-        visible_indices,
+        FilePickerAction, FilePickerEntry, file_picker_action_descriptors, normalized_selection,
+        position_for_action, viewport_range, visible_indices,
     };
 
     #[test]
@@ -512,28 +697,49 @@ mod tests {
                 continue;
             };
             assert_eq!(
-                action_for_event(selected, visible.len(), viewport, &key(KeyCode::PageUp)),
-                Some(FilePickerAction::Select(number(record.field("page-up")))),
+                position_for_action(
+                    selected,
+                    visible.len(),
+                    viewport,
+                    FilePickerAction::PreviousPage,
+                ),
+                Some(number(record.field("page-up"))),
                 "case {} page-up",
                 record.id
             );
             assert_eq!(
-                action_for_event(selected, visible.len(), viewport, &key(KeyCode::PageDown)),
-                Some(FilePickerAction::Select(number(record.field("page-down")))),
+                position_for_action(
+                    selected,
+                    visible.len(),
+                    viewport,
+                    FilePickerAction::NextPage,
+                ),
+                Some(number(record.field("page-down"))),
                 "case {} page-down",
                 record.id
             );
         }
     }
 
-    fn key(code: KeyCode) -> Event {
-        Event::Key(KeyEvent {
-            code,
-            modifiers: Modifiers::NONE,
-            action: KeyAction::Press,
-            text: None,
-            protocol: KeyProtocol::Legacy,
-        })
+    #[test]
+    fn descriptor_clones_reuse_immutable_storage() {
+        let enabled = file_picker_action_descriptors(true, true, true);
+        let disabled = file_picker_action_descriptors(false, true, true);
+
+        for index in 0..enabled.len() {
+            assert!(std::ptr::eq(
+                enabled[index].id().as_str(),
+                disabled[index].id().as_str()
+            ));
+            assert!(std::ptr::eq(
+                enabled[index].label(),
+                disabled[index].label()
+            ));
+            assert!(std::ptr::eq(
+                enabled[index].default_bindings(),
+                disabled[index].default_bindings()
+            ));
+        }
     }
 
     fn number(value: &str) -> usize {

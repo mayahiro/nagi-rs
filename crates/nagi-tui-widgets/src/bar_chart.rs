@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use nagi_text::{WidthProfile, text_width};
+use nagi_text::{WidthProfile, grapheme_width, text_width};
 use nagi_tui::{Node, Style};
 
 use crate::sparkline::scaled_level;
@@ -84,6 +84,7 @@ pub struct BarChart<Message> {
     maximum: Option<u64>,
     show_values: bool,
     style: BarChartStyle,
+    width_profile: WidthProfile<'static>,
     message: PhantomData<fn() -> Message>,
 }
 
@@ -97,6 +98,7 @@ impl<Message> BarChart<Message> {
             maximum: None,
             show_values: true,
             style: BarChartStyle::default(),
+            width_profile: WidthProfile::MODERN,
             message: PhantomData,
         }
     }
@@ -124,6 +126,15 @@ impl<Message> BarChart<Message> {
         self
     }
 
+    /// Sets the terminal cell-width policy used by labels and bars
+    ///
+    /// Pass `ViewContext::width_profile` to keep the widget aligned with its Runtime
+    #[must_use]
+    pub const fn width_profile(mut self, profile: WidthProfile<'static>) -> Self {
+        self.width_profile = profile;
+        self
+    }
+
     /// Builds the public semantic node for this bar chart
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
@@ -133,9 +144,16 @@ impl<Message> BarChart<Message> {
         let label_width = self
             .bars
             .iter()
-            .map(|bar| text_width(bar.label(), WidthProfile::MODERN))
+            .map(|bar| text_width(bar.label(), self.width_profile))
             .max()
             .unwrap_or(0);
+        let (filled_glyph, empty_glyph) = if grapheme_width("█", self.width_profile) == 1
+            && grapheme_width("░", self.width_profile) == 1
+        {
+            ("█", "░")
+        } else {
+            ("#", ".")
+        };
         let rows = self.bars.into_iter().map(|bar| {
             let filled = scaled_bar_cells(bar.value, maximum, self.width);
             let mut parts = vec![
@@ -144,16 +162,18 @@ impl<Message> BarChart<Message> {
                         "{}{}",
                         bar.label,
                         " ".repeat(
-                            label_width
-                                .saturating_sub(text_width(&bar.label, WidthProfile::MODERN))
+                            label_width.saturating_sub(text_width(&bar.label, self.width_profile))
                         )
                     ),
                     self.style.label,
                 ),
                 Node::text(" "),
-                Node::styled_text("█".repeat(filled), self.style.bar.merged(bar.style)),
                 Node::styled_text(
-                    "░".repeat(usize::from(self.width).saturating_sub(filled)),
+                    filled_glyph.repeat(filled),
+                    self.style.bar.merged(bar.style),
+                ),
+                Node::styled_text(
+                    empty_glyph.repeat(usize::from(self.width).saturating_sub(filled)),
                     self.style.empty,
                 ),
             ];

@@ -1,5 +1,9 @@
-use nagi_tui::{Event, KeyAction, KeyCode, Modifiers, MouseButton, MouseKind};
+use nagi_tui::{Event, MouseButton, MouseKind};
 
+#[cfg(test)]
+use nagi_tui::{KeyAction, KeyCode, Modifiers};
+
+#[cfg(test)]
 pub(crate) fn is_activation_event(event: &Event) -> bool {
     match event {
         Event::Key(key) if key.action != KeyAction::Release => match key.code {
@@ -11,6 +15,14 @@ pub(crate) fn is_activation_event(event: &Event) -> bool {
         Event::Mouse(mouse) => mouse.kind == MouseKind::Press && mouse.button == MouseButton::Left,
         _ => false,
     }
+}
+
+pub(crate) fn is_pointer_activation_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Mouse(mouse)
+            if mouse.kind == MouseKind::Press && mouse.button == MouseButton::Left
+    )
 }
 
 #[cfg(test)]

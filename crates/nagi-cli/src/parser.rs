@@ -6,10 +6,14 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use crate::command::{
     Argument, Command, OptionGroupKind, OptionKind, OptionSpec, PresenceBasis, option_display,
-    quote_value,
+    quote_value, valid_id,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticTarget};
-use crate::value::{ParsedValue, ValueSource};
+use crate::lifecycle::DeprecationNotice;
+use crate::value::{
+    ParsedValue, REDACTED_VALUE, ValueOrigin, ValueResolution, ValueResolutionMode,
+    ValueResolutionRequest, ValueResolver, ValueSource,
+};
 
 #[derive(Clone, Debug)]
 enum InvocationValue {
@@ -25,6 +29,8 @@ enum InvocationValue {
 struct InvocationDefinition {
     kind: OptionKind,
     repeated: bool,
+    sensitive: bool,
+    argument: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +48,8 @@ impl InvocationScopeData {
                 InvocationDefinition {
                     kind: option.kind,
                     repeated: option.repeated,
+                    sensitive: option.sensitive,
+                    argument: false,
                 },
             );
         }
@@ -51,6 +59,8 @@ impl InvocationScopeData {
                 InvocationDefinition {
                     kind: OptionKind::Value,
                     repeated: argument.repeated,
+                    sensitive: argument.sensitive,
+                    argument: true,
                 },
             );
         }
@@ -131,6 +141,7 @@ pub struct Invocation {
     command_id_path: Vec<String>,
     scopes: Vec<InvocationScopeData>,
     current_scope: usize,
+    deprecation_notices: Vec<DeprecationNotice>,
 }
 
 impl Invocation {
@@ -142,6 +153,16 @@ impl Invocation {
     /// Returns the stable root-to-leaf command-ID path
     pub fn command_id_path(&self) -> &[String] {
         &self.command_id_path
+    }
+
+    /// Returns deprecated Command and Option uses in deterministic first-use
+    /// order
+    ///
+    /// A deprecated root Command comes first. Subsequent targets follow their
+    /// first successful argv occurrence. Each stable target occurs at most
+    /// once. Environment, external, and default resolution do not produce notices
+    pub fn deprecation_notices(&self) -> &[DeprecationNotice] {
+        &self.deprecation_notices
     }
 
     /// Returns the current stable path where unqualified lookup starts
@@ -245,6 +266,13 @@ impl Invocation {
         })
     }
 
+    /// Reports whether the nearest visible Value declaration is Sensitive
+    pub fn value_is_sensitive(&self, id: &str) -> bool {
+        self.lookup(id).is_some_and(|(definition, _)| {
+            definition.kind == OptionKind::Value && definition.sensitive
+        })
+    }
+
     /// Returns the first platform-native raw value
     pub fn raw_value(&self, id: &str) -> Option<&OsStr> {
         self.parsed_values(id)?.first().map(ParsedValue::raw)
@@ -265,7 +293,7 @@ impl Invocation {
 
     /// Returns the first typed value or a structured access error
     ///
-    /// Environment and default values are already resolved before this lookup
+    /// Environment, external, and default values are resolved before this lookup
     pub fn require_value<T: Any>(&self, id: &str) -> Result<&T, ValueAccessError> {
         required_value(self.value_scope_id_path(), self.parsed_values(id), id)
     }
@@ -291,6 +319,34 @@ impl Invocation {
             }
         }
         None
+    }
+
+    pub(crate) fn mark_sensitive_target(&self, target: DiagnosticTarget) -> DiagnosticTarget {
+        if target.kind() == crate::diagnostic::DiagnosticTargetKind::ResponseFile {
+            return target;
+        }
+        let scope_index = if target.command_id_path().is_empty() {
+            Some(self.current_scope)
+        } else {
+            self.scopes.iter().enumerate().find_map(|(index, _)| {
+                (self.command_id_path[..=index] == *target.command_id_path()).then_some(index)
+            })
+        };
+        let Some(scope_index) = scope_index else {
+            return target;
+        };
+        let Some(definition) = self.scopes[scope_index].definitions.get(target.value_id()) else {
+            return target;
+        };
+        let target_is_argument = matches!(
+            target.kind(),
+            crate::diagnostic::DiagnosticTargetKind::Argument
+        );
+        target.with_sensitive(
+            definition.kind == OptionKind::Value
+                && definition.argument == target_is_argument
+                && definition.sensitive,
+        )
     }
 }
 
@@ -392,6 +448,14 @@ impl InvocationScope<'_> {
             .is_some_and(|definition| definition.kind == OptionKind::Value && definition.repeated)
     }
 
+    /// Reports whether one local Value declaration is Sensitive
+    pub fn value_is_sensitive(&self, id: &str) -> bool {
+        self.data()
+            .definitions
+            .get(id)
+            .is_some_and(|definition| definition.kind == OptionKind::Value && definition.sensitive)
+    }
+
     /// Iterates local IDs that have a value in sorted order
     pub fn value_ids(&self) -> impl Iterator<Item = &str> {
         self.data().values.keys().map(String::as_str)
@@ -490,20 +554,66 @@ impl Command {
         K: Into<OsString>,
         V: Into<OsString>,
     {
+        self.parse_with_optional_value_resolver(arguments, environment, None)
+    }
+
+    /// Parses arguments, environment values, and application-owned fallbacks
+    ///
+    /// The resolver is called only for selected Value Options that have no
+    /// command-line or environment value
+    pub fn parse_with_value_resolver<I, S, E, K, V>(
+        &self,
+        arguments: I,
+        environment: E,
+        resolver: &dyn ValueResolver,
+    ) -> Result<ParseResult, Diagnostic>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+        E: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.parse_with_optional_value_resolver(arguments, environment, Some(resolver))
+    }
+
+    fn parse_with_optional_value_resolver<I, S, E, K, V>(
+        &self,
+        arguments: I,
+        environment: E,
+        resolver: Option<&dyn ValueResolver>,
+    ) -> Result<ParseResult, Diagnostic>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+        E: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
         self.validate()?;
         let arguments: Vec<OsString> = arguments.into_iter().map(Into::into).collect();
         let environment: BTreeMap<OsString, OsString> = environment
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
-        Parser::new(self, arguments, environment).parse()
+        self.parse_validated_with_optional_value_resolver(arguments, environment, resolver)
+    }
+
+    pub(crate) fn parse_validated_with_optional_value_resolver(
+        &self,
+        arguments: Vec<OsString>,
+        environment: BTreeMap<OsString, OsString>,
+        resolver: Option<&dyn ValueResolver>,
+    ) -> Result<ParseResult, Diagnostic> {
+        Parser::new(self, arguments, environment, resolver).parse()
     }
 }
 
-struct Parser<'command> {
+struct Parser<'command, 'resolver> {
     root: &'command Command,
     arguments: Vec<OsString>,
     environment: BTreeMap<OsString, OsString>,
+    resolver: Option<&'resolver dyn ValueResolver>,
     index: usize,
     commands: Vec<&'command Command>,
     command_path: Vec<String>,
@@ -511,18 +621,21 @@ struct Parser<'command> {
     positional_index: usize,
     positional_started: bool,
     options_enabled: bool,
+    deprecation_notices: Vec<DeprecationNotice>,
 }
 
-impl<'command> Parser<'command> {
+impl<'command, 'resolver> Parser<'command, 'resolver> {
     fn new(
         root: &'command Command,
         arguments: Vec<OsString>,
         environment: BTreeMap<OsString, OsString>,
+        resolver: Option<&'resolver dyn ValueResolver>,
     ) -> Self {
-        Self {
+        let mut parser = Self {
             root,
             arguments,
             environment,
+            resolver,
             index: 0,
             commands: vec![root],
             command_path: vec![root.name.clone()],
@@ -530,7 +643,17 @@ impl<'command> Parser<'command> {
             positional_index: 0,
             positional_started: false,
             options_enabled: true,
+            deprecation_notices: Vec::new(),
+        };
+        if let Some(deprecation) = &root.deprecation {
+            parser.push_deprecation_notice(DeprecationNotice::command(
+                vec![root.name.clone()],
+                vec![root.id.clone()],
+                root.name.clone(),
+                deprecation,
+            ));
         }
+        parser
     }
 
     fn parse(mut self) -> Result<ParseResult, Diagnostic> {
@@ -538,7 +661,7 @@ impl<'command> Parser<'command> {
             return Ok(result);
         }
         while self.index < self.arguments.len() {
-            let argument = self.arguments[self.index].clone();
+            let argument = std::mem::take(&mut self.arguments[self.index]);
             let bytes = argument.as_bytes();
             if self.options_enabled && bytes == b"--" {
                 self.options_enabled = false;
@@ -570,17 +693,19 @@ impl<'command> Parser<'command> {
             self.index += 1;
         }
 
-        self.resolve_fallbacks()?;
+        let command_id_path = self
+            .commands
+            .iter()
+            .map(|command| command.id.clone())
+            .collect::<Vec<_>>();
+        self.resolve_fallbacks(&command_id_path)?;
         self.validate_values()?;
         let mut invocation = Invocation {
             command_path: self.command_path.clone(),
-            command_id_path: self
-                .commands
-                .iter()
-                .map(|command| command.id.clone())
-                .collect(),
+            command_id_path,
             current_scope: self.scopes.len() - 1,
             scopes: std::mem::take(&mut self.scopes),
+            deprecation_notices: std::mem::take(&mut self.deprecation_notices),
         };
         self.run_validators(&mut invocation)?;
         Ok(ParseResult::Invocation(invocation))
@@ -591,22 +716,6 @@ impl<'command> Parser<'command> {
             .last()
             .copied()
             .expect("parser always has a root command")
-    }
-
-    fn active_values(&self) -> &BTreeMap<String, InvocationValue> {
-        &self
-            .scopes
-            .last()
-            .expect("parser always has a root value scope")
-            .values
-    }
-
-    fn active_values_mut(&mut self) -> &mut BTreeMap<String, InvocationValue> {
-        &mut self
-            .scopes
-            .last_mut()
-            .expect("parser always has a root value scope")
-            .values
     }
 
     fn current_command_id_path(&self) -> Vec<String> {
@@ -698,20 +807,29 @@ impl<'command> Parser<'command> {
             }));
         }
 
-        let Some(option) = self
-            .active()
-            .options
-            .iter()
-            .find(|option| option.long.as_deref() == Some(name))
-            .cloned()
-        else {
+        let Some((scope_index, option_index)) = self.visible_long_option(name) else {
             return Err(self.error(
                 DiagnosticCode::UnknownOption,
                 format!("unknown option {}", quote_value(argument)),
             ));
         };
+        let command = self.commands[scope_index];
+        let option = &command.options[option_index];
         self.index += 1;
-        self.apply_option(&option, attached, argument)?;
+        let first_occurrence = self.apply_option(scope_index, option, attached)?;
+        if first_occurrence {
+            let option = &self.commands[scope_index].options[option_index];
+            if let Some(deprecation) = option.deprecation.clone() {
+                let value_id = option.id.clone();
+                self.push_deprecation_notice(DeprecationNotice::option(
+                    self.command_path.clone(),
+                    self.command_id_path(scope_index),
+                    value_id,
+                    format!("--{name}"),
+                    &deprecation,
+                ));
+            }
+        }
         Ok(None)
     }
 
@@ -741,25 +859,47 @@ impl<'command> Parser<'command> {
                     command_id_path: vec![self.root.id.clone()],
                 }));
             }
-            let Some(option) = self
-                .active()
-                .options
-                .iter()
-                .find(|option| option.short == Some(short))
-                .cloned()
-            else {
+            let Some((scope_index, option_index)) = self.visible_short_option(short) else {
                 return Err(self.error(
                     DiagnosticCode::UnknownOption,
                     format!("unknown option '-{short}'"),
                 ));
             };
+            let command = self.commands[scope_index];
+            let option = &command.options[option_index];
             if option.kind == OptionKind::Value {
                 let attached = (offset + 1 < bytes.len())
                     .then(|| OsString::from_vec(bytes[offset + 1..].to_vec()));
-                self.apply_option(&option, attached, argument)?;
+                let first_occurrence = self.apply_option(scope_index, option, attached)?;
+                if first_occurrence {
+                    let option = &self.commands[scope_index].options[option_index];
+                    if let Some(deprecation) = option.deprecation.clone() {
+                        let value_id = option.id.clone();
+                        self.push_deprecation_notice(DeprecationNotice::option(
+                            self.command_path.clone(),
+                            self.command_id_path(scope_index),
+                            value_id,
+                            format!("-{short}"),
+                            &deprecation,
+                        ));
+                    }
+                }
                 return Ok(None);
             }
-            self.apply_option(&option, None, argument)?;
+            let first_occurrence = self.apply_option(scope_index, option, None)?;
+            if first_occurrence {
+                let option = &self.commands[scope_index].options[option_index];
+                if let Some(deprecation) = option.deprecation.clone() {
+                    let value_id = option.id.clone();
+                    self.push_deprecation_notice(DeprecationNotice::option(
+                        self.command_path.clone(),
+                        self.command_id_path(scope_index),
+                        value_id,
+                        format!("-{short}"),
+                        &deprecation,
+                    ));
+                }
+            }
             offset += 1;
         }
         Ok(None)
@@ -767,48 +907,52 @@ impl<'command> Parser<'command> {
 
     fn apply_option(
         &mut self,
+        scope_index: usize,
         option: &OptionSpec,
         attached: Option<OsString>,
-        _spelling: &OsStr,
-    ) -> Result<(), Diagnostic> {
-        match option.kind {
+    ) -> Result<bool, Diagnostic> {
+        let first_occurrence = match option.kind {
             OptionKind::Flag => {
                 if attached.is_some() {
                     return Err(self.error_with_targets(
                         DiagnosticCode::UnexpectedOptionValue,
                         format!("option '{}' does not take a value", option_display(option)),
-                        [DiagnosticTarget::option(&option.id)],
+                        [self.option_target(scope_index, &option.id)],
                     ));
                 }
-                if self.active_values().contains_key(&option.id) {
+                if self.scopes[scope_index].values.contains_key(&option.id) {
                     return Err(self.error_with_targets(
                         DiagnosticCode::DuplicateOption,
                         format!(
                             "option '{}' was provided more than once",
                             option_display(option)
                         ),
-                        [DiagnosticTarget::option(&option.id)],
+                        [self.option_target(scope_index, &option.id)],
                     ));
                 }
-                self.active_values_mut()
+                self.scopes[scope_index]
+                    .values
                     .insert(option.id.clone(), InvocationValue::Flag);
+                true
             }
             OptionKind::Count => {
                 if attached.is_some() {
                     return Err(self.error_with_targets(
                         DiagnosticCode::UnexpectedOptionValue,
                         format!("option '{}' does not take a value", option_display(option)),
-                        [DiagnosticTarget::option(&option.id)],
+                        [self.option_target(scope_index, &option.id)],
                     ));
                 }
-                match self.active_values_mut().entry(option.id.clone()) {
+                match self.scopes[scope_index].values.entry(option.id.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(InvocationValue::Count(1));
+                        true
                     }
                     std::collections::btree_map::Entry::Occupied(mut entry) => {
                         if let InvocationValue::Count(count) = entry.get_mut() {
                             *count = count.saturating_add(1);
                         }
+                        false
                     }
                 }
             }
@@ -816,38 +960,75 @@ impl<'command> Parser<'command> {
                 let raw = match attached {
                     Some(value) => value,
                     None => {
-                        let Some(value) = self.arguments.get(self.index).cloned() else {
+                        if self.index >= self.arguments.len() {
                             return Err(self.error_with_targets(
                                 DiagnosticCode::MissingOptionValue,
                                 format!("option '{}' requires a value", option_display(option)),
-                                [DiagnosticTarget::option(&option.id)],
+                                [self.option_target(scope_index, &option.id)],
                             ));
-                        };
+                        }
+                        let value = std::mem::take(&mut self.arguments[self.index]);
                         self.index += 1;
                         value
                     }
                 };
-                if !option.repeated && self.active_values().contains_key(&option.id) {
+                let duplicate = self.scopes[scope_index].values.contains_key(&option.id);
+                if !option.repeated && duplicate {
                     return Err(self.error_with_targets(
                         DiagnosticCode::DuplicateOption,
                         format!(
                             "option '{}' was provided more than once",
                             option_display(option)
                         ),
-                        [DiagnosticTarget::option(&option.id)],
+                        [self.option_target(scope_index, &option.id)],
                     ));
                 }
                 let parsed = self.parse_value(
                     &option.id,
                     &option.parser,
                     raw,
-                    ValueSource::CommandLine,
-                    DiagnosticTarget::option(&option.id),
+                    ValueOrigin::command_line(),
+                    option.sensitive,
+                    self.option_target(scope_index, &option.id),
                 )?;
-                self.push_value(self.scopes.len() - 1, &option.id, parsed);
+                self.push_value(scope_index, &option.id, parsed);
+                !duplicate
             }
-        }
-        Ok(())
+        };
+        Ok(first_occurrence)
+    }
+
+    fn visible_long_option(&self, name: &str) -> Option<(usize, usize)> {
+        let active_index = self.commands.len() - 1;
+        (0..self.commands.len()).rev().find_map(|scope_index| {
+            self.commands[scope_index]
+                .options
+                .iter()
+                .enumerate()
+                .find(|(_, option)| {
+                    option.long.as_deref() == Some(name)
+                        && (scope_index == active_index || option.inherited)
+                })
+                .map(|(option_index, _)| (scope_index, option_index))
+        })
+    }
+
+    fn visible_short_option(&self, short: char) -> Option<(usize, usize)> {
+        let active_index = self.commands.len() - 1;
+        (0..self.commands.len()).rev().find_map(|scope_index| {
+            self.commands[scope_index]
+                .options
+                .iter()
+                .enumerate()
+                .find(|(_, option)| {
+                    option.short == Some(short) && (scope_index == active_index || option.inherited)
+                })
+                .map(|(option_index, _)| (scope_index, option_index))
+        })
+    }
+
+    fn option_target(&self, scope_index: usize, id: &str) -> DiagnosticTarget {
+        DiagnosticTarget::option(id).with_command_id_path(self.command_id_path(scope_index))
     }
 
     fn select_subcommand(&mut self, argument: &OsStr) -> bool {
@@ -859,12 +1040,26 @@ impl<'command> Parser<'command> {
         }) else {
             return false;
         };
+        let deprecation = command.deprecation.clone();
+        let supplied_spelling = name.to_owned();
         self.commands.push(command);
         self.command_path.push(command.name.clone());
         self.scopes.push(InvocationScopeData::new(command));
         self.positional_index = 0;
         self.positional_started = false;
+        if let Some(deprecation) = deprecation {
+            self.push_deprecation_notice(DeprecationNotice::command(
+                self.command_path.clone(),
+                self.current_command_id_path(),
+                supplied_spelling,
+                &deprecation,
+            ));
+        }
         true
+    }
+
+    fn push_deprecation_notice(&mut self, notice: DeprecationNotice) {
+        self.deprecation_notices.push(notice);
     }
 
     fn parse_positional(&mut self, raw: OsString) -> Result<(), Diagnostic> {
@@ -891,7 +1086,8 @@ impl<'command> Parser<'command> {
             &argument.id,
             &argument.parser,
             raw,
-            ValueSource::CommandLine,
+            ValueOrigin::command_line(),
+            argument.sensitive,
             DiagnosticTarget::argument(&argument.id),
         )?;
         self.push_value(self.scopes.len() - 1, &argument.id, parsed);
@@ -901,7 +1097,7 @@ impl<'command> Parser<'command> {
         Ok(())
     }
 
-    fn resolve_fallbacks(&mut self) -> Result<(), Diagnostic> {
+    fn resolve_fallbacks(&mut self, selected_command_id_path: &[String]) -> Result<(), Diagnostic> {
         let commands = self.commands.clone();
         for (command_index, command) in commands.into_iter().enumerate() {
             for option in &command.options {
@@ -910,32 +1106,150 @@ impl<'command> Parser<'command> {
                 {
                     continue;
                 }
-                let fallback = option
-                    .environment
-                    .as_ref()
-                    .and_then(|name| self.environment.get(OsStr::new(name)))
-                    .cloned()
-                    .map(|value| (value, ValueSource::Environment))
-                    .or_else(|| {
-                        option
-                            .default
-                            .clone()
-                            .map(|value| (value, ValueSource::Default))
-                    });
-                if let Some((raw, source)) = fallback {
+                if let Some((name, raw)) = option.environment.as_ref().and_then(|name| {
+                    self.environment
+                        .get(OsStr::new(name))
+                        .cloned()
+                        .map(|raw| (name, raw))
+                }) {
+                    let origin = ValueOrigin::environment(name.clone());
                     let parsed = self.parse_value(
                         &option.id,
                         &option.parser,
                         raw,
-                        source,
+                        origin.clone(),
+                        option.sensitive,
                         DiagnosticTarget::option(&option.id)
-                            .with_command_id_path(self.command_id_path(command_index)),
+                            .with_command_id_path(self.command_id_path(command_index))
+                            .with_value_origin(origin),
+                    )?;
+                    self.push_value(command_index, &option.id, parsed);
+                    continue;
+                }
+
+                if let Some(resolver) = self.resolver {
+                    let request = ValueResolutionRequest::new(
+                        &self.command_path,
+                        selected_command_id_path,
+                        &self.command_path[..=command_index],
+                        &selected_command_id_path[..=command_index],
+                        &option.id,
+                        option.repeated,
+                        option.sensitive,
+                    );
+                    let resolution = resolver.resolve(&request).map_err(|diagnostic| {
+                        self.resolver_diagnostic(diagnostic, command_index, &option.id)
+                    })?;
+                    if resolution.is_resolved() {
+                        self.apply_external_resolution(command_index, option, resolution)?;
+                        continue;
+                    }
+                }
+
+                if let Some(raw) = option.default.clone() {
+                    let origin = ValueOrigin::default_value();
+                    let parsed = self.parse_value(
+                        &option.id,
+                        &option.parser,
+                        raw,
+                        origin.clone(),
+                        option.sensitive,
+                        DiagnosticTarget::option(&option.id)
+                            .with_command_id_path(self.command_id_path(command_index))
+                            .with_value_origin(origin),
                     )?;
                     self.push_value(command_index, &option.id, parsed);
                 }
             }
         }
         Ok(())
+    }
+
+    fn apply_external_resolution(
+        &mut self,
+        command_index: usize,
+        option: &OptionSpec,
+        resolution: ValueResolution,
+    ) -> Result<(), Diagnostic> {
+        let (identity, values, mode) = resolution
+            .into_resolved_parts()
+            .expect("a resolved result has an identity");
+        if !valid_id(&identity) {
+            return Err(self.error_with_targets(
+                DiagnosticCode::InvalidSpecification,
+                format!(
+                    "Value Resolver returned an invalid source identity for '{}'",
+                    option.id
+                ),
+                [self.option_target(command_index, &option.id)],
+            ));
+        }
+        if values.is_empty() {
+            return Err(self.error_with_targets(
+                DiagnosticCode::InvalidSpecification,
+                format!(
+                    "Value Resolver returned an empty resolved result for '{}'",
+                    option.id
+                ),
+                [self.option_target(command_index, &option.id)],
+            ));
+        }
+        if !option.repeated && (values.len() != 1 || mode != ValueResolutionMode::Replace) {
+            return Err(self.error_with_targets(
+                DiagnosticCode::InvalidSpecification,
+                format!(
+                    "Value Resolver returned repeated or merged values for non-repeated '{}'",
+                    option.id
+                ),
+                [self.option_target(command_index, &option.id)],
+            ));
+        }
+
+        for raw in values {
+            let origin = ValueOrigin::external(std::sync::Arc::clone(&identity));
+            let parsed = self.parse_value(
+                &option.id,
+                &option.parser,
+                raw,
+                origin.clone(),
+                option.sensitive,
+                self.option_target(command_index, &option.id)
+                    .with_value_origin(origin),
+            )?;
+            self.push_value(command_index, &option.id, parsed);
+        }
+        if mode == ValueResolutionMode::Merge {
+            if let Some(raw) = option.default.clone() {
+                let origin = ValueOrigin::default_value();
+                let parsed = self.parse_value(
+                    &option.id,
+                    &option.parser,
+                    raw,
+                    origin.clone(),
+                    option.sensitive,
+                    self.option_target(command_index, &option.id)
+                        .with_value_origin(origin),
+                )?;
+                self.push_value(command_index, &option.id, parsed);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolver_diagnostic(
+        &self,
+        mut diagnostic: Diagnostic,
+        command_index: usize,
+        value_id: &str,
+    ) -> Diagnostic {
+        if diagnostic.targets().is_empty() {
+            diagnostic = diagnostic.with_target(self.option_target(command_index, value_id));
+        }
+        diagnostic
+            .with_default_target_path(&self.command_id_path(command_index))
+            .map_targets(|target| self.mark_sensitive_target(target))
+            .with_command_path(self.command_path.clone())
+            .with_usage(self.root.usage_for_path(&self.command_path))
     }
 
     fn validate_values(&self) -> Result<(), Diagnostic> {
@@ -1054,10 +1368,12 @@ impl<'command> Parser<'command> {
             for validator in &command.validators {
                 if let Err(diagnostic) = validator.validate(invocation) {
                     invocation.current_scope = invocation.scopes.len() - 1;
-                    return Err(diagnostic
+                    let diagnostic = diagnostic
                         .with_default_target_path(&invocation.command_id_path[..=command_index])
+                        .map_targets(|target| invocation.mark_sensitive_target(target))
                         .with_command_path(self.command_path.clone())
-                        .with_usage(self.root.usage_for_path(&self.command_path)));
+                        .with_usage(self.root.usage_for_path(&self.command_path));
+                    return Err(diagnostic);
                 }
             }
         }
@@ -1070,17 +1386,20 @@ impl<'command> Parser<'command> {
         id: &str,
         parser: &std::sync::Arc<dyn crate::value::ValueParser>,
         raw: OsString,
-        source: ValueSource,
+        origin: ValueOrigin,
+        sensitive: bool,
         target: DiagnosticTarget,
     ) -> Result<ParsedValue, Diagnostic> {
+        let target = target.with_value_origin(origin.clone());
         let typed = parser.parse(&raw).map_err(|reason| {
-            self.error_with_targets(
-                DiagnosticCode::InvalidValue,
-                format!("invalid value {} for '{id}': {reason}", quote_value(&raw)),
-                [target],
-            )
+            let message = if sensitive {
+                format!("invalid value {REDACTED_VALUE} for '{id}'")
+            } else {
+                format!("invalid value {} for '{id}': {reason}", quote_value(&raw))
+            };
+            self.error_with_targets(DiagnosticCode::InvalidValue, message, [target])
         })?;
-        Ok(ParsedValue::new(raw, source, typed))
+        Ok(ParsedValue::new(raw, origin, typed, sensitive))
     }
 
     fn push_value(&mut self, scope_index: usize, id: &str, value: ParsedValue) {
@@ -1115,12 +1434,40 @@ impl<'command> Parser<'command> {
     {
         let mut diagnostic = Diagnostic::new(code, message);
         for target in targets {
-            diagnostic = diagnostic.with_target(target);
+            diagnostic = diagnostic.with_target(self.mark_sensitive_target(target));
         }
         diagnostic
             .with_default_target_path(&self.current_command_id_path())
             .with_command_path(self.command_path.clone())
             .with_usage(self.root.usage_for_path(&self.command_path))
+    }
+
+    fn mark_sensitive_target(&self, target: DiagnosticTarget) -> DiagnosticTarget {
+        let scope_index = if target.command_id_path().is_empty() {
+            Some(self.commands.len().saturating_sub(1))
+        } else {
+            self.commands.iter().enumerate().find_map(|(index, _)| {
+                (self.command_id_path(index) == target.command_id_path()).then_some(index)
+            })
+        };
+        let Some(scope_index) = scope_index else {
+            return target;
+        };
+        let command = self.commands[scope_index];
+        let sensitive = match target.kind() {
+            crate::diagnostic::DiagnosticTargetKind::Option => command
+                .options
+                .iter()
+                .find(|option| option.id == target.value_id())
+                .is_some_and(|option| option.sensitive),
+            crate::diagnostic::DiagnosticTargetKind::Argument => command
+                .arguments
+                .iter()
+                .find(|argument| argument.id == target.value_id())
+                .is_some_and(|argument| argument.sensitive),
+            crate::diagnostic::DiagnosticTargetKind::ResponseFile => false,
+        };
+        target.with_sensitive(sensitive)
     }
 
     fn command_id_path(&self, index: usize) -> Vec<String> {

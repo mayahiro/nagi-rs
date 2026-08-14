@@ -94,6 +94,7 @@ pub struct Chart<Message> {
     bounds: Option<(i32, i32, i32, i32)>,
     show_axes: bool,
     style: ChartStyle,
+    width_profile: WidthProfile<'static>,
     message: PhantomData<fn() -> Message>,
 }
 
@@ -108,6 +109,7 @@ impl<Message> Chart<Message> {
             bounds: None,
             show_axes: true,
             style: ChartStyle::default(),
+            width_profile: WidthProfile::MODERN,
             message: PhantomData,
         }
     }
@@ -139,6 +141,15 @@ impl<Message> Chart<Message> {
         self
     }
 
+    /// Sets the terminal cell-width policy used by axes and markers
+    ///
+    /// Pass `ViewContext::width_profile` to keep the widget aligned with its Runtime
+    #[must_use]
+    pub const fn width_profile(mut self, profile: WidthProfile<'static>) -> Self {
+        self.width_profile = profile;
+        self
+    }
+
     /// Builds the public semantic node for this chart
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
@@ -156,14 +167,22 @@ impl<Message> Chart<Message> {
             (0, 0)
         };
         if self.show_axes {
+            let (vertical, horizontal, corner) = if ["│", "─", "└"]
+                .into_iter()
+                .all(|glyph| grapheme_width(glyph, self.width_profile) == 1)
+            {
+                ("│", "─", "└")
+            } else {
+                ("|", "-", "+")
+            };
             for y in 0..i32::from(self.height).saturating_sub(bottom) {
-                drawing.write(0, y, "│", self.style.axis, WidthProfile::MODERN);
+                drawing.write(0, y, vertical, self.style.axis, self.width_profile);
             }
             let axis_y = i32::from(self.height).saturating_sub(1);
             for x in 0..i32::from(self.width) {
-                drawing.write(x, axis_y, "─", self.style.axis, WidthProfile::MODERN);
+                drawing.write(x, axis_y, horizontal, self.style.axis, self.width_profile);
             }
-            drawing.write(0, axis_y, "└", self.style.axis, WidthProfile::MODERN);
+            drawing.write(0, axis_y, corner, self.style.axis, self.width_profile);
         }
         let plot_width = i32::from(self.width).saturating_sub(left);
         let plot_height = i32::from(self.height).saturating_sub(bottom);
@@ -172,7 +191,7 @@ impl<Message> Chart<Message> {
         }
         let (minimum_x, maximum_x, minimum_y, maximum_y) = self.chart_bounds();
         for series in self.series {
-            let marker = chart_marker(&series.marker);
+            let marker = chart_marker(&series.marker, self.width_profile);
             let mut mapped = Vec::with_capacity(series.points.len());
             for point in series.points {
                 let current = CellPoint {
@@ -180,12 +199,18 @@ impl<Message> Chart<Message> {
                     y: plot_height - 1 - chart_scale(point.y, minimum_y, maximum_y, plot_height),
                 };
                 if let Some(previous) = mapped.last().copied() {
-                    draw_line(&mut drawing, previous, current, series.style);
+                    draw_line(
+                        &mut drawing,
+                        previous,
+                        current,
+                        series.style,
+                        self.width_profile,
+                    );
                 }
                 mapped.push(current);
             }
             for point in mapped {
-                drawing.write(point.x, point.y, marker, series.style, WidthProfile::MODERN);
+                drawing.write(point.x, point.y, marker, series.style, self.width_profile);
             }
         }
         Node::surface(drawing)
@@ -247,14 +272,15 @@ fn chart_scale(value: i32, minimum: i32, maximum: i32, cells: i32) -> i32 {
     i32::try_from(numerator / denominator).unwrap_or(i32::MAX)
 }
 
-fn chart_marker(marker: &str) -> &str {
-    let Some(grapheme) = graphemes(marker).next() else {
-        return "•";
-    };
-    if grapheme_width(grapheme.text(), WidthProfile::MODERN) == 1 {
+fn chart_marker<'a>(marker: &'a str, profile: WidthProfile<'static>) -> &'a str {
+    if let Some(grapheme) = graphemes(marker).next()
+        && grapheme_width(grapheme.text(), profile) == 1
+    {
         grapheme.text()
-    } else {
+    } else if grapheme_width("•", profile) == 1 {
         "•"
+    } else {
+        "*"
     }
 }
 
@@ -264,15 +290,26 @@ struct CellPoint {
     y: i32,
 }
 
-fn draw_line(drawing: &mut Surface, start: CellPoint, end: CellPoint, style: Style) {
+fn draw_line(
+    drawing: &mut Surface,
+    start: CellPoint,
+    end: CellPoint,
+    style: Style,
+    profile: WidthProfile<'static>,
+) {
     let (mut x, mut y) = (start.x, start.y);
     let delta_x = (end.x - start.x).abs();
     let delta_y = -(end.y - start.y).abs();
     let step_x = if start.x < end.x { 1 } else { -1 };
     let step_y = if start.y < end.y { 1 } else { -1 };
     let mut error_value = delta_x + delta_y;
+    let line_glyph = if grapheme_width("·", profile) == 1 {
+        "·"
+    } else {
+        "."
+    };
     loop {
-        drawing.write(x, y, "·", style, WidthProfile::MODERN);
+        drawing.write(x, y, line_glyph, style, profile);
         if x == end.x && y == end.y {
             return;
         }
@@ -290,7 +327,17 @@ fn draw_line(drawing: &mut Surface, start: CellPoint, end: CellPoint, style: Sty
 
 #[cfg(test)]
 mod tests {
-    use super::chart_scale;
+    use nagi_text::WidthProfile;
+
+    use super::{chart_marker, chart_scale};
+
+    #[test]
+    fn marker_fallback_respects_width_profile() {
+        assert_eq!(chart_marker("", WidthProfile::MODERN), "•");
+        assert_eq!(chart_marker("", WidthProfile::CJK), "*");
+        assert_eq!(chart_marker("·", WidthProfile::CJK), "*");
+        assert_eq!(chart_marker("x", WidthProfile::CJK), "x");
+    }
 
     #[test]
     fn scaling_matches_shared_fixtures() {

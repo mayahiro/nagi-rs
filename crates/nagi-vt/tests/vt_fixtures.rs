@@ -5,8 +5,9 @@ mod support;
 use std::fmt::Write;
 
 use nagi_vt::{
-    Capabilities, CursorShape, Decoder, EraseMode, Event, KeyAction, KeyCode, KeyProtocol,
-    Modifiers, MouseButton, MouseKind, MouseTracking, SgrColor, SgrStyle, TerminalOp, encode,
+    Capabilities, ColorLevel, CursorShape, Decoder, EraseMode, Event, KeyAction, KeyCode,
+    KeyProtocol, KeyboardEnhancements, Modifiers, MouseButton, MouseKind, MouseTracking, SgrColor,
+    SgrStyle, TerminalOp, encode, encode_at,
 };
 
 #[test]
@@ -36,6 +37,40 @@ fn input_and_every_single_split_match_shared_fixtures() {
 }
 
 #[test]
+fn ambiguous_input_follows_the_configured_protocol() {
+    let Some(records) = support::load(
+        "vt/input-protocol.txt",
+        "vt-input-protocol",
+        &["protocol", "input", "expected"],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let kitty_keyboard_mode = match record.field("protocol") {
+            "legacy" => false,
+            "kitty" => true,
+            value => panic!("unknown keyboard protocol {value}"),
+        };
+        let input = record.decoded("input");
+        let expected = record.field("expected");
+        let whole = decode_protocol_chunks([input.as_slice()], kitty_keyboard_mode);
+        assert_eq!(
+            canonical_events(&whole),
+            expected,
+            "case {} whole",
+            record.id
+        );
+
+        for split in 0..=input.len() {
+            let split_events =
+                decode_protocol_chunks([&input[..split], &input[split..]], kitty_keyboard_mode);
+            assert_eq!(split_events, whole, "case {} split {split}", record.id);
+        }
+    }
+}
+
+#[test]
 fn output_matches_shared_fixtures() {
     let Some(records) = support::load(
         "vt/output.txt",
@@ -49,6 +84,14 @@ fn output_matches_shared_fixtures() {
         let capabilities = match record.field("capabilities") {
             "modern" => Capabilities::MODERN,
             "baseline" => Capabilities::BASELINE,
+            "ansi16" => Capabilities {
+                color_level: ColorLevel::Ansi16,
+                ..Capabilities::BASELINE
+            },
+            "monochrome" => Capabilities {
+                color_level: ColorLevel::Monochrome,
+                ..Capabilities::BASELINE
+            },
             value => panic!("unknown capabilities {value}"),
         };
         assert_eq!(
@@ -63,8 +106,65 @@ fn output_matches_shared_fixtures() {
     }
 }
 
+#[test]
+fn output_origin_matches_shared_fixtures() {
+    let Some(records) = support::load(
+        "vt/output-origin.txt",
+        "vt-output-origin",
+        &["capabilities", "origin", "operations", "expected"],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let capabilities = match record.field("capabilities") {
+            "modern" => Capabilities::MODERN,
+            "baseline" => Capabilities::BASELINE,
+            "ansi16" => Capabilities {
+                color_level: ColorLevel::Ansi16,
+                ..Capabilities::BASELINE
+            },
+            "monochrome" => Capabilities {
+                color_level: ColorLevel::Monochrome,
+                ..Capabilities::BASELINE
+            },
+            value => panic!("unknown capabilities {value}"),
+        };
+        let [origin_x, origin_y] = pair(record.field("origin"));
+        assert_eq!(
+            encode_at(
+                &fixture_operations(record.field("operations")),
+                capabilities,
+                origin_x,
+                origin_y,
+            ),
+            record.decoded("expected"),
+            "case {}",
+            record.id
+        );
+    }
+}
+
+fn pair(value: &str) -> [u32; 2] {
+    let mut fields = value.split(',');
+    let result = [
+        unsigned(fields.next().expect("pair has first value")),
+        unsigned(fields.next().expect("pair has second value")),
+    ];
+    assert!(fields.next().is_none(), "pair has exactly two values");
+    result
+}
+
 fn decode_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Vec<Event> {
+    decode_protocol_chunks(chunks, false)
+}
+
+fn decode_protocol_chunks<'a>(
+    chunks: impl IntoIterator<Item = &'a [u8]>,
+    kitty_keyboard_mode: bool,
+) -> Vec<Event> {
     let mut decoder = Decoder::new();
+    decoder.set_kitty_keyboard_mode(kitty_keyboard_mode);
     let mut events = Vec::new();
     for chunk in chunks {
         events.extend(decoder.feed(chunk));
@@ -100,6 +200,7 @@ fn canonical_event(event: &Event) -> String {
             },
             match key.protocol {
                 KeyProtocol::Legacy => "legacy",
+                KeyProtocol::Kitty => "kitty",
                 KeyProtocol::Unknown => "unknown",
             }
         ),
@@ -141,6 +242,7 @@ fn key_code(code: KeyCode) -> String {
         KeyCode::PageUp => "page-up".to_owned(),
         KeyCode::PageDown => "page-down".to_owned(),
         KeyCode::Function(number) => format!("f{number}"),
+        KeyCode::Functional(number) => format!("functional-{number}"),
         KeyCode::Unknown => "unknown".to_owned(),
     }
 }
@@ -170,8 +272,20 @@ fn modifiers(modifiers: Modifiers) -> String {
     if modifiers.control {
         names.push("control");
     }
+    if modifiers.super_key {
+        names.push("super");
+    }
+    if modifiers.hyper {
+        names.push("hyper");
+    }
     if modifiers.meta {
         names.push("meta");
+    }
+    if modifiers.caps_lock {
+        names.push("caps-lock");
+    }
+    if modifiers.num_lock {
+        names.push("num-lock");
     }
     if names.is_empty() {
         "-".to_owned()
@@ -212,6 +326,14 @@ fn fixture_operations(value: &str) -> Vec<TerminalOp> {
                     dx: signed(dx),
                     dy: signed(dy),
                 },
+                ["request-cursor-position"] => TerminalOp::RequestCursorPosition,
+                ["request-primary-device-attributes"] => TerminalOp::RequestPrimaryDeviceAttributes,
+                ["query-keyboard-enhancements"] => TerminalOp::QueryKeyboardEnhancements,
+                ["push-keyboard-enhancements", "nagi"] => {
+                    TerminalOp::PushKeyboardEnhancements(KeyboardEnhancements::NAGI)
+                }
+                ["pop-keyboard-enhancements"] => TerminalOp::PopKeyboardEnhancements,
+                ["next-line"] => TerminalOp::NextLine,
                 ["set-style", style] => TerminalOp::SetStyle(fixture_style(style)),
                 ["reset-style"] => TerminalOp::ResetStyle,
                 ["write", text] => TerminalOp::WriteText(fixture_scalar_text(text)),
@@ -228,6 +350,8 @@ fn fixture_operations(value: &str) -> Vec<TerminalOp> {
                 ["disable-mouse"] => TerminalOp::DisableMouse,
                 ["enable-focus"] => TerminalOp::EnableFocus,
                 ["disable-focus"] => TerminalOp::DisableFocus,
+                ["set-clipboard", "-"] => TerminalOp::SetClipboard(String::new()),
+                ["set-clipboard", text] => TerminalOp::SetClipboard(fixture_scalar_text(text)),
                 ["begin-sync"] => TerminalOp::BeginSynchronizedUpdate,
                 ["end-sync"] => TerminalOp::EndSynchronizedUpdate,
                 _ => panic!("invalid terminal operation {operation}"),

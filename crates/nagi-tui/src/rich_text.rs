@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use nagi_text::{WidthProfile, grapheme_width, graphemes};
 use nagi_vt::Style;
 
-use crate::{HorizontalAlignment, Size};
+use crate::{HorizontalAlignment, Point, Size, TextHit};
 
 /// Automatic paragraph line-wrapping behavior
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -18,7 +20,7 @@ pub enum WrapMode {
 /// One styled run of paragraph text
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextSpan {
-    text: String,
+    text: Arc<str>,
     style: Style,
 }
 
@@ -27,7 +29,7 @@ impl TextSpan {
     #[must_use]
     pub fn new(text: impl Into<String>, style: Style) -> Self {
         Self {
-            text: text.into(),
+            text: Arc::from(text.into()),
             style,
         }
     }
@@ -42,6 +44,13 @@ impl TextSpan {
     #[must_use]
     pub const fn style(&self) -> Style {
         self.style
+    }
+
+    /// Returns this span with a replacement style while sharing its text
+    #[must_use]
+    pub fn with_style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
     }
 }
 
@@ -92,15 +101,76 @@ struct ParagraphLayoutEntry {
     size: Size,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_span_clones_share_text_storage() {
+        let span = TextSpan::new("shared text", Style::default());
+        let clone = span.clone();
+        assert_eq!(span, clone);
+        assert!(std::ptr::eq(span.text().as_ptr(), clone.text().as_ptr()));
+    }
+
+    #[test]
+    fn paragraph_unit_keeps_pointer_metadata_compact() {
+        assert!(std::mem::size_of::<ParagraphUnit>() <= 32);
+    }
+
+    #[test]
+    fn paragraph_pointer_metadata_is_lazy() {
+        let spans = [TextSpan::new("text", Style::default())];
+        let mut cache = ParagraphLayoutCache::default();
+        cache.resolve(&spans, 4, true, WrapMode::Word, WidthProfile::MODERN);
+        assert!(cache.pointer.is_none());
+
+        cache.text_hit(
+            &spans,
+            4,
+            ParagraphOptions::default(),
+            WidthProfile::MODERN,
+            Point::new(0, 0),
+        );
+        assert!(cache.pointer.is_some());
+    }
+
+    #[test]
+    fn paragraph_hit_clamps_rows_outside_the_layout() {
+        let spans = [TextSpan::new("a\nb", Style::default())];
+        let mut cache = ParagraphLayoutCache::default();
+        let options = ParagraphOptions {
+            wrap: WrapMode::None,
+            alignment: HorizontalAlignment::Start,
+        };
+
+        assert_eq!(
+            cache.text_hit(&spans, 1, options, WidthProfile::MODERN, Point::new(0, -1)),
+            TextHit::new(0, 0)
+        );
+        assert_eq!(
+            cache.text_hit(&spans, 1, options, WidthProfile::MODERN, Point::new(0, 9)),
+            TextHit::new(3, 3)
+        );
+    }
+}
+
 pub(crate) struct ParagraphLayout<'a> {
     pub(crate) units: &'a [ParagraphUnit],
     pub(crate) lines: &'a [ParagraphLine],
     pub(crate) size: Size,
+    pointer: Option<&'a ParagraphPointerMetadata>,
+}
+
+struct ParagraphPointerMetadata {
+    span_offsets: Vec<usize>,
+    cell_starts: Vec<u32>,
 }
 
 #[derive(Default)]
 pub(crate) struct ParagraphLayoutCache {
     units: Option<Vec<ParagraphUnit>>,
+    pointer: Option<Box<ParagraphPointerMetadata>>,
     entries: [Option<ParagraphLayoutEntry>; 2],
     next: usize,
 }
@@ -112,7 +182,11 @@ impl ParagraphLayoutCache {
         max_width: u32,
         bounded: bool,
         mode: WrapMode,
+        profile: WidthProfile<'static>,
     ) -> ParagraphLayout<'_> {
+        if self.units.is_none() {
+            self.units = Some(span_units(spans, profile));
+        }
         let key = ParagraphLayoutKey {
             max_width,
             bounded,
@@ -123,7 +197,7 @@ impl ParagraphLayoutCache {
             .iter()
             .position(|entry| entry.as_ref().is_some_and(|entry| entry.key == key));
         if entry_index.is_none() {
-            let units = self.units.get_or_insert_with(|| span_units(spans));
+            let units = self.units.as_deref().unwrap_or_default();
             let lines = layout_lines(units, max_width, bounded, mode);
             let size = paragraph_layout_size(&lines);
             let index = self
@@ -142,7 +216,29 @@ impl ParagraphLayoutCache {
             units: self.units.as_deref().unwrap_or_default(),
             lines: &entry.lines,
             size: entry.size,
+            pointer: self.pointer.as_deref(),
         }
+    }
+
+    pub(crate) fn text_hit(
+        &mut self,
+        spans: &[TextSpan],
+        width: u32,
+        options: ParagraphOptions,
+        profile: WidthProfile<'static>,
+        position: Point,
+    ) -> TextHit {
+        if self.units.is_none() {
+            self.units = Some(span_units(spans, profile));
+        }
+        if self.pointer.is_none() {
+            self.pointer = Some(Box::new(paragraph_pointer_metadata(
+                spans,
+                self.units.as_deref().unwrap_or_default(),
+            )));
+        }
+        let layout = self.resolve(spans, width, true, options.wrap, profile);
+        paragraph_text_hit(&layout, width, options.alignment, position)
     }
 }
 
@@ -203,7 +299,7 @@ fn layout_lines(
     lines
 }
 
-fn span_units(spans: &[TextSpan]) -> Vec<ParagraphUnit> {
+fn span_units(spans: &[TextSpan], profile: WidthProfile<'static>) -> Vec<ParagraphUnit> {
     let capacity = spans
         .iter()
         .try_fold(0_usize, |total, span| {
@@ -224,7 +320,7 @@ fn span_units(spans: &[TextSpan]) -> Vec<ParagraphUnit> {
                 });
                 continue;
             }
-            let width = grapheme_width(grapheme.text(), WidthProfile::MODERN)
+            let width = grapheme_width(grapheme.text(), profile)
                 .max(1)
                 .min(u32::MAX as usize) as u32;
             units.push(ParagraphUnit {
@@ -238,6 +334,121 @@ fn span_units(spans: &[TextSpan]) -> Vec<ParagraphUnit> {
         }
     }
     units
+}
+
+fn paragraph_pointer_metadata(
+    spans: &[TextSpan],
+    units: &[ParagraphUnit],
+) -> ParagraphPointerMetadata {
+    let mut logical_cell = 0_u32;
+    let mut cell_starts = Vec::with_capacity(units.len());
+    for unit in units {
+        cell_starts.push(logical_cell);
+        if unit.break_line {
+            logical_cell = 0;
+        } else {
+            logical_cell = logical_cell.saturating_add(unit.width);
+        }
+    }
+    ParagraphPointerMetadata {
+        span_offsets: paragraph_span_offsets(spans),
+        cell_starts,
+    }
+}
+
+fn paragraph_span_offsets(spans: &[TextSpan]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(spans.len().saturating_add(1));
+    offsets.push(0_usize);
+    for span in spans {
+        let next = offsets
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(span.text.len());
+        offsets.push(next);
+    }
+    offsets
+}
+
+fn paragraph_text_hit(
+    layout: &ParagraphLayout<'_>,
+    width: u32,
+    alignment: HorizontalAlignment,
+    position: Point,
+) -> TextHit {
+    let pointer = layout
+        .pointer
+        .expect("pointer metadata is prepared for text hit");
+    let document_len = pointer.span_offsets.last().copied().unwrap_or(0);
+    if position.y < 0 {
+        return TextHit::new(0, 0);
+    }
+    let Ok(line_index) = usize::try_from(position.y) else {
+        return TextHit::new(document_len, document_len);
+    };
+    let Some(line) = layout.lines.get(line_index) else {
+        return TextHit::new(document_len, document_len);
+    };
+    let line_start = layout.units.get(line.start).map_or(document_len, |unit| {
+        paragraph_unit_hit(layout, unit).start()
+    });
+    let line_end = line
+        .end
+        .checked_sub(1)
+        .and_then(|index| layout.units.get(index))
+        .map_or(line_start, |unit| paragraph_unit_hit(layout, unit).end());
+    let desired = line.width.min(width);
+    let line_x = i64::from(paragraph_alignment_offset(width, desired, alignment));
+    let pointer_x = i64::from(position.x);
+    if pointer_x < line_x {
+        return TextHit::new(line_start, line_start);
+    }
+    let units = &layout.units[line.start..line.end];
+    let cell_starts = &pointer.cell_starts[line.start..line.end];
+    let relative = u64::try_from(pointer_x.saturating_sub(line_x)).unwrap_or(u64::MAX);
+    let line_cell_start = cell_starts.first().copied().unwrap_or(0);
+    let target = u64::from(line_cell_start).saturating_add(relative);
+    let mut low = 0_usize;
+    let mut high = units.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let cell_end =
+            u64::from(cell_starts[middle]).saturating_add(u64::from(units[middle].width));
+        if cell_end <= target {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let index = low;
+    if let Some(unit) = units.get(index) {
+        return paragraph_unit_hit(layout, unit);
+    }
+    TextHit::new(line_end, line_end)
+}
+
+fn paragraph_unit_hit(layout: &ParagraphLayout<'_>, unit: &ParagraphUnit) -> TextHit {
+    let span_offsets = &layout
+        .pointer
+        .expect("pointer metadata is prepared for text hit")
+        .span_offsets;
+    let base = span_offsets
+        .get(unit.span)
+        .copied()
+        .unwrap_or_else(|| span_offsets.last().copied().unwrap_or(0));
+    TextHit::new(
+        base.saturating_add(unit.start),
+        base.saturating_add(unit.end),
+    )
+}
+
+fn paragraph_alignment_offset(available: u32, desired: u32, alignment: HorizontalAlignment) -> u32 {
+    let remaining = available.saturating_sub(desired.min(available));
+    match alignment {
+        HorizontalAlignment::Start => 0,
+        HorizontalAlignment::Center => remaining / 2,
+        HorizontalAlignment::End => remaining,
+    }
 }
 
 fn last_space(units: &[ParagraphUnit], start: usize, end: usize) -> Option<usize> {

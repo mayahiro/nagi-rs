@@ -1,6 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::NodeId;
+use crate::virtual_flow::{VirtualFlowInteraction, VirtualFlowWindow};
+use crate::{
+    ModalFocusOptions, ModalInitialFocus, ModalReturnFocus, NodeId, VirtualFlowSource,
+    VirtualFlowState,
+};
 
 #[cfg(test)]
 use crate::fixture_support;
@@ -119,6 +123,20 @@ pub struct InteractionState {
     pub(crate) pointer_capture: Option<NodeId>,
     pub(crate) text_inputs: HashMap<NodeId, TextInputState>,
     pub(crate) scrolls: HashMap<NodeId, ScrollInteraction>,
+    pub(crate) virtual_flows: HashMap<NodeId, VirtualFlowInteraction>,
+    modal_focus_stack: Vec<ModalFocusFrame>,
+}
+
+#[derive(Clone, Debug)]
+struct ModalFocusFrame {
+    id: NodeId,
+    return_focus: Option<NodeId>,
+}
+
+enum FocusLifecycleTransition {
+    Stable,
+    Enter(ModalInitialFocus),
+    Exit(Option<NodeId>),
 }
 
 impl InteractionState {
@@ -160,6 +178,14 @@ impl InteractionState {
             .get(id)
             .filter(|scroll| scroll.initialized)
             .map(|scroll| scroll.state)
+    }
+
+    /// Returns resolved variable-height flow state for a node
+    #[must_use]
+    pub fn virtual_flow_state(&self, id: &NodeId) -> Option<&VirtualFlowState> {
+        self.virtual_flows
+            .get(id)
+            .and_then(VirtualFlowInteraction::state)
     }
 
     pub(crate) fn ensure_text_input(&mut self, id: &NodeId, value: &str) {
@@ -221,17 +247,165 @@ impl InteractionState {
         scroll.state
     }
 
+    pub(crate) fn prepare_virtual_flow<Message>(
+        &mut self,
+        id: &NodeId,
+        source: &VirtualFlowSource<Message>,
+        width: u32,
+        viewport_height: u32,
+        overscan: u32,
+        stick_to_end: bool,
+    ) -> VirtualFlowWindow {
+        let scroll = self.scrolls.get(id).copied().unwrap_or_default();
+        let preserved = self.virtual_flows.get(id).and_then(|flow| {
+            flow.capture_anchor(scroll.state.offset.y, viewport_height, scroll.following_end)
+        });
+        let follows_end = scroll_follows_end_on_prepare(scroll, stick_to_end);
+        let flow = self.virtual_flows.entry(id.clone()).or_default();
+        flow.reconcile(source, width);
+        let anchor_offset = preserved
+            .as_ref()
+            .map(|anchor| flow.resolve_anchor(anchor, viewport_height));
+        let maximum = ScrollOffset::new(0, flow.total_height().saturating_sub(viewport_height));
+        let scroll = self.scrolls.entry(id.clone()).or_default();
+        if scroll.requested.is_none() && !follows_end {
+            if let Some(offset) = anchor_offset {
+                scroll.state.offset = ScrollOffset::new(0, offset);
+            }
+        }
+        let prepared =
+            resolve_prepared_scroll(*scroll, maximum, ScrollAxis::Vertical, stick_to_end);
+        scroll.requested = None;
+        scroll.axis = ScrollAxis::Vertical;
+        scroll.stick_to_end = stick_to_end;
+        scroll.state = prepared.state;
+        scroll.following_end = prepared.following_end;
+        scroll.initialized = true;
+        flow.resolve_window(
+            prepared.state,
+            viewport_height,
+            overscan,
+            prepared.following_end,
+        )
+    }
+
+    pub(crate) fn apply_virtual_flow_measurements(
+        &mut self,
+        id: &NodeId,
+        measurements: &[(usize, u32)],
+        viewport_height: u32,
+        overscan: u32,
+        stick_to_end: bool,
+    ) -> Option<VirtualFlowWindow> {
+        let scroll_snapshot = self.scrolls.get(id).copied().unwrap_or_default();
+        let flow = self.virtual_flows.get_mut(id)?;
+        let preserved = flow.capture_anchor(
+            scroll_snapshot.state.offset.y,
+            viewport_height,
+            scroll_snapshot.following_end,
+        );
+        let mut changed = false;
+        for &(index, height) in measurements {
+            changed |= flow.set_measured(index, height);
+        }
+        if !changed {
+            return Some(flow.resolve_window(
+                scroll_snapshot.state,
+                viewport_height,
+                overscan,
+                scroll_snapshot.following_end,
+            ));
+        }
+        let follows_end = scroll_follows_end_on_prepare(scroll_snapshot, stick_to_end);
+        let anchor_offset = preserved
+            .as_ref()
+            .map(|anchor| flow.resolve_anchor(anchor, viewport_height));
+        let maximum = ScrollOffset::new(0, flow.total_height().saturating_sub(viewport_height));
+        let scroll = self.scrolls.get_mut(id)?;
+        if scroll.requested.is_none() && !follows_end {
+            if let Some(offset) = anchor_offset {
+                scroll.state.offset = ScrollOffset::new(0, offset);
+            }
+        }
+        let prepared =
+            resolve_prepared_scroll(*scroll, maximum, ScrollAxis::Vertical, stick_to_end);
+        scroll.requested = None;
+        scroll.axis = ScrollAxis::Vertical;
+        scroll.stick_to_end = stick_to_end;
+        scroll.state = prepared.state;
+        scroll.following_end = prepared.following_end;
+        scroll.initialized = true;
+        Some(flow.resolve_window(
+            prepared.state,
+            viewport_height,
+            overscan,
+            prepared.following_end,
+        ))
+    }
+
+    pub(crate) fn virtual_flow_item_layout(
+        &self,
+        id: &NodeId,
+        index: usize,
+    ) -> Option<(u32, u32, bool)> {
+        let flow = self.virtual_flows.get(id)?;
+        Some((
+            flow.origin(index),
+            flow.height(index),
+            flow.is_measured(index),
+        ))
+    }
+
     pub(crate) fn reconcile(
         &mut self,
         active: &HashSet<NodeId>,
         previous_focus_order: &[NodeId],
         current_focus_order: &[NodeId],
+        active_modal: Option<(&NodeId, &ModalFocusOptions)>,
+        focus_fallback: Option<&NodeId>,
     ) {
-        self.focused = reconcile_focus(
-            previous_focus_order,
-            current_focus_order,
-            self.focused.as_ref(),
-        );
+        let transition = self.reconcile_modal_focus(active, active_modal);
+        self.focused = match transition {
+            FocusLifecycleTransition::Enter(ModalInitialFocus::First) => {
+                current_focus_order.first().cloned()
+            }
+            FocusLifecycleTransition::Enter(ModalInitialFocus::Target(target)) => {
+                if current_focus_order.contains(&target) {
+                    Some(target)
+                } else {
+                    current_focus_order.first().cloned()
+                }
+            }
+            FocusLifecycleTransition::Enter(ModalInitialFocus::None) => None,
+            FocusLifecycleTransition::Exit(Some(target)) => {
+                if current_focus_order.contains(&target) {
+                    Some(target)
+                } else {
+                    reconcile_focus(
+                        previous_focus_order,
+                        current_focus_order,
+                        self.focused.as_ref(),
+                    )
+                }
+            }
+            FocusLifecycleTransition::Exit(None) => None,
+            FocusLifecycleTransition::Stable => {
+                if self
+                    .focused
+                    .as_ref()
+                    .is_some_and(|focused| !current_focus_order.contains(focused))
+                    && focus_fallback.is_some_and(|target| current_focus_order.contains(target))
+                {
+                    focus_fallback.cloned()
+                } else {
+                    reconcile_focus(
+                        previous_focus_order,
+                        current_focus_order,
+                        self.focused.as_ref(),
+                    )
+                }
+            }
+        };
         if self
             .pointer_capture
             .as_ref()
@@ -241,6 +415,58 @@ impl InteractionState {
         }
         self.text_inputs.retain(|id, _| active.contains(id));
         self.scrolls.retain(|id, _| active.contains(id));
+        self.virtual_flows.retain(|id, _| active.contains(id));
+    }
+
+    fn reconcile_modal_focus(
+        &mut self,
+        active: &HashSet<NodeId>,
+        active_modal: Option<(&NodeId, &ModalFocusOptions)>,
+    ) -> FocusLifecycleTransition {
+        let Some((modal, options)) = active_modal else {
+            if self.modal_focus_stack.is_empty() {
+                return FocusLifecycleTransition::Stable;
+            }
+            let return_focus = self.modal_focus_stack[0].return_focus.clone();
+            self.modal_focus_stack.clear();
+            return FocusLifecycleTransition::Exit(return_focus);
+        };
+
+        if let Some(position) = self
+            .modal_focus_stack
+            .iter()
+            .position(|frame| &frame.id == modal)
+        {
+            if position + 1 == self.modal_focus_stack.len() {
+                return FocusLifecycleTransition::Stable;
+            }
+            let return_focus = self.modal_focus_stack[position + 1].return_focus.clone();
+            self.modal_focus_stack.truncate(position + 1);
+            return FocusLifecycleTransition::Exit(return_focus);
+        }
+
+        let mut previous_focus = self.focused.clone();
+        while self
+            .modal_focus_stack
+            .last()
+            .is_some_and(|frame| !active.contains(&frame.id))
+        {
+            previous_focus = self
+                .modal_focus_stack
+                .pop()
+                .expect("checked non-empty modal focus stack")
+                .return_focus;
+        }
+        let return_focus = match &options.return_focus {
+            ModalReturnFocus::Previous => previous_focus,
+            ModalReturnFocus::Target(target) => Some(target.clone()),
+            ModalReturnFocus::None => None,
+        };
+        self.modal_focus_stack.push(ModalFocusFrame {
+            id: modal.clone(),
+            return_focus,
+        });
+        FocusLifecycleTransition::Enter(options.initial.clone())
     }
 }
 
@@ -276,6 +502,13 @@ fn resolve_prepared_scroll(
         state,
         following_end,
     }
+}
+
+fn scroll_follows_end_on_prepare(scroll: ScrollInteraction, stick_to_end: bool) -> bool {
+    (!scroll.initialized && stick_to_end)
+        || (scroll.initialized
+            && stick_to_end
+            && (scroll.following_end || (!scroll.stick_to_end && scroll.state.at_end)))
 }
 
 pub(crate) fn normalize_scroll_offset(axis: ScrollAxis, offset: ScrollOffset) -> ScrollOffset {
@@ -449,6 +682,8 @@ mod tests {
                 &active,
                 &ids(record.field("previous-focus")),
                 &ids(record.field("current-focus")),
+                None,
+                None,
             );
 
             assert_eq!(

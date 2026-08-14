@@ -81,6 +81,41 @@ fn command_local_scopes_match_shared_fixtures() {
 }
 
 #[test]
+fn inherited_options_match_shared_fixtures() {
+    let command = inherited_fixture_command();
+    for record in support::load(
+        "cli/inherited-options.txt",
+        "cli-inherited-options",
+        &["argv", "env", "expected"],
+    ) {
+        let snapshot = match command.parse_with_environment(
+            arguments(&record.bytes("argv")),
+            environment(&record.bytes("env")),
+        ) {
+            Ok(ParseResult::Invocation(invocation)) => snapshot_scoped_invocation(&invocation),
+            Ok(_) => panic!("case {} did not produce an Invocation", record.id),
+            Err(error) => snapshot_inherited_error(&error),
+        };
+        assert_eq!(snapshot, record.field("expected"), "case {}", record.id);
+    }
+}
+
+#[test]
+fn inherited_option_validation_matches_shared_fixtures() {
+    for record in support::load(
+        "cli/inherited-option-validation.txt",
+        "cli-inherited-option-validation",
+        &["shape", "expected"],
+    ) {
+        let snapshot = match inherited_validation_command(record.field("shape")).validate() {
+            Ok(()) => "ok",
+            Err(error) => error.code().as_str(),
+        };
+        assert_eq!(snapshot, record.field("expected"), "case {}", record.id);
+    }
+}
+
+#[test]
 fn errors_match_shared_fixtures() {
     let command = fixture_command();
     for record in support::load(
@@ -127,6 +162,7 @@ fn diagnostic_metadata_matches_shared_fixtures() {
                 let kind = match target.kind() {
                     nagi_cli::DiagnosticTargetKind::Option => "option",
                     nagi_cli::DiagnosticTargetKind::Argument => "argument",
+                    nagi_cli::DiagnosticTargetKind::ResponseFile => "response-file",
                 };
                 format!(
                     "{kind}@{}:{}",
@@ -209,6 +245,53 @@ fn help_presentation_matches_shared_fixtures() {
             .collect::<Vec<_>>()
             .join("|");
         assert_eq!(snapshot, record.field("expected"), "case {}", record.id);
+    }
+}
+
+#[test]
+fn inherited_option_help_matches_shared_fixtures() {
+    let command = inherited_help_command();
+    for record in support::load(
+        "cli/inherited-option-help.txt",
+        "cli-inherited-option-help",
+        &["path", "structured", "expected"],
+    ) {
+        let path = record
+            .field("path")
+            .split('/')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut command_path = vec!["root".to_owned()];
+        command_path.extend(path);
+        let document = command
+            .help_document(&command_path)
+            .unwrap_or_else(|error| panic!("case {} failed: {error}", record.id));
+        let structured = document
+            .inherited_options()
+            .iter()
+            .map(|option| {
+                format!(
+                    "{}@{}:{}={}",
+                    option.command_id_path().join("/"),
+                    option.command_path().join("/"),
+                    option.id(),
+                    option.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        assert_eq!(
+            structured,
+            record.field("structured"),
+            "case {} structured",
+            record.id
+        );
+        assert_eq!(
+            command.render_help(&command_path).unwrap(),
+            record.text("expected"),
+            "case {} rendered",
+            record.id
+        );
     }
 }
 
@@ -416,6 +499,150 @@ fn fixture_command() -> Command {
         )
 }
 
+fn inherited_fixture_command() -> Command {
+    Command::new("root")
+        .id("root-id")
+        .option(
+            OptionSpec::count("verbose")
+                .long("verbose")
+                .short('v')
+                .inherited(),
+        )
+        .option(
+            OptionSpec::value("config")
+                .long("config")
+                .short('c')
+                .environment("NAGI_CONFIG")
+                .default_value("default")
+                .inherited(),
+        )
+        .option(
+            OptionSpec::value("tag")
+                .long("tag")
+                .short('t')
+                .repeated()
+                .inherited(),
+        )
+        .option(
+            OptionSpec::value("jobs")
+                .long("jobs")
+                .parser(integer_parser())
+                .default_value("1")
+                .inherited(),
+        )
+        .option(OptionSpec::flag("root-only").long("root-only"))
+        .subcommand(
+            Command::new("run")
+                .id("run-id")
+                .option(OptionSpec::flag("dry-run").long("dry-run").short('n'))
+                .option(
+                    OptionSpec::value("profile")
+                        .long("profile")
+                        .short('p')
+                        .inherited(),
+                )
+                .argument(Argument::new("args").repeated())
+                .subcommand(Command::new("exec").id("exec-id")),
+        )
+}
+
+fn inherited_validation_command(shape: &str) -> Command {
+    match shape {
+        "local-reuse" => Command::new("root")
+            .option(OptionSpec::flag("root-value").long("same"))
+            .subcommand(Command::new("child").option(OptionSpec::flag("child-value").long("same"))),
+        "ancestor-local-child-inherited" => Command::new("root")
+            .option(OptionSpec::flag("root-value").long("same"))
+            .subcommand(
+                Command::new("child")
+                    .option(OptionSpec::flag("child-value").long("same").inherited()),
+            ),
+        "ancestor-inherited-child-local-long" => Command::new("root")
+            .option(OptionSpec::flag("root-value").long("same").inherited())
+            .subcommand(Command::new("child").option(OptionSpec::flag("child-value").long("same"))),
+        "ancestor-inherited-child-local-short" => Command::new("root")
+            .option(OptionSpec::flag("root-value").short('s').inherited())
+            .subcommand(Command::new("child").option(OptionSpec::flag("child-value").short('s'))),
+        "ancestor-inherited-child-inherited" => Command::new("root")
+            .option(OptionSpec::flag("root-value").long("same").inherited())
+            .subcommand(
+                Command::new("child")
+                    .option(OptionSpec::flag("child-value").long("same").inherited()),
+            ),
+        "transitive-collision" => Command::new("root")
+            .option(OptionSpec::flag("root-value").long("same").inherited())
+            .subcommand(
+                Command::new("child").subcommand(
+                    Command::new("grandchild")
+                        .option(OptionSpec::flag("grandchild-value").long("same")),
+                ),
+            ),
+        "unrelated-siblings" => Command::new("root")
+            .subcommand(
+                Command::new("first")
+                    .option(OptionSpec::flag("first-value").long("same").inherited()),
+            )
+            .subcommand(
+                Command::new("second")
+                    .option(OptionSpec::flag("second-value").long("same").inherited()),
+            ),
+        "same-id-different-spelling" => Command::new("root")
+            .option(OptionSpec::flag("value").long("root-value").inherited())
+            .subcommand(
+                Command::new("child").option(OptionSpec::flag("value").long("child-value")),
+            ),
+        value => panic!("unknown inherited option validation shape {value}"),
+    }
+}
+
+fn inherited_help_command() -> Command {
+    Command::new("root")
+        .id("root-id")
+        .option(
+            OptionSpec::count("verbose")
+                .long("verbose")
+                .short('v')
+                .help("Increase verbosity")
+                .inherited(),
+        )
+        .option(
+            OptionSpec::value("config")
+                .long("config")
+                .short('c')
+                .help("Configuration path")
+                .inherited(),
+        )
+        .subcommand(
+            Command::new("run")
+                .id("run-id")
+                .about("Run command")
+                .option(
+                    OptionSpec::flag("dry-run")
+                        .long("dry-run")
+                        .short('n')
+                        .help("Dry run"),
+                )
+                .option(
+                    OptionSpec::value("profile")
+                        .long("profile")
+                        .short('p')
+                        .help("Execution profile")
+                        .inherited(),
+                )
+                .subcommand(
+                    Command::new("exec")
+                        .id("exec-id")
+                        .about("Execute command")
+                        .option(
+                            OptionSpec::flag("trace")
+                                .long("trace")
+                                .short('x')
+                                .help("Trace execution"),
+                        ),
+                ),
+        )
+}
+
 fn runtime_command() -> Command {
     Command::new("nagi")
         .about("Nagi fixture command")
@@ -536,11 +763,80 @@ fn snapshot_invocation(invocation: &Invocation) -> String {
     )
 }
 
+fn snapshot_scoped_invocation(invocation: &Invocation) -> String {
+    let scopes = invocation
+        .scopes()
+        .map(|scope| {
+            let mut values = Vec::new();
+            for id in scope.value_ids() {
+                if scope.flag(id).is_some() {
+                    values.push(format!("{id}=flag"));
+                } else if let Some(count) = scope.count(id) {
+                    values.push(format!("{id}=count:{count}"));
+                } else if let Some(parsed) = scope.parsed_values(id) {
+                    if !scope.is_repeated(id) {
+                        values.push(format!(
+                            "{id}=value:{}:{}",
+                            source(parsed[0].source()),
+                            hex(parsed[0].raw().as_bytes())
+                        ));
+                    } else {
+                        let joined = parsed
+                            .iter()
+                            .map(|value| {
+                                format!(
+                                    "{}:{}",
+                                    source(value.source()),
+                                    hex(value.raw().as_bytes())
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("+");
+                        values.push(format!("{id}=values:{joined}"));
+                    }
+                }
+            }
+            format!(
+                "{}{{{}}}",
+                scope.command_id_path().join("/"),
+                values.join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "ok;command={};scopes={scopes}",
+        invocation.command_path().join("/")
+    )
+}
+
+fn snapshot_inherited_error(error: &Diagnostic) -> String {
+    let targets = error
+        .targets()
+        .iter()
+        .map(|target| {
+            let kind = match target.kind() {
+                nagi_cli::DiagnosticTargetKind::Option => "option",
+                nagi_cli::DiagnosticTargetKind::Argument => "argument",
+                nagi_cli::DiagnosticTargetKind::ResponseFile => "response-file",
+            };
+            format!(
+                "{kind}@{}:{}",
+                target.command_id_path().join("/"),
+                target.value_id()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    format!("error;code={};targets={targets}", error.code().as_str())
+}
+
 fn source(source: ValueSource) -> &'static str {
     match source {
         ValueSource::CommandLine => "cli",
         ValueSource::Environment => "env",
         ValueSource::Default => "default",
+        ValueSource::External => "external",
     }
 }
 

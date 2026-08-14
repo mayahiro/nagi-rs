@@ -5,24 +5,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nagi_surface::SurfaceError;
+use nagi_text::WidthProfile;
 use nagi_vt::{Event, KeyAction, KeyCode, MouseButton, MouseKind, TerminalOp};
 
-use crate::effect::RuntimeCommand;
+use crate::action_routing::{
+    ActionIndex, CoreActionMatch, ResolvedActionRoute, route_needs_action_resolution,
+    validate_action_owners,
+};
+use crate::core_action::{CoreAction, default_focus_action};
+use crate::effect::{ClipboardRequest, RuntimeCommand};
 use crate::renderer::operations;
-use crate::routing::{FocusChange, InteractiveKind, PointerChange, TreeIndex};
+use crate::routing::{
+    FocusChange, InteractiveKind, PointerChange, PointerEventContext, PointerViewport, TreeIndex,
+};
+use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeDiagnostics, RuntimeNoticeQueue};
 use crate::subscription_supervisor::{
     SubscriptionDiagnostics, SubscriptionReconciliation, SubscriptionSupervisor, SubscriptionTag,
 };
 use crate::supervisor::{EffectDiagnostics, EffectSupervisor};
 use crate::text_edit::{TextEdit, apply_text_edit, normalize_cursor};
 use crate::wake::WakeHandle;
+use crate::worker_tracker::WorkerTracker;
 use crate::{
-    App, Clock, EventDispatch, EventResult, InteractionState, Node, NodeId, Point, ScrollOffset,
-    Size, SubscriptionKey, Surface, SystemClock, TaskKey, Timestamp,
+    App, BindingConflict, Clock, EventDispatch, EventResult, InteractionState, Node, NodeId, Point,
+    Rect, ResolvedActions, ScrollOffset, Size, SubscriptionKey, Surface, SystemClock, TaskKey,
+    TerminalCapabilityProfile, Timestamp,
 };
 
 /// The default maximum number of messages waiting in a runtime queue
 pub const DEFAULT_QUEUE_CAPACITY: usize = 4_096;
+
+/// The default maximum number of application updates in one scheduling cycle
+pub const DEFAULT_MAX_UPDATES_PER_CYCLE: usize = 64;
 
 /// The default maximum number of effect tasks executing concurrently
 pub const DEFAULT_TASK_LIMIT: usize = 64;
@@ -30,19 +44,32 @@ pub const DEFAULT_TASK_LIMIT: usize = 64;
 /// The default per-source subscription inbox capacity
 pub const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 256;
 
+/// The default maximum number of retained asynchronous lifecycle notices
+pub const DEFAULT_RUNTIME_NOTICE_CAPACITY: usize = 256;
+
 /// Runtime construction settings
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct RuntimeConfig {
     /// Initial terminal cell size
     pub size: Size,
     /// Maximum number of messages waiting for sequential processing
     pub queue_capacity: usize,
+    /// Maximum number of application updates in one scheduling cycle
+    pub max_updates_per_cycle: usize,
     /// Maximum number of effect tasks executing concurrently
     pub task_limit: usize,
     /// Maximum pending values retained by each subscription source
     pub subscription_capacity: usize,
+    /// Maximum retained asynchronous lifecycle notices
+    pub runtime_notice_capacity: usize,
     /// Smallest interval between non-urgent rendered frames
     pub minimum_frame_interval: Duration,
+    /// Terminal cell-width policy used by the complete view
+    ///
+    /// A Custom override must return stable widths for this Runtime's lifetime
+    pub width_profile: WidthProfile<'static>,
+    /// Terminal features available to application views
+    pub terminal_capabilities: TerminalCapabilityProfile,
 }
 
 impl RuntimeConfig {
@@ -52,9 +79,13 @@ impl RuntimeConfig {
         Self {
             size,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            max_updates_per_cycle: DEFAULT_MAX_UPDATES_PER_CYCLE,
             task_limit: DEFAULT_TASK_LIMIT,
             subscription_capacity: DEFAULT_SUBSCRIPTION_CAPACITY,
+            runtime_notice_capacity: DEFAULT_RUNTIME_NOTICE_CAPACITY,
             minimum_frame_interval: Duration::ZERO,
+            width_profile: WidthProfile::MODERN,
+            terminal_capabilities: TerminalCapabilityProfile::UNKNOWN,
         }
     }
 }
@@ -64,16 +95,22 @@ impl RuntimeConfig {
 pub enum RuntimeError {
     /// Queue capacity must be greater than zero
     ZeroQueueCapacity,
+    /// Per-cycle application update limit must be greater than zero
+    ZeroMaxUpdatesPerCycle,
     /// Concurrent task limit must be greater than zero
     ZeroTaskLimit,
     /// Per-source subscription capacity must be greater than zero
     ZeroSubscriptionCapacity,
+    /// Runtime notice capacity must be greater than zero
+    ZeroRuntimeNoticeCapacity,
     /// A frame surface could not be constructed
     Surface(SurfaceError),
     /// Two nodes in one semantic tree used the same stable ID
     DuplicateNodeId(NodeId),
     /// Two subscription sources used the same stable key
     DuplicateSubscriptionKey(SubscriptionKey),
+    /// One active semantic action group has conflicting key bindings
+    BindingConflict(BindingConflict),
 }
 
 impl fmt::Display for RuntimeError {
@@ -82,15 +119,22 @@ impl fmt::Display for RuntimeError {
             Self::ZeroQueueCapacity => {
                 formatter.write_str("runtime queue capacity must be positive")
             }
+            Self::ZeroMaxUpdatesPerCycle => {
+                formatter.write_str("runtime maximum updates per cycle must be positive")
+            }
             Self::ZeroTaskLimit => formatter.write_str("runtime task limit must be positive"),
             Self::ZeroSubscriptionCapacity => {
                 formatter.write_str("runtime subscription capacity must be positive")
+            }
+            Self::ZeroRuntimeNoticeCapacity => {
+                formatter.write_str("runtime notice capacity must be positive")
             }
             Self::Surface(error) => write!(formatter, "construct runtime surface: {error}"),
             Self::DuplicateNodeId(id) => write!(formatter, "duplicate NodeId {id}"),
             Self::DuplicateSubscriptionKey(key) => {
                 write!(formatter, "duplicate SubscriptionKey {key}")
             }
+            Self::BindingConflict(error) => error.fmt(formatter),
         }
     }
 }
@@ -99,12 +143,21 @@ impl Error for RuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Surface(error) => Some(error),
+            Self::BindingConflict(error) => Some(error),
             Self::ZeroQueueCapacity
+            | Self::ZeroMaxUpdatesPerCycle
             | Self::ZeroTaskLimit
             | Self::ZeroSubscriptionCapacity
+            | Self::ZeroRuntimeNoticeCapacity
             | Self::DuplicateNodeId(_)
             | Self::DuplicateSubscriptionKey(_) => None,
         }
+    }
+}
+
+impl From<BindingConflict> for RuntimeError {
+    fn from(error: BindingConflict) -> Self {
+        Self::BindingConflict(error)
     }
 }
 
@@ -200,9 +253,12 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     size: Size,
     queue: VecDeque<QueuedMessage<Application::Message>>,
     queue_capacity: usize,
+    max_updates_per_cycle: usize,
     dirty: bool,
     urgent_frame: bool,
     minimum_frame_interval: Duration,
+    width_profile: WidthProfile<'static>,
+    terminal_capabilities: TerminalCapabilityProfile,
     last_frame: Option<Timestamp>,
     previous_surface: Option<Arc<Surface>>,
     spare_surface: Option<Surface>,
@@ -210,12 +266,20 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     view_tree: Option<Node<Application::Message>>,
     tree_index: TreeIndex,
     next_tree_index: TreeIndex,
+    action_index: ActionIndex<Application::Message>,
+    next_action_index: ActionIndex<Application::Message>,
+    resolved_action_route: Option<ResolvedActionRoute<Application::Message>>,
+    next_resolved_action_route: ResolvedActionRoute<Application::Message>,
+    event_route: Vec<NodeId>,
     effects: EffectSupervisor<Application::Message>,
     subscriptions: SubscriptionSupervisor<Application::Message>,
+    notices: Arc<RuntimeNoticeQueue>,
+    workers: WorkerTracker,
     subscriptions_dirty: bool,
     exit_requested: bool,
     pending_focus: Option<NodeId>,
     pending_scroll: Vec<(NodeId, ScrollOffset)>,
+    pending_clipboard: Option<ClipboardRequest>,
 }
 
 struct QueuedMessage<Message> {
@@ -249,18 +313,30 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         if config.queue_capacity == 0 {
             return Err(RuntimeError::ZeroQueueCapacity);
         }
+        if config.max_updates_per_cycle == 0 {
+            return Err(RuntimeError::ZeroMaxUpdatesPerCycle);
+        }
         if config.task_limit == 0 {
             return Err(RuntimeError::ZeroTaskLimit);
         }
         if config.subscription_capacity == 0 {
             return Err(RuntimeError::ZeroSubscriptionCapacity);
         }
+        if config.runtime_notice_capacity == 0 {
+            return Err(RuntimeError::ZeroRuntimeNoticeCapacity);
+        }
         let startup = app.init();
         let declared_subscriptions = app.subscriptions();
+        let notices = Arc::new(RuntimeNoticeQueue::new(config.runtime_notice_capacity));
+        let workers = WorkerTracker::default();
         let mut effects = EffectSupervisor::new(config.task_limit);
+        effects.set_notices(Arc::clone(&notices));
+        effects.set_worker_tracker(workers.clone());
         effects.set_wake(wake.clone());
         effects.schedule(startup, clock.now());
         let mut subscriptions = SubscriptionSupervisor::new(config.subscription_capacity);
+        subscriptions.set_notices(Arc::clone(&notices));
+        subscriptions.set_worker_tracker(workers.clone());
         subscriptions.set_wake(wake);
         subscriptions
             .reconcile(declared_subscriptions, clock.now())
@@ -271,9 +347,12 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             size: config.size,
             queue: VecDeque::with_capacity(config.queue_capacity.min(64)),
             queue_capacity: config.queue_capacity,
+            max_updates_per_cycle: config.max_updates_per_cycle,
             dirty: true,
             urgent_frame: true,
             minimum_frame_interval: config.minimum_frame_interval,
+            width_profile: config.width_profile,
+            terminal_capabilities: config.terminal_capabilities,
             last_frame: None,
             previous_surface: None,
             spare_surface: None,
@@ -281,12 +360,20 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             view_tree: None,
             tree_index: TreeIndex::default(),
             next_tree_index: TreeIndex::default(),
+            action_index: ActionIndex::default(),
+            next_action_index: ActionIndex::default(),
+            resolved_action_route: None,
+            next_resolved_action_route: ResolvedActionRoute::default(),
+            event_route: Vec::new(),
             effects,
             subscriptions,
+            notices,
+            workers,
             subscriptions_dirty: false,
             exit_requested: false,
             pending_focus: None,
             pending_scroll: Vec::new(),
+            pending_clipboard: None,
         };
         runtime.apply_effect_commands();
         Ok(runtime)
@@ -302,6 +389,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     pub fn app_mut(&mut self) -> &mut Application {
         self.dirty = true;
         self.subscriptions_dirty = true;
+        self.view_tree = None;
         &mut self.app
     }
 
@@ -309,6 +397,35 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     #[must_use]
     pub fn into_app(self) -> Application {
         self.app
+    }
+
+    /// Requests cooperative cancellation of active Effects and Subscriptions
+    /// without waiting for their producer functions to return
+    pub fn close(&mut self) {
+        self.effects.close();
+        self.subscriptions.close();
+        self.subscriptions_dirty = false;
+    }
+
+    /// Requests cooperative cancellation and waits until every Nagi-started
+    /// Effect and Stream producer function has returned
+    ///
+    /// A producer that ignores cancellation can block this call indefinitely.
+    /// Application-owned processes or workers started inside a producer are
+    /// outside this wait boundary
+    pub fn close_and_wait(&mut self) {
+        self.close();
+        self.workers.wait();
+    }
+
+    /// Requests cooperative cancellation and waits up to `timeout` for every
+    /// Nagi-started Effect and Stream producer function to return
+    ///
+    /// Returns false when the timeout expires. Cancellation remains requested,
+    /// and a later call may continue waiting
+    pub fn close_and_wait_timeout(&mut self, timeout: Duration) -> bool {
+        self.close();
+        self.workers.wait_timeout(timeout)
     }
 
     /// Returns runtime-owned Interaction State
@@ -323,12 +440,24 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.size
     }
 
+    /// Returns the latest clipboard request without clearing it
+    #[must_use]
+    pub const fn pending_clipboard_request(&self) -> Option<&ClipboardRequest> {
+        self.pending_clipboard.as_ref()
+    }
+
+    /// Takes and clears the latest pending clipboard request
+    pub fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
+        self.pending_clipboard.take()
+    }
+
     /// Changes terminal size and schedules a frame when it differs
     pub fn resize(&mut self, size: Size) {
         if self.size != size {
             self.size = size;
             self.dirty = true;
             self.urgent_frame = true;
+            self.view_tree = None;
         }
     }
 
@@ -350,18 +479,38 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.queue.len()
     }
 
+    /// Reports whether another scheduling cycle can apply an update without
+    /// waiting for input, a wake-up, or a future deadline
+    #[must_use]
+    pub fn has_pending_updates(&self) -> bool {
+        !self.queue.is_empty()
+            || self.effects.ready_messages() != 0
+            || self.subscriptions.time_until_deadline(self.clock.now()) == Some(Duration::ZERO)
+    }
+
     /// Polls due timers and completed tasks into the bounded message queue
     pub fn poll_effects(&mut self) -> usize {
+        self.poll_effects_up_to(self.queue_capacity)
+    }
+
+    fn poll_effects_up_to(&mut self, maximum: usize) -> usize {
         self.effects.poll(self.clock.now());
         self.apply_effect_commands();
-        let available = self.queue_capacity.saturating_sub(self.queue.len());
-        let messages = self.effects.take_ready(available);
-        let count = messages.len();
-        self.queue
-            .extend(messages.into_iter().map(|message| QueuedMessage {
+        let available = self
+            .queue_capacity
+            .saturating_sub(self.queue.len())
+            .min(maximum);
+        let mut count = 0;
+        while count < available {
+            let Some(message) = self.effects.pop_ready() else {
+                break;
+            };
+            self.queue.push_back(QueuedMessage {
                 message,
                 subscription: None,
-            }));
+            });
+            count += 1;
+        }
         count
     }
 
@@ -373,8 +522,15 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
 
     /// Polls subscriptions and moves ready values into the bounded queue
     pub fn poll_subscriptions(&mut self) -> usize {
+        self.poll_subscriptions_up_to(self.queue_capacity)
+    }
+
+    fn poll_subscriptions_up_to(&mut self, maximum: usize) -> usize {
         self.subscriptions.poll(self.clock.now());
-        let available = self.queue_capacity.saturating_sub(self.queue.len());
+        let available = self
+            .queue_capacity
+            .saturating_sub(self.queue.len())
+            .min(maximum);
         let messages = self.subscriptions.take_ready(available);
         let count = messages.len();
         self.queue
@@ -401,6 +557,26 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     #[must_use]
     pub fn pending_tasks(&self) -> usize {
         self.effects.pending_tasks()
+    }
+
+    /// Returns terminal-suspending tasks waiting for the Runtime driver
+    #[must_use]
+    pub fn pending_terminal_tasks(&self) -> usize {
+        self.effects.pending_terminal_tasks()
+    }
+
+    /// Runs the oldest terminal-suspending task on the current thread
+    ///
+    /// A full-screen terminal driver MUST suspend its terminal session before
+    /// calling this method and resume it afterwards. Task panics are recovered
+    /// as Runtime notices. The returned message becomes available to the next
+    /// pending-message processing boundary
+    pub fn run_terminal_task(&mut self) -> bool {
+        let ran = self.effects.run_terminal_task(self.clock.now());
+        if ran {
+            self.apply_effect_commands();
+        }
+        ran
     }
 
     /// Returns completed effect messages waiting for queue capacity
@@ -457,6 +633,23 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.subscriptions.diagnostics()
     }
 
+    /// Returns retained asynchronous lifecycle notices
+    #[must_use]
+    pub fn pending_runtime_notices(&self) -> usize {
+        self.notices.pending()
+    }
+
+    /// Removes and returns retained notices in occurrence order
+    pub fn drain_runtime_notices(&mut self) -> Vec<RuntimeNotice> {
+        self.notices.drain()
+    }
+
+    /// Returns bounded notice queue counters
+    #[must_use]
+    pub fn runtime_notice_diagnostics(&self) -> RuntimeNoticeDiagnostics {
+        self.notices.diagnostics()
+    }
+
     /// Returns time until the next clock-driven effect deadline
     #[must_use]
     pub fn time_until_effect_deadline(&self) -> Option<Duration> {
@@ -485,22 +678,51 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         })
     }
 
-    /// Applies every queued message in FIFO order without rendering between
-    /// messages
+    /// Applies at most the configured per-cycle number of messages in FIFO
+    /// order without rendering between messages
     pub fn process_pending(&mut self) -> Result<usize, RuntimeError> {
         self.process_pending_with(|_| {})
     }
 
-    /// Applies queued messages and observes each immediately before update
+    /// Applies one bounded scheduling cycle and observes each message
+    /// immediately before update
     pub fn process_pending_with(
         &mut self,
-        mut observe: impl FnMut(&Application::Message),
+        observe: impl FnMut(&Application::Message),
     ) -> Result<usize, RuntimeError> {
         self.reconcile_subscriptions()?;
-        self.poll_effects();
-        self.poll_subscriptions();
+        let remaining = self.max_updates_per_cycle.saturating_sub(self.queue.len());
+        let effects = self.poll_effects_up_to(remaining);
+        self.poll_subscriptions_up_to(remaining.saturating_sub(effects));
+        self.process_queued_with_inner(observe, Some(self.max_updates_per_cycle))
+    }
+
+    /// Applies messages already in the application queue without polling
+    /// asynchronous Effects or Subscriptions
+    pub fn process_queued(&mut self) -> Result<usize, RuntimeError> {
+        self.process_queued_with(|_| {})
+    }
+
+    /// Applies messages already in the application queue and observes each
+    /// immediately before update without polling asynchronous sources
+    pub fn process_queued_with(
+        &mut self,
+        observe: impl FnMut(&Application::Message),
+    ) -> Result<usize, RuntimeError> {
+        self.reconcile_subscriptions()?;
+        self.process_queued_with_inner(observe, None)
+    }
+
+    fn process_queued_with_inner(
+        &mut self,
+        mut observe: impl FnMut(&Application::Message),
+        maximum: Option<usize>,
+    ) -> Result<usize, RuntimeError> {
         let mut processed = 0;
-        while let Some(queued) = self.queue.pop_front() {
+        while maximum.is_none_or(|maximum| processed < maximum) {
+            let Some(queued) = self.queue.pop_front() else {
+                break;
+            };
             observe(&queued.message);
             let effect = self.app.update(queued.message);
             let without_redraw = effect.without_redraw;
@@ -508,6 +730,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.apply_effect_commands();
             if !without_redraw {
                 self.dirty = true;
+                self.view_tree = None;
             }
             self.subscriptions_dirty = true;
             self.reconcile_subscriptions()?;
@@ -524,9 +747,14 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 RuntimeCommand::ScrollTo { id, offset } => {
                     self.pending_scroll.push((id, offset));
                 }
+                RuntimeCommand::SetClipboard(request) => {
+                    self.pending_clipboard = Some(request);
+                    continue;
+                }
             }
             self.dirty = true;
             self.urgent_frame = true;
+            self.view_tree = None;
         }
     }
 
@@ -539,7 +767,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         for (id, offset) in self.pending_scroll.drain(..) {
             if index
                 .record(&id)
-                .is_some_and(|record| record.kind == InteractiveKind::ScrollViewport)
+                .is_some_and(|record| record.kind.is_scroll_viewport())
             {
                 self.interaction.request_scroll(&id, offset);
             }
@@ -548,6 +776,21 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
 
     /// Schedules a frame even when application state has not changed
     pub fn request_frame(&mut self) {
+        self.dirty = true;
+        self.urgent_frame = true;
+        self.subscriptions_dirty = true;
+    }
+
+    /// Discards the terminal diff baseline and requests one full redraw
+    ///
+    /// Drivers call this after an external process may have changed terminal
+    /// contents while the Runtime was suspended
+    pub fn invalidate_terminal_surface(&mut self) {
+        if let Some(previous) = self.previous_surface.take() {
+            if let Ok(surface) = Arc::try_unwrap(previous) {
+                self.spare_surface = Some(surface);
+            }
+        }
         self.dirty = true;
         self.urgent_frame = true;
         self.subscriptions_dirty = true;
@@ -609,33 +852,40 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         {
             self.dirty = true;
             self.urgent_frame = true;
+            self.view_tree = None;
         }
         true
+    }
+
+    /// Returns resolved semantic action groups on the active target-to-root route
+    ///
+    /// Groups outside the nearest StopAtScope boundary are omitted. Each
+    /// projection contains the complete active root-to-target scope path.
+    /// At one Node, a Node-declared group precedes a Core semantic group, so
+    /// the same owner may occur twice
+    pub fn active_action_groups(&mut self) -> Result<Vec<ResolvedActions>, RuntimeError> {
+        self.ensure_tree()?;
+        let route = self.tree_index.route(self.interaction.focused.as_ref());
+        let focus_owner = self
+            .tree_index
+            .focus_action_owner(self.interaction.focused.as_ref());
+        self.ensure_action_route(&route, focus_owner.as_ref())?;
+        Ok(self
+            .resolved_action_route
+            .as_ref()
+            .map_or_else(Vec::new, ResolvedActionRoute::groups))
     }
 
     /// Routes one normalized event through focus, hit testing, and ancestors
     pub fn dispatch_event(&mut self, event: &Event) -> Result<EventDispatch, RuntimeEventError> {
         self.ensure_tree()?;
-        if let Event::Key(key) = event {
-            if key.action != KeyAction::Release
-                && key.code == KeyCode::Tab
-                && !key.modifiers.alt
-                && !key.modifiers.control
-                && !key.modifiers.meta
-            {
-                let focus_scope = self.tree_index.focus_scope();
-                self.interaction.focused = crate::interaction::traverse_focus(
-                    focus_scope.as_ref(),
-                    self.interaction.focused.as_ref(),
-                    !key.modifiers.shift,
-                );
-                self.dirty = true;
-                self.urgent_frame = true;
-                return Ok(EventDispatch {
-                    consumed: true,
-                    messages: 0,
-                    redraw: true,
-                });
+        if self
+            .tree_index
+            .focus_action_owner(self.interaction.focused.as_ref())
+            .is_none()
+        {
+            if let Some(action) = default_focus_action(event) {
+                return Ok(self.dispatch_legacy_focus_action(action));
             }
         }
 
@@ -658,16 +908,60 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             }
         }
 
-        let route = self.tree_index.route(target.as_ref());
+        let mut route = std::mem::take(&mut self.event_route);
+        self.tree_index.route_into(target.as_ref(), &mut route);
+        let result = self.dispatch_event_route(event, &route);
+        route.clear();
+        self.event_route = route;
+        result
+    }
+
+    fn dispatch_event_route(
+        &mut self,
+        event: &Event,
+        route: &[NodeId],
+    ) -> Result<EventDispatch, RuntimeEventError> {
+        let focus_owner = self
+            .tree_index
+            .focus_action_owner(self.interaction.focused.as_ref());
+        self.ensure_action_route(route, focus_owner.as_ref())?;
         let mut dispatch = EventDispatch::default();
-        for (index, id) in route.into_iter().enumerate() {
+        for (index, id) in route.iter().enumerate() {
+            let action_result = self
+                .resolved_action_route
+                .as_ref()
+                .and_then(|resolved| resolved.match_declared_event(index, event).invoke());
+            if let Some(result) = action_result {
+                self.apply_event_result(result, &mut dispatch)?;
+                if dispatch.consumed {
+                    break;
+                }
+            }
+            let core_match = self
+                .resolved_action_route
+                .as_ref()
+                .map_or(CoreActionMatch::None, |resolved| {
+                    resolved.match_core_event(index, event)
+                });
+            let core_result = match core_match {
+                CoreActionMatch::None => None,
+                CoreActionMatch::Consume => Some(EventResult::consumed()),
+                CoreActionMatch::Invoke(action) => self.handle_core_action(id, action),
+            };
+            if let Some(result) = core_result {
+                self.apply_event_result(result, &mut dispatch)?;
+                if dispatch.consumed {
+                    break;
+                }
+            }
             let kind = self
                 .tree_index
-                .record(&id)
+                .record(id)
                 .map_or(InteractiveKind::Generic, |record| record.kind);
             let special = match kind {
-                InteractiveKind::TextInput if index == 0 => self.handle_text_input(&id, event),
-                InteractiveKind::ScrollViewport => self.handle_scroll(&id, event),
+                InteractiveKind::TextInput if index == 0 => self.handle_text_input(id, event),
+                InteractiveKind::ScrollViewportVertical
+                | InteractiveKind::ScrollViewportHorizontal => self.handle_scroll_mouse(id, event),
                 InteractiveKind::Generic | InteractiveKind::TextInput | InteractiveKind::Modal => {
                     None
                 }
@@ -678,18 +972,162 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                     break;
                 }
             }
+            let pointer_context = self.pointer_event_context(id, route, index, event);
+            let pointer_result = pointer_context.and_then(|context| {
+                self.view_tree
+                    .as_ref()
+                    .and_then(|view| view.handle_pointer_event(id, context))
+            });
+            if let Some(result) = pointer_result {
+                self.apply_event_result(result, &mut dispatch)?;
+                if dispatch.consumed {
+                    break;
+                }
+            }
             let result = self
                 .view_tree
                 .as_ref()
-                .and_then(|view| view.handle_event(&id, event));
+                .and_then(|view| view.handle_event(id, event));
             if let Some(result) = result {
                 self.apply_event_result(result, &mut dispatch)?;
                 if dispatch.consumed {
                     break;
                 }
             }
+            if self
+                .tree_index
+                .record(id)
+                .is_some_and(|record| record.blocks_unhandled_events)
+            {
+                dispatch.consumed = true;
+                break;
+            }
         }
         Ok(dispatch)
+    }
+
+    fn pointer_event_context(
+        &self,
+        id: &NodeId,
+        route: &[NodeId],
+        index: usize,
+        event: &Event,
+    ) -> Option<PointerEventContext> {
+        let Event::Mouse(mouse) = event else {
+            return None;
+        };
+        let record = self.tree_index.record(id)?;
+        let visible = record.rect.intersection(record.clip);
+        let local_position = Point::new(
+            local_pointer_coordinate(mouse.x, record.rect.x),
+            local_pointer_coordinate(mouse.y, record.rect.y),
+        );
+        let visible_bounds = Rect::new(
+            local_geometry_coordinate(visible.x, record.rect.x),
+            local_geometry_coordinate(visible.y, record.rect.y),
+            visible.width,
+            visible.height,
+        );
+        let viewport = route[index.saturating_add(1)..]
+            .iter()
+            .find_map(|viewport_id| {
+                let viewport_record = self.tree_index.record(viewport_id)?;
+                let axis = viewport_record.kind.scroll_axis()?;
+                let state = self.interaction.scroll_state(viewport_id)?;
+                Some(PointerViewport::new(
+                    viewport_id.clone(),
+                    axis,
+                    state,
+                    viewport_record.rect.intersection(viewport_record.clip),
+                ))
+            });
+        Some(PointerEventContext::new(
+            *mouse,
+            local_position,
+            record.rect.size(),
+            visible_bounds,
+            self.width_profile,
+            self.interaction.pointer_capture() == Some(id),
+            viewport,
+        ))
+    }
+
+    fn ensure_action_route(
+        &mut self,
+        route: &[NodeId],
+        focus_owner: Option<&NodeId>,
+    ) -> Result<(), RuntimeError> {
+        if !route_needs_action_resolution(route, &self.action_index, &self.tree_index, focus_owner)
+        {
+            self.publish_resolved_action_route(false);
+            return Ok(());
+        }
+        if self
+            .resolved_action_route
+            .as_ref()
+            .is_some_and(|resolved| resolved.matches_route(route, focus_owner))
+        {
+            return Ok(());
+        }
+        self.next_resolved_action_route.resolve_into(
+            route,
+            &self.action_index,
+            &self.tree_index,
+            focus_owner,
+        )?;
+        self.publish_resolved_action_route(true);
+        Ok(())
+    }
+
+    fn publish_resolved_action_route(&mut self, active: bool) {
+        if active {
+            let previous = self.resolved_action_route.take().unwrap_or_default();
+            let current = std::mem::replace(&mut self.next_resolved_action_route, previous);
+            self.resolved_action_route = Some(current);
+        } else if let Some(previous) = self.resolved_action_route.take() {
+            self.next_resolved_action_route = previous;
+        }
+    }
+
+    fn dispatch_legacy_focus_action(&mut self, action: CoreAction) -> EventDispatch {
+        let forward = matches!(action, CoreAction::FocusNext);
+        let focus_scope = self.tree_index.focus_scope();
+        self.interaction.focused = crate::interaction::traverse_focus(
+            focus_scope.as_ref(),
+            self.interaction.focused.as_ref(),
+            forward,
+        );
+        self.dirty = true;
+        self.urgent_frame = true;
+        EventDispatch {
+            consumed: true,
+            messages: 0,
+            redraw: true,
+        }
+    }
+
+    fn handle_core_action(
+        &mut self,
+        id: &NodeId,
+        action: CoreAction,
+    ) -> Option<EventResult<Application::Message>> {
+        match action {
+            CoreAction::FocusNext | CoreAction::FocusPrevious => {
+                let focus_scope = self.tree_index.focus_scope();
+                self.interaction.focused = crate::interaction::traverse_focus(
+                    focus_scope.as_ref(),
+                    self.interaction.focused.as_ref(),
+                    action == CoreAction::FocusNext,
+                );
+                self.dirty = true;
+                self.urgent_frame = true;
+                Some(EventResult::consumed().redraw())
+            }
+            CoreAction::ScrollPageUp
+            | CoreAction::ScrollPageDown
+            | CoreAction::ScrollStart
+            | CoreAction::ScrollEnd => self.handle_scroll_action(id, action),
+        }
     }
 
     fn handle_text_input(
@@ -707,7 +1145,12 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 KeyCode::End => TextEdit::End,
                 KeyCode::Backspace => TextEdit::Backspace,
                 KeyCode::Delete => TextEdit::Delete,
-                KeyCode::Character(_) if !key.modifiers.control && !key.modifiers.meta => {
+                KeyCode::Character(_) | KeyCode::Unknown
+                    if !key.modifiers.control
+                        && !key.modifiers.meta
+                        && !key.modifiers.super_key
+                        && !key.modifiers.hyper =>
+                {
                     TextEdit::Insert(key.text.as_deref()?)
                 }
                 _ => return None,
@@ -735,14 +1178,13 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         Some(result)
     }
 
-    fn handle_scroll(
+    fn handle_scroll_mouse(
         &mut self,
         id: &NodeId,
         event: &Event,
     ) -> Option<EventResult<Application::Message>> {
         let state = self.interaction.scroll_state(id)?;
         let axis = self.view_tree.as_ref()?.scroll_options(id)?.axis;
-        let viewport = self.tree_index.record(id)?.rect;
         let current = state.offset;
         let next = match event {
             Event::Mouse(mouse) if mouse.kind == MouseKind::Scroll => match mouse.button {
@@ -760,24 +1202,54 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 }
                 _ => return None,
             },
-            Event::Key(key) if key.action != KeyAction::Release => match key.code {
-                KeyCode::PageUp if axis.allows_vertical() => {
-                    ScrollOffset::new(current.x, current.y.saturating_sub(viewport.height.max(1)))
-                }
-                KeyCode::PageDown if axis.allows_vertical() => {
-                    ScrollOffset::new(current.x, current.y.saturating_add(viewport.height.max(1)))
-                }
-                KeyCode::Home if axis.allows_vertical() => ScrollOffset::new(current.x, 0),
-                KeyCode::End if axis.allows_vertical() => {
-                    ScrollOffset::new(current.x, state.maximum.y)
-                }
-                KeyCode::Home if axis.allows_horizontal() => ScrollOffset::new(0, current.y),
-                KeyCode::End if axis.allows_horizontal() => {
-                    ScrollOffset::new(state.maximum.x, current.y)
-                }
-                _ => return None,
-            },
             _ => return None,
+        };
+        let (state, changed) = self.interaction.request_scroll(id, next)?;
+        self.dirty = true;
+        self.urgent_frame = true;
+        let mut result = EventResult::consumed().redraw();
+        if changed {
+            if let Some(message) = self
+                .view_tree
+                .as_ref()
+                .and_then(|view| view.scroll_message(id, state))
+            {
+                result = result.emit(message);
+            }
+        }
+        Some(result)
+    }
+
+    fn handle_scroll_action(
+        &mut self,
+        id: &NodeId,
+        action: CoreAction,
+    ) -> Option<EventResult<Application::Message>> {
+        let state = self.interaction.scroll_state(id)?;
+        let axis = self.view_tree.as_ref()?.scroll_options(id)?.axis;
+        let viewport = self.tree_index.record(id)?.rect;
+        let current = state.offset;
+        let next = match action {
+            CoreAction::ScrollPageUp if axis.allows_vertical() => {
+                ScrollOffset::new(current.x, current.y.saturating_sub(viewport.height.max(1)))
+            }
+            CoreAction::ScrollPageDown if axis.allows_vertical() => {
+                ScrollOffset::new(current.x, current.y.saturating_add(viewport.height.max(1)))
+            }
+            CoreAction::ScrollStart if axis.allows_vertical() => ScrollOffset::new(current.x, 0),
+            CoreAction::ScrollEnd if axis.allows_vertical() => {
+                ScrollOffset::new(current.x, state.maximum.y)
+            }
+            CoreAction::ScrollStart if axis.allows_horizontal() => ScrollOffset::new(0, current.y),
+            CoreAction::ScrollEnd if axis.allows_horizontal() => {
+                ScrollOffset::new(state.maximum.x, current.y)
+            }
+            CoreAction::FocusNext
+            | CoreAction::FocusPrevious
+            | CoreAction::ScrollPageUp
+            | CoreAction::ScrollPageDown
+            | CoreAction::ScrollStart
+            | CoreAction::ScrollEnd => return None,
         };
         let (state, changed) = self.interaction.request_scroll(id, next)?;
         self.dirty = true;
@@ -828,6 +1300,28 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.enqueue(message)?;
             dispatch.messages += 1;
         }
+        if let Some((id, offset)) = result.scroll {
+            let is_available = self
+                .tree_index
+                .record(&id)
+                .is_some_and(|record| record.kind.is_scroll_viewport())
+                && self.tree_index.allows_interaction(&id);
+            if is_available {
+                if let Some((state, true)) = self.interaction.request_scroll(&id, offset) {
+                    self.dirty = true;
+                    self.urgent_frame = true;
+                    dispatch.redraw = true;
+                    if let Some(message) = self
+                        .view_tree
+                        .as_ref()
+                        .and_then(|view| view.scroll_message(&id, state))
+                    {
+                        self.enqueue(message)?;
+                        dispatch.messages += 1;
+                    }
+                }
+            }
+        }
         dispatch.consumed |= result.consumed;
         dispatch.redraw |= result.redraw;
         if result.redraw {
@@ -842,6 +1336,10 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             return Ok(());
         }
         let declared = self.app.subscriptions();
+        if declared.is_none() && self.subscriptions.active_subscriptions() == 0 {
+            self.subscriptions_dirty = false;
+            return Ok(());
+        }
         let SubscriptionReconciliation { stopped } = self
             .subscriptions
             .reconcile(declared, self.clock.now())
@@ -862,77 +1360,144 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         Ok(())
     }
 
-    fn ensure_focused_visible(
+    fn ensure_reveal_targets_visible(
         &mut self,
         view: &Node<Application::Message>,
         index: &mut TreeIndex,
+        actions: &mut ActionIndex<Application::Message>,
     ) -> Result<(), RuntimeError> {
-        let Some(focused) = self.interaction.focused.clone() else {
-            return Ok(());
-        };
-        let scrolls: Vec<_> = index
-            .route(Some(&focused))
-            .into_iter()
-            .filter(|id| {
-                view.scroll_options(id)
-                    .is_some_and(|options| options.ensure_focused_visible)
-            })
-            .collect();
-        for id in scrolls {
-            let Some(target) = index.record(&focused).cloned() else {
+        if let Some(focused) = self.interaction.focused.clone() {
+            let scrolls: Vec<_> = index
+                .route(Some(&focused))
+                .into_iter()
+                .filter(|id| {
+                    index
+                        .reveal_targets
+                        .iter()
+                        .all(|(viewport, _)| viewport != id)
+                        && view
+                            .scroll_options(id)
+                            .is_some_and(|options| options.ensure_focused_visible)
+                })
+                .collect();
+            for viewport in scrolls {
+                self.ensure_target_visible(view, index, actions, &viewport, &focused)?;
+            }
+        }
+
+        let mut remaining = index.reveal_targets.len();
+        while remaining > 0 {
+            remaining = remaining.min(index.reveal_targets.len());
+            if remaining == 0 {
                 break;
-            };
-            let Some(viewport) = index.record(&id).cloned() else {
-                continue;
-            };
-            let Some(axis) = view.scroll_options(&id).map(|options| options.axis) else {
-                continue;
-            };
-            let Some(state) = self.interaction.scroll_state(&id) else {
-                continue;
-            };
-            let mut next = state.offset;
-            if axis.allows_horizontal() {
-                next.x = visible_axis_offset(
-                    next.x,
-                    viewport.rect.x,
-                    viewport.rect.width,
-                    target.rect.x,
-                    target.rect.width,
-                );
             }
-            if axis.allows_vertical() {
-                next.y = visible_axis_offset(
-                    next.y,
-                    viewport.rect.y,
-                    viewport.rect.height,
-                    target.rect.y,
-                    target.rect.height,
-                );
-            }
-            if next == state.offset {
-                continue;
-            }
-            self.interaction.request_scroll(&id, next);
-            view.prepare_interaction(self.size, &mut self.interaction);
-            view.build_tree_index_into(self.size, &self.interaction, index)
-                .map_err(RuntimeError::DuplicateNodeId)?;
+            remaining -= 1;
+            let (viewport, target) = index.reveal_targets[remaining].clone();
+            self.ensure_target_visible(view, index, actions, &viewport, &target)?;
         }
         Ok(())
+    }
+
+    fn ensure_target_visible(
+        &mut self,
+        view: &Node<Application::Message>,
+        index: &mut TreeIndex,
+        actions: &mut ActionIndex<Application::Message>,
+        viewport_id: &NodeId,
+        target_id: &NodeId,
+    ) -> Result<(), RuntimeError> {
+        if !index.is_within(target_id, viewport_id) {
+            return Ok(());
+        }
+        let Some(target) = index.record(target_id).cloned() else {
+            return Ok(());
+        };
+        let Some(viewport) = index.record(viewport_id).cloned() else {
+            return Ok(());
+        };
+        let Some(axis) = view.scroll_options(viewport_id).map(|options| options.axis) else {
+            return Ok(());
+        };
+        let Some(state) = self.interaction.scroll_state(viewport_id) else {
+            return Ok(());
+        };
+        let mut next = state.offset;
+        if axis.allows_horizontal() {
+            next.x = visible_axis_offset(
+                next.x,
+                viewport.rect.x,
+                viewport.rect.width,
+                target.rect.x,
+                target.rect.width,
+            );
+        }
+        if axis.allows_vertical() {
+            next.y = visible_axis_offset(
+                next.y,
+                viewport.rect.y,
+                viewport.rect.height,
+                target.rect.y,
+                target.rect.height,
+            );
+        }
+        if next == state.offset {
+            return Ok(());
+        }
+        self.interaction.request_scroll(viewport_id, next);
+        view.prepare_interaction(self.size, &mut self.interaction, self.width_profile);
+        view.build_tree_index_into(
+            self.size,
+            &self.interaction,
+            index,
+            actions,
+            self.width_profile,
+        )
+        .map_err(RuntimeError::DuplicateNodeId)
     }
 
     fn ensure_tree(&mut self) -> Result<(), RuntimeError> {
         if self.view_tree.is_some() {
             return Ok(());
         }
-        let view = self.app.view(crate::ViewContext::new(self.size));
+        let view = self
+            .app
+            .view(crate::ViewContext::with_terminal_capabilities(
+                self.size,
+                self.width_profile,
+                self.terminal_capabilities,
+            ));
+        view.prepare_virtual_flows(self.size, &mut self.interaction, self.width_profile);
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
-        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
+        let mut action_index = std::mem::take(&mut self.next_action_index);
+        if let Err(id) = view.build_tree_index_into(
+            self.size,
+            &self.interaction,
+            &mut tree_index,
+            &mut action_index,
+            self.width_profile,
+        ) {
             self.next_tree_index = tree_index;
+            self.next_action_index = action_index;
             return Err(RuntimeError::DuplicateNodeId(id));
         }
-        self.interaction
-            .reconcile(&tree_index.active, &[], tree_index.focus_scope().as_ref());
+        let previous_focus_order = self.tree_index.focus_scope();
+        let current_focus_order = tree_index.focus_scope();
+        let focus_fallback = self
+            .interaction
+            .focused
+            .as_ref()
+            .and_then(|focused| self.tree_index.focus_fallback(focused))
+            .cloned();
+        self.interaction.reconcile(
+            &tree_index.active,
+            previous_focus_order.as_ref(),
+            current_focus_order.as_ref(),
+            tree_index
+                .active_modal
+                .as_ref()
+                .map(|modal| (modal, &tree_index.active_modal_focus)),
+            focus_fallback.as_ref(),
+        );
         if self
             .interaction
             .pointer_capture
@@ -942,20 +1507,44 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.interaction.pointer_capture = None;
         }
         self.apply_pending_interaction(&tree_index);
-        if view.prepare_interaction(self.size, &mut self.interaction) {
-            if let Err(id) =
-                view.build_tree_index_into(self.size, &self.interaction, &mut tree_index)
-            {
+        if view.prepare_interaction(self.size, &mut self.interaction, self.width_profile) {
+            if let Err(id) = view.build_tree_index_into(
+                self.size,
+                &self.interaction,
+                &mut tree_index,
+                &mut action_index,
+                self.width_profile,
+            ) {
                 self.next_tree_index = tree_index;
+                self.next_action_index = action_index;
                 return Err(RuntimeError::DuplicateNodeId(id));
             }
         }
-        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index) {
+        if let Err(error) =
+            self.ensure_reveal_targets_visible(&view, &mut tree_index, &mut action_index)
+        {
             self.next_tree_index = tree_index;
+            self.next_action_index = action_index;
             return Err(error);
         }
+        let has_resolved_action_route = match resolve_frame_actions_into(
+            &tree_index,
+            &action_index,
+            self.interaction.focused.as_ref(),
+            &mut self.next_resolved_action_route,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.next_tree_index = tree_index;
+                self.next_action_index = action_index;
+                return Err(error);
+            }
+        };
         let previous = std::mem::replace(&mut self.tree_index, tree_index);
         self.next_tree_index = previous;
+        let previous = std::mem::replace(&mut self.action_index, action_index);
+        self.next_action_index = previous;
+        self.publish_resolved_action_route(has_resolved_action_route);
         self.view_tree = Some(view);
         Ok(())
     }
@@ -974,19 +1563,45 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 }
             }
         }
-        let view = self.app.view(crate::ViewContext::new(self.size));
+        let view = self
+            .app
+            .view(crate::ViewContext::with_terminal_capabilities(
+                self.size,
+                self.width_profile,
+                self.terminal_capabilities,
+            ));
+        view.prepare_virtual_flows(self.size, &mut self.interaction, self.width_profile);
         let mut tree_index = std::mem::take(&mut self.next_tree_index);
-        if let Err(id) = view.build_tree_index_into(self.size, &self.interaction, &mut tree_index) {
+        let mut action_index = std::mem::take(&mut self.next_action_index);
+        if let Err(id) = view.build_tree_index_into(
+            self.size,
+            &self.interaction,
+            &mut tree_index,
+            &mut action_index,
+            self.width_profile,
+        ) {
             self.next_tree_index = tree_index;
+            self.next_action_index = action_index;
             return Err(RuntimeError::DuplicateNodeId(id));
         }
         {
             let previous_focus_order = self.tree_index.focus_scope();
             let current_focus_order = tree_index.focus_scope();
+            let focus_fallback = self
+                .interaction
+                .focused
+                .as_ref()
+                .and_then(|focused| self.tree_index.focus_fallback(focused))
+                .cloned();
             self.interaction.reconcile(
                 &tree_index.active,
                 previous_focus_order.as_ref(),
                 current_focus_order.as_ref(),
+                tree_index
+                    .active_modal
+                    .as_ref()
+                    .map(|modal| (modal, &tree_index.active_modal_focus)),
+                focus_fallback.as_ref(),
             );
         }
         if self
@@ -998,18 +1613,39 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             self.interaction.pointer_capture = None;
         }
         self.apply_pending_interaction(&tree_index);
-        if view.prepare_interaction(self.size, &mut self.interaction) {
-            if let Err(id) =
-                view.build_tree_index_into(self.size, &self.interaction, &mut tree_index)
-            {
+        if view.prepare_interaction(self.size, &mut self.interaction, self.width_profile) {
+            if let Err(id) = view.build_tree_index_into(
+                self.size,
+                &self.interaction,
+                &mut tree_index,
+                &mut action_index,
+                self.width_profile,
+            ) {
                 self.next_tree_index = tree_index;
+                self.next_action_index = action_index;
                 return Err(RuntimeError::DuplicateNodeId(id));
             }
         }
-        if let Err(error) = self.ensure_focused_visible(&view, &mut tree_index) {
+        if let Err(error) =
+            self.ensure_reveal_targets_visible(&view, &mut tree_index, &mut action_index)
+        {
             self.next_tree_index = tree_index;
+            self.next_action_index = action_index;
             return Err(error);
         }
+        let has_resolved_action_route = match resolve_frame_actions_into(
+            &tree_index,
+            &action_index,
+            self.interaction.focused.as_ref(),
+            &mut self.next_resolved_action_route,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.next_tree_index = tree_index;
+                self.next_action_index = action_index;
+                return Err(error);
+            }
+        };
         let mut surface = match self.spare_surface.take() {
             Some(mut surface)
                 if surface.width() == self.size.width && surface.height() == self.size.height =>
@@ -1021,11 +1657,12 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
                 Ok(surface) => surface,
                 Err(error) => {
                     self.next_tree_index = tree_index;
+                    self.next_action_index = action_index;
                     return Err(error.into());
                 }
             },
         };
-        view.render_to(&mut surface, &self.interaction);
+        view.render_to_profile(&mut surface, &self.interaction, self.width_profile);
         let previous_surface = self.previous_surface.take();
         let frame_operations = operations(previous_surface.as_deref(), &surface);
         if let Some(previous_surface) = previous_surface {
@@ -1038,6 +1675,9 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.view_tree = Some(view);
         let previous = std::mem::replace(&mut self.tree_index, tree_index);
         self.next_tree_index = previous;
+        let previous = std::mem::replace(&mut self.action_index, action_index);
+        self.next_action_index = previous;
+        self.publish_resolved_action_route(has_resolved_action_route);
         self.dirty = false;
         self.urgent_frame = false;
         self.last_frame = Some(now);
@@ -1048,11 +1688,34 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         }))
     }
 
-    /// Processes all queued messages and produces at most one frame
+    /// Processes one bounded scheduling cycle and produces at most one frame
     pub fn step(&mut self) -> Result<Option<Frame>, RuntimeError> {
         self.process_pending()?;
         self.render_if_dirty()
     }
+}
+
+fn local_pointer_coordinate(value: u32, origin: i32) -> i32 {
+    clamp_pointer_coordinate(i64::from(value).saturating_sub(i64::from(origin)))
+}
+
+fn local_geometry_coordinate(value: i32, origin: i32) -> i32 {
+    clamp_pointer_coordinate(i64::from(value).saturating_sub(i64::from(origin)))
+}
+
+fn clamp_pointer_coordinate(value: i64) -> i32 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+fn resolve_frame_actions_into<Message>(
+    tree: &TreeIndex,
+    actions: &ActionIndex<Message>,
+    target: Option<&NodeId>,
+    resolved: &mut ResolvedActionRoute<Message>,
+) -> Result<bool, RuntimeError> {
+    validate_action_owners(tree, actions)?;
+    let focus_owner = tree.focus_action_owner(target);
+    Ok(resolved.resolve_tree_route_into(target, actions, tree, focus_owner.as_ref())?)
 }
 
 fn visible_axis_offset(
@@ -1080,16 +1743,17 @@ fn visible_axis_offset(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
     use crate::fixture_support;
     use crate::{
-        CancelToken, DeliveryPolicy, Effect, EventResult, Insets, KeyEvent, KeyProtocol, Modifiers,
-        Node, NodeId, ScrollOffset, Subscription, SubscriptionKey, Task, TaskKey, VirtualClock,
+        Action, ActionDescriptor, CancelToken, DeliveryPolicy, Effect, EventResult, Insets,
+        KeyBinding, KeyEvent, KeyProtocol, KeyStroke, Modifiers, Node, NodeId, ScrollOffset,
+        Subscription, SubscriptionKey, Task, TaskKey, VirtualClock,
     };
 
     use super::*;
@@ -1155,6 +1819,146 @@ mod tests {
     }
 
     #[test]
+    fn scheduling_cycle_bounds_updates_without_reordering_the_queue() {
+        let mut config = RuntimeConfig::new(Size::new(3, 1));
+        config.max_updates_per_cycle = 2;
+        let mut runtime = Runtime::with_clock(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            config,
+            VirtualClock::new(),
+        )
+        .unwrap();
+        for value in 1..=5 {
+            runtime.enqueue(Message::Add(value)).unwrap();
+        }
+
+        assert_eq!(runtime.process_pending().unwrap(), 2);
+        assert_eq!(runtime.app().updates, [1, 2]);
+        assert_eq!(runtime.queued_messages(), 3);
+        assert!(runtime.has_pending_updates());
+
+        assert_eq!(runtime.process_queued().unwrap(), 3);
+        assert_eq!(runtime.app().updates, [1, 2, 3, 4, 5]);
+        assert!(!runtime.has_pending_updates());
+    }
+
+    #[test]
+    fn zero_scheduling_cycle_limit_is_rejected() {
+        let mut config = RuntimeConfig::new(Size::new(1, 1));
+        config.max_updates_per_cycle = 0;
+        let result = Runtime::with_clock(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            config,
+            VirtualClock::new(),
+        );
+
+        assert!(matches!(result, Err(RuntimeError::ZeroMaxUpdatesPerCycle)));
+    }
+
+    struct ShutdownWaitApp {
+        effect_returned: Arc<std::sync::atomic::AtomicBool>,
+        stream_returned: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl App for ShutdownWaitApp {
+        type Message = ();
+
+        fn init(&mut self) -> Effect<Self::Message> {
+            let returned = Arc::clone(&self.effect_returned);
+            Effect::run(move |token| {
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+                returned.store(true, Ordering::Release);
+            })
+        }
+
+        fn update(&mut self, (): Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn subscriptions(&self) -> Subscription<Self::Message> {
+            let returned = Arc::clone(&self.stream_returned);
+            Subscription::stream("shutdown", DeliveryPolicy::reliable(), move |token, _| {
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+                returned.store(true, Ordering::Release);
+            })
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::text("")
+        }
+    }
+
+    #[test]
+    fn close_and_wait_observes_effect_and_stream_return() {
+        let effect_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut runtime = Runtime::new(
+            ShutdownWaitApp {
+                effect_returned: Arc::clone(&effect_returned),
+                stream_returned: Arc::clone(&stream_returned),
+            },
+            Size::new(1, 1),
+        )
+        .unwrap();
+
+        runtime.close_and_wait();
+
+        assert!(effect_returned.load(Ordering::Acquire));
+        assert!(stream_returned.load(Ordering::Acquire));
+    }
+
+    struct IgnoredCancellationApp {
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl App for IgnoredCancellationApp {
+        type Message = ();
+
+        fn init(&mut self) -> Effect<Self::Message> {
+            let release = Arc::clone(&self.release);
+            Effect::run(move |_| {
+                while !release.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+            })
+        }
+
+        fn update(&mut self, (): Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::text("")
+        }
+    }
+
+    #[test]
+    fn close_wait_timeout_can_be_retried_after_ignored_cancellation() {
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut runtime = Runtime::new(
+            IgnoredCancellationApp {
+                release: Arc::clone(&release),
+            },
+            Size::new(1, 1),
+        )
+        .unwrap();
+
+        assert!(!runtime.close_and_wait_timeout(Duration::ZERO));
+        release.store(true, Ordering::Release);
+        runtime.close_and_wait();
+    }
+
+    #[test]
     fn effect_without_redraw_skips_unchanged_frame() {
         let mut runtime = Runtime::new(
             Counter {
@@ -1205,6 +2009,75 @@ mod tests {
         let spare = runtime.spare_surface.as_ref().expect("reclaimed surface");
         assert_eq!(spare.width(), 3);
         assert_eq!(spare.height(), 1);
+    }
+
+    struct TerminalTaskApp {
+        messages: Vec<&'static str>,
+    }
+
+    impl App for TerminalTaskApp {
+        type Message = &'static str;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            self.messages.push(message);
+            if message == "start" {
+                return Effect::sequence([
+                    Effect::suspend_terminal(|_| "first"),
+                    Effect::suspend_terminal(|_| "second"),
+                ]);
+            }
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::text(self.messages.join(","))
+        }
+    }
+
+    #[test]
+    fn terminal_tasks_complete_on_the_driver_thread_and_preserve_sequence_order() {
+        let mut runtime = Runtime::new(
+            TerminalTaskApp {
+                messages: Vec::new(),
+            },
+            Size::new(32, 1),
+        )
+        .unwrap();
+        runtime.enqueue("start").unwrap();
+        runtime.process_pending().unwrap();
+
+        assert_eq!(runtime.pending_terminal_tasks(), 1);
+        assert!(runtime.run_terminal_task());
+        runtime.process_pending().unwrap();
+        assert_eq!(runtime.app().messages, ["start", "first"]);
+        assert_eq!(runtime.pending_terminal_tasks(), 1);
+
+        assert!(runtime.run_terminal_task());
+        runtime.process_pending().unwrap();
+        assert_eq!(runtime.app().messages, ["start", "first", "second"]);
+        assert_eq!(runtime.pending_terminal_tasks(), 0);
+        assert!(!runtime.run_terminal_task());
+    }
+
+    #[test]
+    fn invalidated_terminal_surface_produces_a_full_redraw() {
+        let mut runtime = Runtime::new(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            Size::new(3, 1),
+        )
+        .unwrap();
+        let first = runtime.render_if_dirty().unwrap().unwrap();
+        runtime.request_frame();
+        let unchanged = runtime.render_if_dirty().unwrap().unwrap();
+        assert!(unchanged.operations().is_empty());
+
+        runtime.invalidate_terminal_surface();
+        let redrawn = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(redrawn.operations(), first.operations());
     }
 
     #[test]
@@ -1508,6 +2381,57 @@ mod tests {
         assert_eq!(runtime.effect_diagnostics().stale_results(), 1);
     }
 
+    struct CachedActionApp;
+
+    impl App for CachedActionApp {
+        type Message = ();
+
+        fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::text("target").focusable("target").on_actions(
+                "target",
+                [Action::new(
+                    ActionDescriptor::new(
+                        "app.action",
+                        "Action",
+                        [KeyBinding::new(KeyStroke::character('x', Modifiers::NONE))],
+                    ),
+                    |_| EventResult::ignored(),
+                )],
+            )
+        }
+    }
+
+    #[test]
+    fn dispatch_reuses_the_resolved_action_route_for_unchanged_focus() {
+        let mut runtime = Runtime::with_clock(
+            CachedActionApp,
+            RuntimeConfig::new(Size::new(8, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        runtime.request_focus(&NodeId::from("target")).unwrap();
+        runtime.active_action_groups().unwrap();
+        let before = std::ptr::from_ref(runtime.resolved_action_route.as_ref().unwrap());
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Character('x'),
+            modifiers: Modifiers::NONE,
+            action: KeyAction::Press,
+            text: Some("x".to_owned()),
+            protocol: KeyProtocol::Legacy,
+        });
+
+        runtime.dispatch_event(&event).unwrap();
+        runtime.dispatch_event(&event).unwrap();
+
+        let after = std::ptr::from_ref(runtime.resolved_action_route.as_ref().unwrap());
+        assert_eq!(before, after);
+    }
+
     enum InputMessage {
         Change(String),
     }
@@ -1667,8 +2591,67 @@ mod tests {
         assert_eq!(runtime.app().visits, ["input", "panel"]);
     }
 
+    struct PointerHandlerOrderApp {
+        visits: Vec<&'static str>,
+    }
+
+    impl App for PointerHandlerOrderApp {
+        type Message = FocusMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            match message {
+                FocusMessage::Visit(id) => self.visits.push(id),
+            }
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::rich_text([crate::TextSpan::new("ab", crate::Style::default())])
+                .on_pointer_event("target", |context| {
+                    let hit = context.text_hit().expect("paragraph text hit");
+                    assert_eq!((hit.start(), hit.end()), (0, 1));
+                    assert_eq!(context.local_position(), Point::new(0, 0));
+                    assert_eq!(context.bounds(), Size::new(2, 1));
+                    assert_eq!(context.visible_bounds(), Rect::new(0, 0, 2, 1));
+                    assert!(!context.is_captured());
+                    assert!(context.viewport().is_none());
+                    EventResult::ignored().emit(FocusMessage::Visit("pointer"))
+                })
+                .on_event("target", |_| {
+                    EventResult::message(FocusMessage::Visit("raw"))
+                })
+        }
+    }
+
+    #[test]
+    fn geometry_pointer_handler_precedes_raw_handler() {
+        let mut runtime = Runtime::with_clock(
+            PointerHandlerOrderApp { visits: Vec::new() },
+            RuntimeConfig::new(Size::new(2, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        let dispatch = runtime
+            .dispatch_event(&Event::Mouse(crate::MouseEvent {
+                kind: MouseKind::Press,
+                button: MouseButton::Left,
+                x: 0,
+                y: 0,
+                modifiers: Modifiers::NONE,
+            }))
+            .unwrap();
+
+        assert!(dispatch.consumed());
+        assert_eq!(dispatch.messages(), 2);
+        runtime.process_pending().unwrap();
+        assert_eq!(runtime.app().visits, ["pointer", "raw"]);
+    }
+
     struct ModalApp {
         visits: Vec<&'static str>,
+        hard: bool,
     }
 
     impl App for ModalApp {
@@ -1692,9 +2675,12 @@ mod tests {
                 .on_event("input", |_| {
                     EventResult::ignored().emit(FocusMessage::Visit("input"))
                 });
-            let modal = Node::modal("modal", input).on_event("modal", |_| {
+            let mut modal = Node::modal("modal", input).on_event("modal", |_| {
                 EventResult::ignored().emit(FocusMessage::Visit("modal"))
             });
+            if self.hard {
+                modal = modal.block_unhandled_events();
+            }
             Node::stack([background, modal]).on_event("root", |_| {
                 EventResult::message(FocusMessage::Visit("root"))
             })
@@ -1704,7 +2690,10 @@ mod tests {
     #[test]
     fn modal_restricts_focus_and_routes_through_modal_ancestors() {
         let mut runtime = Runtime::with_clock(
-            ModalApp { visits: Vec::new() },
+            ModalApp {
+                visits: Vec::new(),
+                hard: false,
+            },
             RuntimeConfig::new(Size::new(12, 1)),
             VirtualClock::new(),
         )
@@ -1740,6 +2729,35 @@ mod tests {
         assert_eq!(routed.messages(), 3);
         runtime.step().unwrap();
         assert_eq!(runtime.app().visits, ["input", "modal", "root"]);
+    }
+
+    #[test]
+    fn event_boundary_stops_unhandled_event_at_modal() {
+        let mut runtime = Runtime::with_clock(
+            ModalApp {
+                visits: Vec::new(),
+                hard: true,
+            },
+            RuntimeConfig::new(Size::new(12, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        assert!(runtime.request_focus(&NodeId::from("input")).unwrap());
+
+        let routed = runtime
+            .dispatch_event(&Event::Key(KeyEvent {
+                code: KeyCode::Right,
+                modifiers: Modifiers::NONE,
+                action: KeyAction::Unknown,
+                text: None,
+                protocol: KeyProtocol::Legacy,
+            }))
+            .unwrap();
+        assert!(routed.consumed());
+        assert_eq!(routed.messages(), 2);
+        runtime.step().unwrap();
+        assert_eq!(runtime.app().visits, ["input", "modal"]);
     }
 
     struct ScrollApp;
@@ -1781,6 +2799,338 @@ mod tests {
         assert_eq!(
             runtime.interaction().scroll_offset(&NodeId::from("scroll")),
             ScrollOffset::new(0, 1)
+        );
+    }
+
+    #[derive(Clone)]
+    struct VirtualFlowEntry {
+        key: &'static str,
+        label: &'static str,
+        height: u32,
+    }
+
+    struct VirtualFlowApp {
+        entries: Vec<VirtualFlowEntry>,
+        items: crate::VirtualFlowItems,
+        update: crate::VirtualFlowUpdate,
+        stick_to_end: bool,
+        builds: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl VirtualFlowApp {
+        fn new(entries: Vec<VirtualFlowEntry>, stick_to_end: bool) -> Self {
+            let items = virtual_flow_items(&entries);
+            Self {
+                entries,
+                items,
+                update: crate::VirtualFlowUpdate::reset(1),
+                stick_to_end,
+                builds: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn replace_entries(
+            &mut self,
+            entries: Vec<VirtualFlowEntry>,
+            update: crate::VirtualFlowUpdate,
+        ) {
+            self.items = virtual_flow_items(&entries);
+            self.entries = entries;
+            self.update = update;
+        }
+    }
+
+    impl App for VirtualFlowApp {
+        type Message = ();
+
+        fn update(&mut self, (): ()) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            let estimates = self.entries.clone();
+            let entries = self.entries.clone();
+            let builds = Arc::clone(&self.builds);
+            let source = crate::VirtualFlowSource::new(self.items.clone(), move |context| {
+                builds
+                    .lock()
+                    .unwrap()
+                    .push(context.key().as_str().to_owned());
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.key == context.key().as_str())
+                    .expect("built virtual flow item exists");
+                virtual_flow_item_node(entry)
+            })
+            .estimated_height(move |context| {
+                estimates
+                    .iter()
+                    .find(|entry| entry.key == context.key().as_str())
+                    .expect("estimated virtual flow item exists")
+                    .height
+            })
+            .update(self.update.clone());
+            Node::virtual_flow_with_options(
+                "virtual-flow",
+                source,
+                crate::VirtualFlowOptions {
+                    overscan: 1,
+                    stick_to_end: self.stick_to_end,
+                    ..crate::VirtualFlowOptions::default()
+                },
+            )
+        }
+    }
+
+    fn virtual_flow_items(entries: &[VirtualFlowEntry]) -> crate::VirtualFlowItems {
+        crate::VirtualFlowItems::new(
+            entries
+                .iter()
+                .map(|entry| crate::VirtualFlowItem::new(entry.key)),
+        )
+        .unwrap()
+    }
+
+    fn virtual_flow_item_node(entry: &VirtualFlowEntry) -> Node<()> {
+        Node::column((0..entry.height).map(|_| Node::text(entry.label)))
+            .with_id(format!("item-{}", entry.key))
+    }
+
+    #[test]
+    fn virtual_flow_measures_once_and_preserves_prepend_anchor() {
+        let mut runtime = Runtime::with_clock(
+            VirtualFlowApp::new(
+                vec![
+                    VirtualFlowEntry {
+                        key: "a",
+                        label: "A",
+                        height: 2,
+                    },
+                    VirtualFlowEntry {
+                        key: "b",
+                        label: "B",
+                        height: 3,
+                    },
+                    VirtualFlowEntry {
+                        key: "c",
+                        label: "C",
+                        height: 1,
+                    },
+                    VirtualFlowEntry {
+                        key: "d",
+                        label: "D",
+                        height: 2,
+                    },
+                ],
+                false,
+            ),
+            RuntimeConfig::new(Size::new(4, 3)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+
+        let initial = runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(initial.surface().cell(0, 0).unwrap().content(), "A");
+        assert_eq!(initial.surface().cell(0, 2).unwrap().content(), "B");
+        assert_eq!(&*runtime.app().builds.lock().unwrap(), &["a", "b"]);
+        let state = runtime
+            .interaction()
+            .virtual_flow_state(&NodeId::from("virtual-flow"))
+            .unwrap();
+        assert_eq!(state.visible_range(), 0..2);
+
+        runtime.app().builds.lock().unwrap().clear();
+        assert!(runtime.set_scroll_offset(&NodeId::from("virtual-flow"), ScrollOffset::new(0, 2),));
+        runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(&*runtime.app().builds.lock().unwrap(), &["a", "b", "c"]);
+
+        runtime.app().builds.lock().unwrap().clear();
+        runtime.app_mut().replace_entries(
+            vec![
+                VirtualFlowEntry {
+                    key: "x",
+                    label: "X",
+                    height: 4,
+                },
+                VirtualFlowEntry {
+                    key: "a",
+                    label: "A",
+                    height: 2,
+                },
+                VirtualFlowEntry {
+                    key: "b",
+                    label: "B",
+                    height: 3,
+                },
+                VirtualFlowEntry {
+                    key: "c",
+                    label: "C",
+                    height: 1,
+                },
+                VirtualFlowEntry {
+                    key: "d",
+                    label: "D",
+                    height: 2,
+                },
+            ],
+            crate::VirtualFlowUpdate::changed(2, 1, 0..1),
+        );
+        runtime.request_frame();
+        let prepended = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(prepended.surface().cell(0, 0).unwrap().content(), "B");
+        let state = runtime
+            .interaction()
+            .virtual_flow_state(&NodeId::from("virtual-flow"))
+            .unwrap();
+        assert_eq!(state.scroll().offset, ScrollOffset::new(0, 6));
+        assert_eq!(state.anchor().unwrap().key().as_str(), "b");
+        assert_eq!(&*runtime.app().builds.lock().unwrap(), &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn virtual_flow_follows_streaming_tail_growth() {
+        let mut runtime = Runtime::with_clock(
+            VirtualFlowApp::new(
+                vec![
+                    VirtualFlowEntry {
+                        key: "a",
+                        label: "A",
+                        height: 2,
+                    },
+                    VirtualFlowEntry {
+                        key: "b",
+                        label: "B",
+                        height: 2,
+                    },
+                    VirtualFlowEntry {
+                        key: "c",
+                        label: "C",
+                        height: 1,
+                    },
+                ],
+                true,
+            ),
+            RuntimeConfig::new(Size::new(4, 3)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap().unwrap();
+
+        runtime.app_mut().replace_entries(
+            vec![
+                VirtualFlowEntry {
+                    key: "a",
+                    label: "A",
+                    height: 2,
+                },
+                VirtualFlowEntry {
+                    key: "b",
+                    label: "B",
+                    height: 2,
+                },
+                VirtualFlowEntry {
+                    key: "c",
+                    label: "C2",
+                    height: 4,
+                },
+            ],
+            crate::VirtualFlowUpdate::changed(2, 1, 2..3),
+        );
+        runtime.request_frame();
+        let streamed = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(streamed.surface().cell(0, 0).unwrap().content(), "C");
+        assert_eq!(streamed.surface().cell(1, 0).unwrap().content(), "2");
+        let state = runtime
+            .interaction()
+            .virtual_flow_state(&NodeId::from("virtual-flow"))
+            .unwrap();
+        assert_eq!(state.scroll().offset, ScrollOffset::new(0, 5));
+        assert_eq!(state.scroll().maximum, ScrollOffset::new(0, 5));
+        assert!(state.scroll().at_end);
+    }
+
+    enum VirtualFlowScrollMessage {
+        Scrolled(crate::ScrollState),
+    }
+
+    struct VirtualFlowScrollApp {
+        items: crate::VirtualFlowItems,
+        observed: Vec<crate::ScrollState>,
+    }
+
+    impl App for VirtualFlowScrollApp {
+        type Message = VirtualFlowScrollMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            match message {
+                VirtualFlowScrollMessage::Scrolled(state) => self.observed.push(state),
+            }
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            let source = crate::VirtualFlowSource::new(self.items.clone(), |context| {
+                Node::text(context.key().as_str().to_owned())
+            });
+            Node::virtual_flow_with_options(
+                "virtual-flow",
+                source,
+                crate::VirtualFlowOptions {
+                    on_scroll: Some(Box::new(VirtualFlowScrollMessage::Scrolled)),
+                    ..crate::VirtualFlowOptions::default()
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn virtual_flow_routes_core_scroll_actions_and_user_callback() {
+        let items = crate::VirtualFlowItems::new(
+            ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .map(crate::VirtualFlowItem::new),
+        )
+        .unwrap();
+        let mut runtime = Runtime::with_clock(
+            VirtualFlowScrollApp {
+                items,
+                observed: Vec::new(),
+            },
+            RuntimeConfig::new(Size::new(4, 2)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        runtime
+            .request_focus(&NodeId::from("virtual-flow"))
+            .unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        let dispatched = runtime
+            .dispatch_event(&Event::Key(KeyEvent {
+                code: KeyCode::PageDown,
+                modifiers: Modifiers::NONE,
+                action: KeyAction::Unknown,
+                text: None,
+                protocol: KeyProtocol::Legacy,
+            }))
+            .unwrap();
+        assert!(dispatched.consumed());
+        runtime.process_pending().unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        assert_eq!(runtime.app().observed.len(), 1);
+        assert_eq!(runtime.app().observed[0].offset, ScrollOffset::new(0, 2));
+        assert_eq!(
+            runtime
+                .interaction()
+                .virtual_flow_state(&NodeId::from("virtual-flow"))
+                .unwrap()
+                .scroll()
+                .offset,
+            ScrollOffset::new(0, 2)
         );
     }
 
@@ -2263,5 +3613,71 @@ mod tests {
             ScrollOffset::new(0, 3)
         );
         assert_eq!(frame.surface().cell(0, 1).unwrap().content(), "4");
+    }
+
+    struct NestedRevealApp;
+
+    impl App for NestedRevealApp {
+        type Message = ();
+
+        fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            let rows = (0..5).map(|index| {
+                let row = Node::text(index.to_string());
+                let row = if index == 4 {
+                    row.with_id("target")
+                } else {
+                    row
+                };
+                row.with_length(crate::Length::Fixed(1))
+            });
+            let inner = Node::scroll_viewport_with_options(
+                "inner",
+                Node::column(rows),
+                crate::ScrollViewportOptions {
+                    axis: crate::ScrollAxis::Vertical,
+                    ..crate::ScrollViewportOptions::default()
+                },
+            )
+            .reveal_descendant("target")
+            .with_length(crate::Length::Fixed(2));
+            Node::scroll_viewport_with_options(
+                "outer",
+                Node::column([
+                    Node::text("header").with_length(crate::Length::Fixed(2)),
+                    inner,
+                ]),
+                crate::ScrollViewportOptions {
+                    axis: crate::ScrollAxis::Vertical,
+                    ..crate::ScrollViewportOptions::default()
+                },
+            )
+            .reveal_descendant("target")
+        }
+    }
+
+    #[test]
+    fn nested_explicit_reveal_adjusts_inner_before_outer() {
+        let mut runtime = Runtime::with_clock(
+            NestedRevealApp,
+            RuntimeConfig::new(Size::new(8, 3)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+
+        let frame = runtime.render_if_dirty().unwrap().unwrap();
+
+        assert_eq!(
+            runtime.interaction().scroll_offset(&NodeId::from("inner")),
+            ScrollOffset::new(0, 3)
+        );
+        assert_eq!(
+            runtime.interaction().scroll_offset(&NodeId::from("outer")),
+            ScrollOffset::new(0, 1)
+        );
+        assert_eq!(frame.surface().cell(0, 2).unwrap().content(), "4");
     }
 }

@@ -3,47 +3,152 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
+use nagi_text::WidthProfile;
+
+use crate::terminal_capability::process_environment_profile;
 use crate::terminal_unix::{TerminalError, TerminalSession};
 use crate::{
     App, Capabilities, Event, EventAction, MouseTracking, QueueFull, Runtime, RuntimeConfig,
-    RuntimeError, RuntimeEventError, Size, SystemClock, TimedInputDecoder,
+    RuntimeError, RuntimeEventError, RuntimeNotice, Size, SystemClock, TerminalCapabilityDetection,
+    TerminalCapabilityProfile, TerminalColorLevel, TerminalFeatureSupport,
+    TerminalKeyboardProtocol, TerminalOp, TimedInputDecoder,
 };
+
+/// Error returned when an inline terminal viewport has no rows
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidInlineViewportHeight;
+
+impl fmt::Display for InvalidInlineViewportHeight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an inline terminal viewport requires a positive height")
+    }
+}
+
+impl Error for InvalidInlineViewportHeight {}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TerminalViewportKind {
+    #[default]
+    Fullscreen,
+    Inline,
+}
+
+/// Screen region owned by the standard terminal runner
+///
+/// The default is a full-screen alternate-screen viewport.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalViewport {
+    kind: TerminalViewportKind,
+    inline_height: u16,
+}
+
+impl TerminalViewport {
+    /// Full-screen alternate-screen ownership
+    pub const FULLSCREEN: Self = Self {
+        kind: TerminalViewportKind::Fullscreen,
+        inline_height: 0,
+    };
+
+    /// Creates a main-screen viewport with a positive requested row count
+    ///
+    /// The terminal runner clamps this height to the current terminal height.
+    pub const fn inline(height: u16) -> Result<Self, InvalidInlineViewportHeight> {
+        if height == 0 {
+            return Err(InvalidInlineViewportHeight);
+        }
+        Ok(Self {
+            kind: TerminalViewportKind::Inline,
+            inline_height: height,
+        })
+    }
+
+    /// Returns the requested row count for an inline viewport
+    #[must_use]
+    pub const fn inline_height(self) -> Option<u16> {
+        match self.kind {
+            TerminalViewportKind::Fullscreen => None,
+            TerminalViewportKind::Inline => Some(self.inline_height),
+        }
+    }
+}
+
+/// Standard terminal handling for application clipboard requests
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalClipboard {
+    /// Drop clipboard requests without terminal output
+    #[default]
+    Disabled,
+    /// Write clipboard requests through direct, write-only OSC 52 sequences
+    ///
+    /// The terminal runner does not detect support or add multiplexer wrapping
+    Osc52,
+}
 
 /// Settings for [`run_terminal`]
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalOptions {
     /// Optional output capabilities used by the VT encoder
     pub capabilities: Capabilities,
+    /// Capability detection policy, disabled by default
+    pub capability_detection: TerminalCapabilityDetection,
+    /// Maximum wait for active terminal capability queries
+    ///
+    /// Zero performs an immediate query check.
+    pub capability_query_timeout: Duration,
     /// SGR mouse tracking policy, or `None` to preserve terminal text selection
     pub mouse_tracking: Option<MouseTracking>,
+    /// Clipboard output policy, disabled by default
+    pub clipboard: TerminalClipboard,
+    /// Terminal screen region owned by the runner
+    pub viewport: TerminalViewport,
+    /// Maximum wait for an inline viewport cursor-position report
+    ///
+    /// Zero performs an immediate query check.
+    pub cursor_query_timeout: Duration,
     /// Whether to focus the first focusable node before the initial frame
     pub focus_first: bool,
     /// Maximum time to disambiguate a lone ESC from an escape sequence
     pub escape_timeout: Duration,
     /// Maximum number of messages waiting in the runtime queue
     pub queue_capacity: usize,
+    /// Maximum number of application updates in one scheduling cycle
+    pub max_updates_per_cycle: usize,
     /// Maximum number of effect tasks executing concurrently
     pub task_limit: usize,
     /// Maximum pending values retained by each subscription source
     pub subscription_capacity: usize,
+    /// Maximum retained asynchronous lifecycle notices
+    pub runtime_notice_capacity: usize,
     /// Smallest interval between non-urgent rendered frames
     ///
     /// The default limits rendering to 120 frames per second. Zero disables
     /// the limit.
     pub minimum_frame_interval: Duration,
+    /// Terminal cell-width policy used by the complete view
+    ///
+    /// A Custom override must return stable widths for this Runtime's lifetime
+    pub width_profile: WidthProfile<'static>,
 }
 
 impl Default for TerminalOptions {
     fn default() -> Self {
         Self {
             capabilities: Capabilities::BASELINE,
+            capability_detection: TerminalCapabilityDetection::Disabled,
+            capability_query_timeout: Duration::from_millis(100),
             mouse_tracking: None,
+            clipboard: TerminalClipboard::Disabled,
+            viewport: TerminalViewport::FULLSCREEN,
+            cursor_query_timeout: Duration::from_millis(100),
             focus_first: false,
             escape_timeout: Duration::from_millis(25),
             queue_capacity: crate::DEFAULT_QUEUE_CAPACITY,
+            max_updates_per_cycle: crate::DEFAULT_MAX_UPDATES_PER_CYCLE,
             task_limit: crate::DEFAULT_TASK_LIMIT,
             subscription_capacity: crate::DEFAULT_SUBSCRIPTION_CAPACITY,
+            runtime_notice_capacity: crate::DEFAULT_RUNTIME_NOTICE_CAPACITY,
             minimum_frame_interval: Duration::from_nanos(8_333_334),
+            width_profile: WidthProfile::MODERN,
         }
     }
 }
@@ -113,14 +218,61 @@ impl From<RuntimeEventError> for RunError {
 pub fn run_terminal<Application, Mapper>(
     app: Application,
     options: TerminalOptions,
-    mut map_event: Mapper,
+    map_event: Mapper,
 ) -> Result<Application, RunError>
 where
     Application: App,
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
 {
-    let mut session = TerminalSession::open(options.mouse_tracking).map_err(run_terminal_error)?;
-    let result = run_terminal_session(&mut session, app, options, &mut map_event);
+    run_terminal_with_notice_mapper(app, options, map_event, |_| None)
+}
+
+/// Runs an application while synchronously observing recovered failures and
+/// unexpected asynchronous lifecycle transitions
+///
+/// The terminal session restores raw mode and screen state on normal, error,
+/// and panic exits. The returned application contains its final state
+pub fn run_terminal_with_notice_handler<Application, Mapper, Handler>(
+    app: Application,
+    options: TerminalOptions,
+    map_event: Mapper,
+    mut handle_notice: Handler,
+) -> Result<Application, RunError>
+where
+    Application: App,
+    Mapper: FnMut(Event) -> EventAction<Application::Message>,
+    Handler: FnMut(&RuntimeNotice),
+{
+    run_terminal_with_notice_mapper(app, options, map_event, move |notice| {
+        handle_notice(notice);
+        None
+    })
+}
+
+/// Runs an application while mapping Runtime notices directly to optional
+/// application Messages
+///
+/// Each mapped Message is updated before the next notice is mapped, and
+/// rendering remains coalesced. The terminal session restores raw mode and
+/// screen state on normal, error, and panic exits
+pub fn run_terminal_with_notice_mapper<Application, Mapper, NoticeMapper>(
+    app: Application,
+    options: TerminalOptions,
+    mut map_event: Mapper,
+    mut map_notice: NoticeMapper,
+) -> Result<Application, RunError>
+where
+    Application: App,
+    Mapper: FnMut(Event) -> EventAction<Application::Message>,
+    NoticeMapper: FnMut(&RuntimeNotice) -> Option<Application::Message>,
+{
+    let mut session = TerminalSession::open(
+        options.mouse_tracking,
+        options.viewport,
+        options.cursor_query_timeout,
+    )
+    .map_err(run_terminal_error)?;
+    let result = run_terminal_session(&mut session, app, options, &mut map_event, &mut map_notice);
     let restoration = session.finish().map_err(run_terminal_error);
     match (result, restoration) {
         (Err(error), _) => Err(error),
@@ -129,47 +281,71 @@ where
     }
 }
 
-fn run_terminal_session<Application, Mapper>(
+fn run_terminal_session<Application, Mapper, Handler>(
     session: &mut TerminalSession,
     app: Application,
     options: TerminalOptions,
     map_event: &mut Mapper,
+    handle_notice: &mut Handler,
 ) -> Result<Application, RunError>
 where
     Application: App,
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
+    Handler: FnMut(&RuntimeNotice) -> Option<Application::Message>,
 {
-    let (columns, rows) = session.size().map_err(run_terminal_error)?;
+    let terminal_capabilities = detect_terminal_capabilities(session, options)?;
+    let output_capabilities = resolved_output_capabilities(options, terminal_capabilities);
+    let (columns, rows) = session.viewport_size().map_err(run_terminal_error)?;
     let clock = SystemClock::new();
     let mut config = RuntimeConfig::new(Size::new(u32::from(columns), u32::from(rows)));
     config.queue_capacity = options.queue_capacity;
+    config.max_updates_per_cycle = options.max_updates_per_cycle;
     config.task_limit = options.task_limit;
     config.subscription_capacity = options.subscription_capacity;
+    config.runtime_notice_capacity = options.runtime_notice_capacity;
     config.minimum_frame_interval = options.minimum_frame_interval;
+    config.width_profile = options.width_profile;
+    config.terminal_capabilities = terminal_capabilities;
     let mut runtime = Runtime::with_clock_and_wake(app, config, clock, session.wake_handle())?;
     let mut decoder = TimedInputDecoder::new(clock, options.escape_timeout);
+    decoder.set_kitty_keyboard_mode(
+        terminal_capabilities.keyboard_protocol() == TerminalKeyboardProtocol::Kitty,
+    );
     let mut input = [0_u8; 8_192];
 
     if session.take_resize() {
-        let (columns, rows) = session.size().map_err(run_terminal_error)?;
+        let (columns, rows) = session.refresh_viewport().map_err(run_terminal_error)?;
         runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
     }
     runtime.process_pending()?;
+    handle_runtime_notices(&mut runtime, handle_notice)?;
+    if !runtime.exit_requested() {
+        run_pending_terminal_tasks(session, &mut runtime, &mut decoder, handle_notice)?;
+    }
     if options.focus_first {
         runtime.focus_first()?;
     }
-    write_pending_frame(session, &mut runtime, options.capabilities)?;
+    write_pending_output(
+        session,
+        &mut runtime,
+        output_capabilities,
+        options.clipboard,
+    )?;
 
     while !runtime.exit_requested() {
-        let timeout = nearest_terminal_deadline([
-            decoder.time_until_deadline(),
-            runtime.time_until_effect_deadline(),
-            runtime.time_until_subscription_deadline(),
-            runtime.time_until_frame_deadline(),
-        ]);
+        let timeout = if runtime.has_pending_updates() {
+            Some(Duration::ZERO)
+        } else {
+            nearest_terminal_deadline([
+                decoder.time_until_deadline(),
+                runtime.time_until_effect_deadline(),
+                runtime.time_until_subscription_deadline(),
+                runtime.time_until_frame_deadline(),
+            ])
+        };
         let readable = session.wait(timeout).map_err(run_terminal_error)?;
         if session.take_resize() {
-            let (columns, rows) = session.size().map_err(run_terminal_error)?;
+            let (columns, rows) = session.refresh_viewport().map_err(run_terminal_error)?;
             runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
         }
         let mut events = if readable {
@@ -185,20 +361,36 @@ where
 
         let mut exit = false;
         for event in events {
-            if runtime.dispatch_event(&event)?.consumed() {
+            let Some(event) = session.localize_event(event) else {
                 continue;
-            }
-            match map_event(event) {
-                EventAction::Message(message) => runtime.enqueue(message)?,
-                EventAction::Exit => {
-                    exit = true;
-                    break;
+            };
+            let dispatch = runtime.dispatch_event(&event)?;
+            if !dispatch.consumed() {
+                match map_event(event) {
+                    EventAction::Message(message) => runtime.enqueue(message)?,
+                    EventAction::Exit => exit = true,
+                    EventAction::Ignore => {}
                 }
-                EventAction::Ignore => {}
+            }
+            runtime.process_queued()?;
+            if exit || runtime.exit_requested() {
+                break;
+            }
+            if run_pending_terminal_tasks(session, &mut runtime, &mut decoder, handle_notice)? {
+                break;
             }
         }
         runtime.process_pending()?;
-        write_pending_frame(session, &mut runtime, options.capabilities)?;
+        handle_runtime_notices(&mut runtime, handle_notice)?;
+        if !exit && !runtime.exit_requested() {
+            run_pending_terminal_tasks(session, &mut runtime, &mut decoder, handle_notice)?;
+        }
+        write_pending_output(
+            session,
+            &mut runtime,
+            output_capabilities,
+            options.clipboard,
+        )?;
         if exit || runtime.exit_requested() {
             break;
         }
@@ -206,21 +398,129 @@ where
     Ok(runtime.into_app())
 }
 
+fn detect_terminal_capabilities(
+    session: &mut TerminalSession,
+    options: TerminalOptions,
+) -> Result<TerminalCapabilityProfile, RunError> {
+    if options.capability_detection == TerminalCapabilityDetection::Disabled {
+        return Ok(TerminalCapabilityProfile::UNKNOWN);
+    }
+    let profile = process_environment_profile();
+    let keyboard = session
+        .enable_extended_keyboard(options.capability_query_timeout)
+        .map_err(run_terminal_error)?;
+    Ok(profile.with_extended_keyboard(
+        keyboard,
+        if keyboard == TerminalFeatureSupport::Supported {
+            TerminalKeyboardProtocol::Kitty
+        } else {
+            TerminalKeyboardProtocol::Legacy
+        },
+    ))
+}
+
+fn resolved_output_capabilities(
+    options: TerminalOptions,
+    profile: TerminalCapabilityProfile,
+) -> Capabilities {
+    let mut capabilities = options.capabilities;
+    if options.capability_detection == TerminalCapabilityDetection::Enabled {
+        let detected = match profile.color_level() {
+            TerminalColorLevel::Unknown => nagi_vt::ColorLevel::Indexed256,
+            TerminalColorLevel::Monochrome => nagi_vt::ColorLevel::Monochrome,
+            TerminalColorLevel::Ansi16 => nagi_vt::ColorLevel::Ansi16,
+            TerminalColorLevel::Indexed256 => nagi_vt::ColorLevel::Indexed256,
+            TerminalColorLevel::TrueColor => nagi_vt::ColorLevel::TrueColor,
+        };
+        capabilities.color_level = capabilities.color_level.min(detected);
+    }
+    capabilities
+}
+
+fn run_pending_terminal_tasks<Application, Handler>(
+    session: &mut TerminalSession,
+    runtime: &mut Runtime<Application, SystemClock>,
+    decoder: &mut TimedInputDecoder<SystemClock>,
+    handle_notice: &mut Handler,
+) -> Result<bool, RunError>
+where
+    Application: App,
+    Handler: FnMut(&RuntimeNotice) -> Option<Application::Message>,
+{
+    let mut ran = false;
+    while !runtime.exit_requested() && runtime.pending_terminal_tasks() > 0 {
+        session.suspend().map_err(run_terminal_error)?;
+        let ran_task = runtime.run_terminal_task();
+        session.resume().map_err(run_terminal_error)?;
+        debug_assert!(ran_task);
+        if !ran_task {
+            break;
+        }
+
+        decoder.reset();
+        runtime.invalidate_terminal_surface();
+        let (columns, rows) = session.viewport_size().map_err(run_terminal_error)?;
+        runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
+        runtime.process_pending()?;
+        handle_runtime_notices(runtime, handle_notice)?;
+        ran = true;
+    }
+    Ok(ran)
+}
+
+fn handle_runtime_notices<Application, C, Handler>(
+    runtime: &mut Runtime<Application, C>,
+    handler: &mut Handler,
+) -> Result<(), RunError>
+where
+    Application: App,
+    C: crate::Clock,
+    Handler: FnMut(&RuntimeNotice) -> Option<Application::Message>,
+{
+    for notice in runtime.drain_runtime_notices() {
+        if let Some(message) = handler(&notice) {
+            runtime.enqueue(message)?;
+            runtime.process_queued()?;
+        }
+    }
+    Ok(())
+}
+
 fn nearest_terminal_deadline(deadlines: [Option<Duration>; 4]) -> Option<Duration> {
     deadlines.into_iter().flatten().min()
 }
 
-fn write_pending_frame<Application: App>(
+fn write_pending_output<Application: App>(
     session: &mut TerminalSession,
     runtime: &mut Runtime<Application, SystemClock>,
     capabilities: Capabilities,
+    clipboard: TerminalClipboard,
 ) -> Result<(), RunError> {
-    if let Some(frame) = runtime.render_if_dirty()? {
-        session
-            .write_operations(frame.operations(), capabilities)
-            .map_err(run_terminal_error)?;
+    let frame = runtime.render_if_dirty()?;
+    let clipboard_operation = take_clipboard_operation(runtime, clipboard);
+    match (frame.as_ref(), clipboard_operation.as_ref()) {
+        (Some(frame), extra) => session
+            .write_viewport_operations_with_extra(
+                frame.operations(),
+                frame.surface().cursor().map(|cursor| (cursor.x, cursor.y)),
+                extra,
+                capabilities,
+            )
+            .map_err(run_terminal_error)?,
+        (None, Some(operation)) => session
+            .write_operations(std::slice::from_ref(operation), capabilities)
+            .map_err(run_terminal_error)?,
+        (None, None) => {}
     }
     Ok(())
+}
+
+fn take_clipboard_operation<Application: App, C: crate::Clock>(
+    runtime: &mut Runtime<Application, C>,
+    clipboard: TerminalClipboard,
+) -> Option<TerminalOp> {
+    let request = runtime.take_clipboard_request()?;
+    (clipboard == TerminalClipboard::Osc52).then(|| TerminalOp::SetClipboard(request.into_text()))
 }
 
 fn run_terminal_error(error: TerminalError) -> RunError {
@@ -230,19 +530,132 @@ fn run_terminal_error(error: TerminalError) -> RunError {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
     use std::time::Duration;
 
-    use super::{TerminalOptions, nearest_terminal_deadline};
+    use crate::{
+        App, DeliveryPolicy, Effect, Node, Runtime, RuntimeConfig, RuntimeNoticeKind, Size,
+        Subscription, ViewContext, VirtualClock,
+    };
+
+    use super::{
+        TerminalClipboard, TerminalOptions, TerminalViewport, handle_runtime_notices,
+        nearest_terminal_deadline, resolved_output_capabilities, take_clipboard_operation,
+    };
+
+    struct ClipboardApp;
+
+    struct NoticeMapperApp {
+        notices: Vec<RuntimeNoticeKind>,
+    }
+
+    impl App for NoticeMapperApp {
+        type Message = RuntimeNoticeKind;
+
+        fn init(&mut self) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            self.notices.push(message);
+            Effect::none()
+        }
+
+        fn subscriptions(&self) -> Subscription<Self::Message> {
+            Subscription::stream("notice-mapper", DeliveryPolicy::reliable(), |_, _| {})
+        }
+
+        fn view(&self, _context: ViewContext) -> Node<Self::Message> {
+            Node::text("")
+        }
+    }
+
+    impl App for ClipboardApp {
+        type Message = &'static str;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            Effect::set_clipboard(message).without_redraw()
+        }
+
+        fn view(&self, _context: ViewContext) -> Node<Self::Message> {
+            Node::text("view")
+        }
+    }
 
     #[test]
     fn defaults_preserve_unfocused_non_mouse_behavior() {
         let options = TerminalOptions::default();
         assert_eq!(options.mouse_tracking, None);
+        assert_eq!(options.clipboard, TerminalClipboard::Disabled);
+        assert_eq!(
+            options.capability_detection,
+            crate::TerminalCapabilityDetection::Disabled
+        );
+        assert_eq!(options.capability_query_timeout, Duration::from_millis(100));
+        assert_eq!(options.viewport, TerminalViewport::FULLSCREEN);
+        assert_eq!(options.cursor_query_timeout, Duration::from_millis(100));
         assert!(!options.focus_first);
+        assert_eq!(
+            options.max_updates_per_cycle,
+            crate::DEFAULT_MAX_UPDATES_PER_CYCLE
+        );
         assert_eq!(
             options.minimum_frame_interval,
             std::time::Duration::from_nanos(8_333_334)
         );
+    }
+
+    #[test]
+    fn detected_color_level_bounds_explicit_encoder_level() {
+        let mut options = TerminalOptions {
+            capabilities: crate::Capabilities::MODERN,
+            capability_detection: crate::TerminalCapabilityDetection::Enabled,
+            ..TerminalOptions::default()
+        };
+        let indexed = crate::TerminalCapabilityProfile::UNKNOWN
+            .with_color_level(crate::TerminalColorLevel::Indexed256);
+        assert_eq!(
+            resolved_output_capabilities(options, indexed).color_level,
+            crate::ColorLevel::Indexed256
+        );
+
+        let ansi = crate::TerminalCapabilityProfile::UNKNOWN
+            .with_color_level(crate::TerminalColorLevel::Ansi16);
+        assert_eq!(
+            resolved_output_capabilities(options, ansi).color_level,
+            crate::ColorLevel::Ansi16
+        );
+
+        let monochrome = crate::TerminalCapabilityProfile::UNKNOWN
+            .with_color_level(crate::TerminalColorLevel::Monochrome);
+        assert_eq!(
+            resolved_output_capabilities(options, monochrome).color_level,
+            crate::ColorLevel::Monochrome
+        );
+
+        let true_color = crate::TerminalCapabilityProfile::UNKNOWN
+            .with_color_level(crate::TerminalColorLevel::TrueColor);
+        assert_eq!(
+            resolved_output_capabilities(options, true_color).color_level,
+            crate::ColorLevel::TrueColor
+        );
+
+        options.capabilities = crate::Capabilities::BASELINE;
+        assert_eq!(
+            resolved_output_capabilities(options, true_color).color_level,
+            crate::ColorLevel::Indexed256
+        );
+    }
+
+    #[test]
+    fn inline_viewport_requires_positive_height() {
+        assert_eq!(
+            TerminalViewport::inline(0),
+            Err(super::InvalidInlineViewportHeight)
+        );
+        let viewport = TerminalViewport::inline(4).unwrap();
+        assert_eq!(viewport.inline_height(), Some(4));
+        assert_eq!(TerminalViewport::default().inline_height(), None);
     }
 
     #[test]
@@ -256,6 +669,59 @@ mod tests {
                 Some(Duration::from_millis(8)),
             ]),
             Some(Duration::from_millis(8))
+        );
+    }
+
+    #[test]
+    fn runtime_notice_mapper_updates_application_state_without_a_subscription() {
+        let mut runtime = Runtime::with_clock(
+            NoticeMapperApp {
+                notices: Vec::new(),
+            },
+            RuntimeConfig::new(Size::new(1, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        for _ in 0..10_000 {
+            runtime.poll_effects();
+            if runtime.pending_runtime_notices() != 0 {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        handle_runtime_notices(&mut runtime, &mut |notice| Some(notice.kind())).unwrap();
+
+        assert_eq!(
+            runtime.app().notices,
+            [RuntimeNoticeKind::SubscriptionStreamCompleted]
+        );
+        assert_eq!(runtime.pending_runtime_notices(), 0);
+        runtime.close_and_wait();
+    }
+
+    #[test]
+    fn clipboard_output_is_explicit_and_does_not_require_a_frame() {
+        let mut runtime = Runtime::with_clock(
+            ClipboardApp,
+            RuntimeConfig::new(Size::new(8, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        runtime.enqueue("copy").unwrap();
+        runtime.process_pending().unwrap();
+        assert_eq!(
+            take_clipboard_operation(&mut runtime, TerminalClipboard::Disabled),
+            None
+        );
+
+        runtime.enqueue("copy").unwrap();
+        runtime.process_pending().unwrap();
+        assert_eq!(
+            take_clipboard_operation(&mut runtime, TerminalClipboard::Osc52),
+            Some(crate::TerminalOp::SetClipboard("copy".to_owned()))
         );
     }
 }

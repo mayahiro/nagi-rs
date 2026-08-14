@@ -5,8 +5,9 @@ use std::fmt;
 use std::time::Duration;
 
 use nagi_tui::{
-    App, EffectDiagnostics, Event, EventAction, Frame, InteractionState, NodeId, QueueFull,
-    Runtime, RuntimeConfig, RuntimeError, RuntimeEventError, ScrollOffset, ScrollState, Size,
+    App, ClipboardRequest, EffectDiagnostics, Event, EventAction, Frame, InteractionState, NodeId,
+    QueueFull, ResolvedActions, Runtime, RuntimeConfig, RuntimeError, RuntimeEventError,
+    RuntimeNotice, RuntimeNoticeDiagnostics, ScrollOffset, ScrollState, Size,
     SubscriptionDiagnostics, SubscriptionKey, TaskKey, TimedInputDecoder, VirtualClock,
 };
 
@@ -139,6 +140,17 @@ where
         self.runtime.interaction()
     }
 
+    /// Returns the latest pending clipboard request without clearing it
+    #[must_use]
+    pub fn pending_clipboard_request(&self) -> Option<&ClipboardRequest> {
+        self.runtime.pending_clipboard_request()
+    }
+
+    /// Takes and clears the latest pending clipboard request
+    pub fn take_clipboard_request(&mut self) -> Option<ClipboardRequest> {
+        self.runtime.take_clipboard_request()
+    }
+
     /// Requests focus for a focusable ID in the current semantic tree
     pub fn request_focus(&mut self, id: &NodeId) -> Result<bool, HarnessError> {
         Ok(self.runtime.request_focus(id)?)
@@ -165,6 +177,11 @@ where
         self.runtime.interaction().scroll_state(id)
     }
 
+    /// Returns resolved action groups on the active target-to-root route
+    pub fn active_action_groups(&mut self) -> Result<Vec<ResolvedActions>, HarnessError> {
+        Ok(self.runtime.active_action_groups()?)
+    }
+
     /// Returns the number of supervised tasks that have not fully finished
     #[must_use]
     pub fn active_tasks(&self) -> usize {
@@ -181,6 +198,28 @@ where
     #[must_use]
     pub fn pending_tasks(&self) -> usize {
         self.runtime.pending_tasks()
+    }
+
+    /// Returns terminal-suspending tasks waiting for the virtual driver
+    #[must_use]
+    pub fn pending_terminal_tasks(&self) -> usize {
+        self.runtime.pending_terminal_tasks()
+    }
+
+    /// Runs one terminal-suspending task and simulates a restored terminal
+    /// boundary
+    ///
+    /// Incomplete terminal input is discarded, the terminal diff baseline is
+    /// invalidated, the task result is processed, and at most one frame is
+    /// captured
+    pub fn run_terminal_task(&mut self) -> Result<bool, HarnessError> {
+        if !self.runtime.run_terminal_task() {
+            return Ok(false);
+        }
+        self.decoder.reset();
+        self.runtime.invalidate_terminal_surface();
+        self.step()?;
+        Ok(true)
     }
 
     /// Returns completed effect messages waiting for queue capacity
@@ -237,6 +276,35 @@ where
         self.runtime.subscription_diagnostics()
     }
 
+    /// Returns retained asynchronous lifecycle notices
+    #[must_use]
+    pub fn pending_runtime_notices(&self) -> usize {
+        self.runtime.pending_runtime_notices()
+    }
+
+    /// Removes and returns retained notices in occurrence order
+    pub fn drain_runtime_notices(&mut self) -> Vec<RuntimeNotice> {
+        self.runtime.drain_runtime_notices()
+    }
+
+    /// Returns bounded Runtime notice queue counters
+    #[must_use]
+    pub fn runtime_notice_diagnostics(&self) -> RuntimeNoticeDiagnostics {
+        self.runtime.runtime_notice_diagnostics()
+    }
+
+    /// Requests cooperative cancellation and waits for Nagi-started Effect and
+    /// Stream producer functions to return
+    pub fn close_and_wait(&mut self) {
+        self.runtime.close_and_wait();
+    }
+
+    /// Requests cooperative cancellation and waits up to `timeout` for
+    /// Nagi-started producer functions to return
+    pub fn close_and_wait_timeout(&mut self, timeout: Duration) -> bool {
+        self.runtime.close_and_wait_timeout(timeout)
+    }
+
     /// Injects one application message and completes one coalesced step
     pub fn send(&mut self, message: Application::Message) -> Result<(), HarnessError> {
         self.runtime.enqueue(message)?;
@@ -271,7 +339,7 @@ where
         self.step()
     }
 
-    /// Processes queued messages and captures at most one rendered frame
+    /// Processes one bounded scheduling cycle and captures at most one frame
     pub fn step(&mut self) -> Result<(), HarnessError> {
         let messages = &mut self.messages;
         self.runtime
@@ -307,18 +375,21 @@ where
 
     fn dispatch(&mut self, events: Vec<Event>) -> Result<(), HarnessError> {
         for event in events {
-            if self.runtime.dispatch_event(&event)?.consumed() {
-                continue;
+            let dispatch = self.runtime.dispatch_event(&event)?;
+            if !dispatch.consumed() {
+                match (self.map_event)(event) {
+                    EventAction::Message(message) => {
+                        self.runtime.enqueue(message)?;
+                    }
+                    EventAction::Exit => self.exit_requested = true,
+                    EventAction::Ignore => {}
+                }
             }
-            match (self.map_event)(event) {
-                EventAction::Message(message) => {
-                    self.runtime.enqueue(message)?;
-                }
-                EventAction::Exit => {
-                    self.exit_requested = true;
-                    break;
-                }
-                EventAction::Ignore => {}
+            let messages = &mut self.messages;
+            self.runtime
+                .process_queued_with(|message| messages.push(message.clone()))?;
+            if self.exit_requested || self.runtime.exit_requested() {
+                break;
             }
         }
         Ok(())
@@ -336,7 +407,10 @@ where
 mod tests {
     use std::thread;
 
-    use nagi_tui::{DeliveryPolicy, Effect, KeyCode, Node, Subscription, Task};
+    use nagi_tui::{
+        Action, ActionDescriptor, DeliveryPolicy, Effect, EventResult, KeyBinding, KeyCode,
+        KeyStroke, Modifiers, Node, Subscription, Task,
+    };
 
     use super::*;
 
@@ -384,6 +458,240 @@ mod tests {
         assert_eq!(harness.frames().len(), 2);
         assert_eq!(harness.message_history().len(), 2);
         assert!(harness.exit_requested());
+    }
+
+    #[derive(Clone)]
+    struct ClipboardMessage(&'static str);
+
+    struct ClipboardApp;
+
+    impl App for ClipboardApp {
+        type Message = ClipboardMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            Effect::set_clipboard(message.0).without_redraw()
+        }
+
+        fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+            Node::text("clipboard")
+        }
+    }
+
+    #[test]
+    fn pending_clipboard_requests_are_observable_and_takeable() {
+        let mut harness =
+            Harness::new(ClipboardApp, Size::new(12, 1), |_| EventAction::Ignore).unwrap();
+
+        harness.send(ClipboardMessage("copy")).unwrap();
+
+        assert_eq!(
+            harness
+                .pending_clipboard_request()
+                .map(ClipboardRequest::text),
+            Some("copy")
+        );
+        assert_eq!(
+            harness
+                .take_clipboard_request()
+                .map(ClipboardRequest::into_text),
+            Some("copy".to_owned())
+        );
+        assert!(harness.take_clipboard_request().is_none());
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum TerminalMessage {
+        Open,
+        Returned,
+    }
+
+    #[derive(Default)]
+    struct TerminalApp {
+        returned: bool,
+    }
+
+    impl App for TerminalApp {
+        type Message = TerminalMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            match message {
+                TerminalMessage::Open => Effect::suspend_terminal(|_| TerminalMessage::Returned),
+                TerminalMessage::Returned => {
+                    self.returned = true;
+                    Effect::none()
+                }
+            }
+        }
+
+        fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+            Node::text(if self.returned { "returned" } else { "ready" })
+        }
+    }
+
+    #[test]
+    fn terminal_task_boundary_is_deterministic_and_discards_pending_input() {
+        let mut harness = Harness::new(
+            TerminalApp::default(),
+            Size::new(8, 1),
+            |event| match event {
+                Event::Key(key) if key.code == KeyCode::Escape => EventAction::Exit,
+                _ => EventAction::Ignore,
+            },
+        )
+        .unwrap();
+        harness.send(TerminalMessage::Open).unwrap();
+        harness.input(b"\x1B").unwrap();
+
+        assert_eq!(harness.pending_terminal_tasks(), 1);
+        assert!(harness.run_terminal_task().unwrap());
+        assert!(harness.app().returned);
+        assert_eq!(harness.pending_terminal_tasks(), 0);
+        assert!(!harness.run_terminal_task().unwrap());
+
+        harness.advance(Duration::from_millis(25)).unwrap();
+        assert!(!harness.exit_requested());
+        assert_eq!(
+            harness.message_history(),
+            [TerminalMessage::Open, TerminalMessage::Returned]
+        );
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    struct ControlledInputMessage {
+        value: String,
+        selection: usize,
+    }
+
+    #[derive(Default)]
+    struct ControlledInputApp {
+        value: String,
+        selection: usize,
+    }
+
+    impl App for ControlledInputApp {
+        type Message = ControlledInputMessage;
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            self.value = message.value;
+            self.selection = message.selection;
+            Effect::none()
+        }
+
+        fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+            let value = self.value.clone();
+            let selection = self.selection;
+            Node::text(&self.value)
+                .focusable("controlled")
+                .on_event("controlled", move |event| match event {
+                    Event::Text(text) => EventResult::message(ControlledInputMessage {
+                        value: format!("{value}{text}"),
+                        selection,
+                    }),
+                    Event::Key(key) if key.code == KeyCode::Backspace => {
+                        let mut next = value.clone();
+                        next.pop();
+                        EventResult::message(ControlledInputMessage {
+                            value: next,
+                            selection,
+                        })
+                    }
+                    Event::Key(key) if key.code == KeyCode::Down => {
+                        EventResult::message(ControlledInputMessage {
+                            value: value.clone(),
+                            selection: selection + 1,
+                        })
+                    }
+                    _ => EventResult::ignored(),
+                })
+        }
+    }
+
+    #[test]
+    fn controlled_input_events_are_processed_sequentially() {
+        let cases = [
+            (
+                "unicode text",
+                ControlledInputApp::default(),
+                "A日".as_bytes(),
+                "A日",
+                0,
+            ),
+            (
+                "backspace",
+                ControlledInputApp {
+                    value: "abc".to_owned(),
+                    selection: 0,
+                },
+                b"\x7f\x7f".as_slice(),
+                "a",
+                0,
+            ),
+            (
+                "down",
+                ControlledInputApp::default(),
+                b"\x1b[B\x1b[B".as_slice(),
+                "",
+                2,
+            ),
+        ];
+        for (name, app, input, expected_value, expected_selection) in cases {
+            let mut harness = Harness::new(app, Size::new(8, 1), |_| EventAction::Ignore)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(
+                harness.request_focus(&NodeId::from("controlled")).unwrap(),
+                "{name}"
+            );
+            harness
+                .input(input)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(harness.app().value, expected_value, "{name}");
+            assert_eq!(harness.app().selection, expected_selection, "{name}");
+            assert_eq!(harness.frames().len(), 2, "{name}");
+        }
+    }
+
+    struct ActionProjectionApp;
+
+    impl App for ActionProjectionApp {
+        type Message = ();
+
+        fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+            Node::text("action").focusable("owner").on_actions(
+                "owner",
+                [Action::new(
+                    ActionDescriptor::new(
+                        "app.action",
+                        "Action",
+                        [KeyBinding::new(KeyStroke::character('x', Modifiers::NONE))],
+                    ),
+                    |_| EventResult::consumed(),
+                )],
+            )
+        }
+    }
+
+    #[test]
+    fn active_action_projection_is_observable() {
+        let mut harness = Harness::new(ActionProjectionApp, Size::new(8, 1), |_| {
+            EventAction::Ignore
+        })
+        .unwrap();
+        harness.request_focus(&NodeId::from("owner")).unwrap();
+
+        let groups = harness.active_action_groups().unwrap();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].owner().as_str(), "owner");
+        assert_eq!(groups[0].actions()[0].id().as_str(), "app.action");
+        assert_eq!(groups[1].owner().as_str(), "owner");
+        assert_eq!(
+            groups[1].actions()[0].id().as_str(),
+            nagi_tui::FOCUS_NEXT_ACTION_ID
+        );
     }
 
     struct ManualApp {
@@ -502,5 +810,84 @@ mod tests {
         assert!(!source.is_active());
         assert_eq!(harness.active_subscriptions(), 0);
         assert_eq!(harness.message_history().len(), 2);
+    }
+
+    #[test]
+    fn bounded_stream_cycle_gives_the_next_input_event_priority() {
+        let source = manual_subscription();
+        let mut config = RuntimeConfig::new(Size::new(16, 1));
+        config.max_updates_per_cycle = 2;
+        let mut harness = Harness::with_config(
+            ManualSubscriptionApp {
+                source: source.clone(),
+                running: true,
+                values: Vec::new(),
+            },
+            config,
+            Duration::from_millis(25),
+            |event| match event {
+                Event::Text(value) => EventAction::Message(SubscriptionMessage::Value(value)),
+                _ => EventAction::Ignore,
+            },
+        )
+        .unwrap();
+        source.wait_started();
+        for value in ["s0", "s1", "s2", "s3", "s4", "s5"] {
+            source
+                .send(SubscriptionMessage::Value(value.to_owned()))
+                .unwrap();
+        }
+
+        harness.step().unwrap();
+        assert_eq!(harness.app().values, ["s0", "s1"]);
+
+        harness.input(b"x").unwrap();
+        assert_eq!(harness.app().values, ["s0", "s1", "x", "s2", "s3"]);
+
+        harness.step().unwrap();
+        assert_eq!(
+            harness.app().values,
+            ["s0", "s1", "x", "s2", "s3", "s4", "s5"]
+        );
+    }
+
+    struct CompletedStreamHarnessApp;
+
+    impl App for CompletedStreamHarnessApp {
+        type Message = ();
+
+        fn update(&mut self, (): Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn subscriptions(&self) -> Subscription<Self::Message> {
+            Subscription::stream("events", DeliveryPolicy::reliable(), |_, _| {})
+        }
+
+        fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+            Node::text("")
+        }
+    }
+
+    #[test]
+    fn runtime_notices_are_observable() {
+        let mut harness = Harness::new(CompletedStreamHarnessApp, Size::new(1, 1), |_| {
+            EventAction::Ignore
+        })
+        .unwrap();
+
+        for _ in 0..10_000 {
+            if harness.pending_runtime_notices() > 0 {
+                break;
+            }
+            thread::yield_now();
+        }
+        let notices = harness.drain_runtime_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].kind(),
+            nagi_tui::RuntimeNoticeKind::SubscriptionStreamCompleted
+        );
+        assert_eq!(harness.runtime_notice_diagnostics().dropped(), 0);
     }
 }

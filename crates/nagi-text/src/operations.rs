@@ -102,6 +102,9 @@ pub fn wrapped_lines<'text, 'profile>(
 /// Returns the total terminal cell width of `text`
 #[must_use]
 pub fn text_width(text: &str, profile: WidthProfile<'_>) -> usize {
+    if text.is_ascii() && !profile.has_override() {
+        return text.bytes().filter(|byte| !byte.is_ascii_control()).count();
+    }
     graphemes(text).fold(0, |total, grapheme| {
         total.saturating_add(cluster_width(grapheme.text(), profile))
     })
@@ -195,8 +198,16 @@ fn is_mandatory_break(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{byte_at_cell, cell_at_byte, truncate, wrap, wrapped_lines};
-    use crate::width::WidthProfile;
+    use super::{byte_at_cell, cell_at_byte, text_width, truncate, wrap, wrapped_lines};
+    use crate::width::{CellCount, WidthProfile};
+
+    #[test]
+    fn ascii_width_fast_path_preserves_controls_and_custom_overrides() {
+        assert_eq!(text_width("A\tB\u{7f}", WidthProfile::MODERN), 2);
+        let override_width = |grapheme: &str| (grapheme == "A").then_some(CellCount::Two);
+        let profile = WidthProfile::custom(WidthProfile::MODERN, &override_width);
+        assert_eq!(text_width("AB", profile), 3);
+    }
 
     #[test]
     fn cell_operations_do_not_split_wide_graphemes() {

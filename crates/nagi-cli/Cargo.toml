@@ -13,4 +13,24 @@ missing_docs = "deny"
 unsafe_code = "allow"
 
 [dependencies]
-nagi-text = { path = "../nagi-text", version = "0.2.7" }
+nagi-text = { path = "../nagi-text", version = "0.4.0" }
+
+[[bench]]
+name = "inherited_options"
+harness = false
+
+[[bench]]
+name = "completion"
+harness = false
+
+[[bench]]
+name = "diagnostic_json"
+harness = false
+
+[[bench]]
+name = "value_resolution"
+harness = false
+
+[[bench]]
+name = "response_file"
+harness = false

@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 use std::time::Duration;
 
 use crate::effect::{EffectKind, RuntimeCommand, Task};
+use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeKind, RuntimeNoticeQueue};
 use crate::wake::WakeHandle;
+use crate::worker_tracker::WorkerTracker;
 use crate::{CancelToken, Effect, ScopeId, TaskKey, Timestamp};
 
 /// Counters describing supervised task behavior
@@ -30,7 +33,7 @@ impl EffectDiagnostics {
         self.stale_results
     }
 
-    /// Returns the number of task panics caught at the worker boundary
+    /// Returns the number of task panics caught at an Effect execution boundary
     #[must_use]
     pub const fn task_panics(self) -> u64 {
         self.task_panics
@@ -71,6 +74,14 @@ struct TaskState<Message> {
     cancelled: bool,
 }
 
+struct TerminalTaskState<Message> {
+    status: TaskStatus<Message>,
+    token: CancelToken,
+    scopes: Vec<ScopeTag>,
+    continuation: Option<Continuation>,
+    cancelled: bool,
+}
+
 enum TaskResult<Message> {
     Message(Message),
     Panicked,
@@ -108,6 +119,8 @@ pub(crate) struct EffectSupervisor<Message> {
     tasks: HashMap<u64, TaskState<Message>>,
     pending: VecDeque<u64>,
     running: usize,
+    terminal_tasks: HashMap<u64, TerminalTaskState<Message>>,
+    pending_terminal: VecDeque<u64>,
     latest: HashMap<TaskKey, (u64, u64)>,
     generations: HashMap<TaskKey, u64>,
     scope_generations: HashMap<ScopeId, u64>,
@@ -119,6 +132,9 @@ pub(crate) struct EffectSupervisor<Message> {
     next_identifier: u64,
     next_order: u64,
     diagnostics: EffectDiagnostics,
+    notices: Option<Arc<RuntimeNoticeQueue>>,
+    workers: WorkerTracker,
+    closed: bool,
 }
 
 impl<Message: Send + 'static> EffectSupervisor<Message> {
@@ -132,6 +148,8 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             tasks: HashMap::new(),
             pending: VecDeque::new(),
             running: 0,
+            terminal_tasks: HashMap::new(),
+            pending_terminal: VecDeque::new(),
             latest: HashMap::new(),
             generations: HashMap::new(),
             scope_generations: HashMap::new(),
@@ -143,6 +161,9 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             next_identifier: 1,
             next_order: 0,
             diagnostics: EffectDiagnostics::default(),
+            notices: None,
+            workers: WorkerTracker::default(),
+            closed: false,
         }
     }
 
@@ -150,11 +171,25 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
         self.wake = wake;
     }
 
+    pub(crate) fn set_notices(&mut self, notices: Arc<RuntimeNoticeQueue>) {
+        self.notices = Some(notices);
+    }
+
+    pub(crate) fn set_worker_tracker(&mut self, workers: WorkerTracker) {
+        self.workers = workers;
+    }
+
     pub(crate) fn schedule(&mut self, effect: Effect<Message>, now: Timestamp) {
+        if self.closed {
+            return;
+        }
         self.start_effect(effect, Vec::new(), Continuation::None, now);
     }
 
     pub(crate) fn poll(&mut self, now: Timestamp) {
+        if self.closed {
+            return;
+        }
         self.poll_timers(now);
         while let Ok(outcome) = self.receiver.try_recv() {
             self.finish_task(outcome, now);
@@ -162,9 +197,14 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
         self.spawn_available(now);
     }
 
+    #[cfg(test)]
     pub(crate) fn take_ready(&mut self, maximum: usize) -> Vec<Message> {
         let count = maximum.min(self.ready.len());
         self.ready.drain(..count).collect()
+    }
+
+    pub(crate) fn pop_ready(&mut self) -> Option<Message> {
+        self.ready.pop_front()
     }
 
     pub(crate) fn take_commands(&mut self) -> Vec<RuntimeCommand> {
@@ -173,6 +213,29 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
 
     pub(crate) fn ready_messages(&self) -> usize {
         self.ready.len()
+    }
+
+    pub(crate) fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        for task in self.tasks.values() {
+            task.token.cancel();
+        }
+        for task in self.terminal_tasks.values() {
+            task.token.cancel();
+        }
+        self.tasks.clear();
+        self.pending.clear();
+        self.running = 0;
+        self.terminal_tasks.clear();
+        self.pending_terminal.clear();
+        self.latest.clear();
+        self.timers.clear();
+        self.sequences.clear();
+        self.barriers.clear();
+        self.commands.clear();
     }
 
     pub(crate) fn active_tasks(&self) -> usize {
@@ -188,6 +251,37 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             .values()
             .filter(|task| matches!(task.status, TaskStatus::Pending(_)))
             .count()
+    }
+
+    pub(crate) fn pending_terminal_tasks(&self) -> usize {
+        self.terminal_tasks
+            .values()
+            .filter(|task| matches!(task.status, TaskStatus::Pending(_)))
+            .count()
+    }
+
+    pub(crate) fn run_terminal_task(&mut self, now: Timestamp) -> bool {
+        loop {
+            let Some(id) = self.pending_terminal.pop_front() else {
+                return false;
+            };
+            let Some(state) = self.terminal_tasks.get_mut(&id) else {
+                continue;
+            };
+            if state.cancelled {
+                continue;
+            }
+            let TaskStatus::Pending(task) =
+                std::mem::replace(&mut state.status, TaskStatus::Running)
+            else {
+                continue;
+            };
+            let token = state.token.clone();
+            let result = catch_unwind(AssertUnwindSafe(|| task(token)))
+                .map_or(TaskResult::Panicked, TaskResult::Message);
+            self.finish_terminal_task(id, result, now);
+            return true;
+        }
     }
 
     pub(crate) const fn diagnostics(&self) -> EffectDiagnostics {
@@ -233,6 +327,14 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
                 self.commands
                     .push_back(RuntimeCommand::ScrollTo { id, offset });
                 self.complete(continuation, now);
+            }
+            EffectKind::SetClipboard(request) => {
+                self.commands
+                    .push_back(RuntimeCommand::SetClipboard(request));
+                self.complete(continuation, now);
+            }
+            EffectKind::SuspendTerminal(task) => {
+                self.start_terminal_task(task, scopes, continuation);
             }
             EffectKind::Run(task) => {
                 self.start_task(task, scopes, continuation, None, now);
@@ -346,6 +448,26 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
         id
     }
 
+    fn start_terminal_task(
+        &mut self,
+        task: Task<Message>,
+        scopes: Vec<ScopeTag>,
+        continuation: Continuation,
+    ) {
+        let id = self.identifier();
+        self.terminal_tasks.insert(
+            id,
+            TerminalTaskState {
+                status: TaskStatus::Pending(task),
+                token: CancelToken::default(),
+                scopes,
+                continuation: Some(continuation),
+                cancelled: false,
+            },
+        );
+        self.pending_terminal.push_back(id);
+    }
+
     fn spawn_available(&mut self, now: Timestamp) {
         while self.running < self.task_limit {
             let Some(id) = self.pending.pop_front() else {
@@ -365,10 +487,12 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             let token = state.token.clone();
             let sender = self.sender.clone();
             let wake = self.wake.clone();
+            let worker = self.workers.track();
             self.running += 1;
             let spawned = thread::Builder::new()
                 .name(format!("nagi-tui-effect-{id}"))
                 .spawn(move || {
+                    let _worker = worker;
                     let result = catch_unwind(AssertUnwindSafe(|| task(token)))
                         .map_or(TaskResult::Panicked, TaskResult::Message);
                     if sender.send(TaskOutcome { id, result }).is_ok() {
@@ -406,6 +530,12 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             }
             TaskResult::Panicked => {
                 self.diagnostics.task_panics = self.diagnostics.task_panics.saturating_add(1);
+                if let Some(notices) = &self.notices {
+                    notices.push(RuntimeNotice::effect(
+                        RuntimeNoticeKind::EffectPanicked,
+                        state.latest.as_ref(),
+                    ));
+                }
             }
         }
         if let Some(continuation) = state.continuation.take() {
@@ -414,10 +544,42 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
         self.spawn_available(now);
     }
 
+    fn finish_terminal_task(&mut self, id: u64, result: TaskResult<Message>, now: Timestamp) {
+        let Some(mut state) = self.terminal_tasks.remove(&id) else {
+            return;
+        };
+        match result {
+            TaskResult::Message(message) if !state.cancelled => {
+                self.ready.push_back(message);
+            }
+            TaskResult::Message(_) => {
+                self.diagnostics.stale_results = self.diagnostics.stale_results.saturating_add(1);
+            }
+            TaskResult::Panicked => {
+                self.diagnostics.task_panics = self.diagnostics.task_panics.saturating_add(1);
+                if let Some(notices) = &self.notices {
+                    notices.push(RuntimeNotice::effect(
+                        RuntimeNoticeKind::EffectPanicked,
+                        None,
+                    ));
+                }
+            }
+        }
+        if let Some(continuation) = state.continuation.take() {
+            self.complete(continuation, now);
+        }
+    }
+
     fn finish_without_message(&mut self, id: u64, now: Timestamp) {
         let Some(mut state) = self.tasks.remove(&id) else {
             return;
         };
+        if let Some(notices) = &self.notices {
+            notices.push(RuntimeNotice::effect(
+                RuntimeNoticeKind::EffectSpawnFailed,
+                state.latest.as_ref(),
+            ));
+        }
         if matches!(state.status, TaskStatus::Running) {
             self.running = self.running.saturating_sub(1);
         }
@@ -463,6 +625,27 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
         self.spawn_available(now);
     }
 
+    fn cancel_terminal_task(&mut self, id: u64, now: Timestamp) {
+        let Some(state) = self.terminal_tasks.get_mut(&id) else {
+            return;
+        };
+        if state.cancelled {
+            return;
+        }
+        state.cancelled = true;
+        state.token.cancel();
+        self.diagnostics.cancellations = self.diagnostics.cancellations.saturating_add(1);
+        let continuation = state.continuation.take();
+        let pending = matches!(state.status, TaskStatus::Pending(_));
+        if pending {
+            self.terminal_tasks.remove(&id);
+            self.pending_terminal.retain(|pending_id| *pending_id != id);
+        }
+        if let Some(continuation) = continuation {
+            self.complete(continuation, now);
+        }
+    }
+
     fn cancel_scope(&mut self, scope: &ScopeId, now: Timestamp) {
         let generation = self.scope_generations.get(scope).copied().unwrap_or(0);
         self.scope_generations
@@ -479,6 +662,20 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             .collect();
         for id in tasks {
             self.cancel_task(id, now);
+        }
+
+        let terminal_tasks: Vec<_> = self
+            .terminal_tasks
+            .iter()
+            .filter(|(_, task)| {
+                task.scopes
+                    .iter()
+                    .any(|tag| tag.id == *scope && tag.generation == generation)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in terminal_tasks {
+            self.cancel_terminal_task(id, now);
         }
 
         let mut retained = Vec::with_capacity(self.timers.len());
@@ -576,6 +773,9 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
 impl<Message> Drop for EffectSupervisor<Message> {
     fn drop(&mut self) {
         for task in self.tasks.values() {
+            task.token.cancel();
+        }
+        for task in self.terminal_tasks.values() {
             task.token.cancel();
         }
     }
@@ -798,6 +998,102 @@ mod tests {
         });
         supervisor.poll(Timestamp::default());
         assert_eq!(supervisor.take_ready(usize::MAX), ["recovered"]);
+    }
+
+    #[test]
+    fn terminal_suspension_matches_shared_fixtures() {
+        let Some(records) = fixture_support::load(
+            "effects/terminal-suspend.txt",
+            "effect-terminal-suspend",
+            &["mode", "pending", "expected", "panics", "cancellations"],
+        ) else {
+            return;
+        };
+        for record in records {
+            let mut supervisor = EffectSupervisor::new(1);
+            match record.field("mode") {
+                "sequence" => supervisor.schedule(
+                    Effect::sequence([
+                        Effect::suspend_terminal(|_| "first"),
+                        Effect::suspend_terminal(|_| "second"),
+                    ]),
+                    Timestamp::default(),
+                ),
+                "batch" => supervisor.schedule(
+                    Effect::batch([
+                        Effect::suspend_terminal(|_| "first"),
+                        Effect::suspend_terminal(|_| "second"),
+                    ]),
+                    Timestamp::default(),
+                ),
+                "panic-sequence" => supervisor.schedule(
+                    Effect::sequence([
+                        Effect::suspend_terminal(|_| -> &'static str {
+                            panic!("terminal task failure")
+                        }),
+                        Effect::after(Duration::ZERO, "recovered"),
+                    ]),
+                    Timestamp::default(),
+                ),
+                "scoped-cancel" => {
+                    supervisor.schedule(
+                        Effect::scoped("external", Effect::suspend_terminal(|_| "cancelled")),
+                        Timestamp::default(),
+                    );
+                    supervisor.schedule(Effect::cancel_scope("external"), Timestamp::default());
+                }
+                mode => panic!("invalid terminal effect mode {mode}"),
+            }
+
+            let mut pending = vec![supervisor.pending_terminal_tasks()];
+            while supervisor.run_terminal_task(Timestamp::default()) {
+                pending.push(supervisor.pending_terminal_tasks());
+                supervisor.poll(Timestamp::default());
+            }
+            supervisor.poll(Timestamp::default());
+
+            let expected_pending: Vec<_> = record
+                .field("pending")
+                .split(',')
+                .map(|value| usize::try_from(number(value)).unwrap())
+                .collect();
+            assert_eq!(pending, expected_pending, "case {}", record.id);
+            let expected = list(record.field("expected"));
+            assert_eq!(
+                supervisor.take_ready(usize::MAX),
+                expected,
+                "case {}",
+                record.id
+            );
+            assert_eq!(
+                supervisor.diagnostics().task_panics(),
+                number(record.field("panics")),
+                "case {}",
+                record.id
+            );
+            assert_eq!(
+                supervisor.diagnostics().cancellations(),
+                number(record.field("cancellations")),
+                "case {}",
+                record.id
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_terminal_task_cancellation_does_not_retain_queue_entries() {
+        let mut supervisor = EffectSupervisor::new(1);
+        for _ in 0..10_000 {
+            supervisor.schedule(
+                Effect::scoped("external", Effect::suspend_terminal(|_| ())),
+                Timestamp::default(),
+            );
+            supervisor.schedule(Effect::cancel_scope("external"), Timestamp::default());
+        }
+
+        assert!(supervisor.terminal_tasks.is_empty());
+        assert!(supervisor.pending_terminal.is_empty());
+        assert_eq!(supervisor.pending_terminal_tasks(), 0);
     }
 
     #[test]

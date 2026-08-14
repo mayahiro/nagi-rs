@@ -1,8 +1,12 @@
 # Standard widget gallery
 
 This example demonstrates standard widgets: `List`, `Button`,
-`Modal`, `Progress`, and `Spinner`. It also shows application-owned state and a
-clock-driven spinner subscription
+`ConfirmDialog`, `Disclosure`, `Progress`, and `Spinner`. It also shows
+application-owned state and a clock-driven spinner subscription
+
+The ConfirmDialog explicitly makes Cancel its default action, exposes lazy
+controlled details, wraps its actions to the current terminal width, and
+returns focus to the opener when application state removes it
 
 Run it from the Rust repository root:
 

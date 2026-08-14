@@ -1,33 +1,61 @@
 //! Operations dashboard composed from public Nagi TUI APIs
 
+use std::time::Duration;
+
 use nagi_tui::{
-    App, Effect, Event, EventAction, HorizontalAlignment, Length, Node, Style, TerminalOptions,
-    run_terminal,
+    App, Effect, Event, EventAction, HorizontalAlignment, Length, Node, ResponsiveRowPlacement,
+    Style, TerminalOptions, run_terminal,
 };
 use nagi_tui_widgets::{
     BarChart, BarChartBar, Chart, ChartPoint, ChartSeries, Help, HelpBinding, Progress, Sparkline,
-    Table, TableColumn, TableRow,
+    Spinner, StatusBar, StatusBarPriority, StatusBarSlot, Table, TableColumn, TableRow, Toast,
+    ToastRegion, ToastTone,
 };
 
 enum Message {
     SelectService(usize),
+    DismissToast(u64),
+    ExpireToast(u64),
+}
+
+struct ToastRecord {
+    generation: u64,
+    label: String,
 }
 
 #[derive(Default)]
 struct Dashboard {
     service: usize,
+    toast_generation: u64,
+    toast: Option<ToastRecord>,
 }
 
 impl App for Dashboard {
     type Message = Message;
 
     fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
-        let Message::SelectService(index) = message;
-        self.service = index;
-        Effect::none()
+        match message {
+            Message::SelectService(index) => {
+                self.service = index;
+                self.toast_generation = self.toast_generation.saturating_add(1);
+                let generation = self.toast_generation;
+                let service = ["api", "worker", "database"][index];
+                self.toast = Some(ToastRecord {
+                    generation,
+                    label: format!("Selected {service}"),
+                });
+                Effect::after(Duration::from_secs(3), Message::ExpireToast(generation))
+            }
+            Message::DismissToast(generation) | Message::ExpireToast(generation) => {
+                if self.toast.as_ref().map(|toast| toast.generation) == Some(generation) {
+                    self.toast = None;
+                }
+                Effect::none()
+            }
+        }
     }
 
-    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+    fn view(&self, context: nagi_tui::ViewContext) -> Node<Self::Message> {
         let requests = Node::panel(
             Node::column([
                 Node::styled_text(
@@ -91,6 +119,7 @@ impl App for Dashboard {
             8,
         )
         .bounds(0, 7, 0, 12)
+        .width_profile(context.width_profile)
         .into_node();
         let resources = BarChart::new(
             [
@@ -101,6 +130,7 @@ impl App for Dashboard {
             16,
         )
         .maximum(100)
+        .width_profile(context.width_profile)
         .into_node();
         let services = Table::new(
             "services",
@@ -123,7 +153,24 @@ impl App for Dashboard {
         .viewport("service-rows", Length::Fixed(4))
         .into_node();
 
-        Node::column([
+        let status = StatusBar::new([
+            StatusBarSlot::new(Node::text("connected")).priority(StatusBarPriority::High),
+            StatusBarSlot::new(self.toast.as_ref().map_or_else(
+                || Node::text("idle"),
+                |_| {
+                    Spinner::new(self.toast_generation)
+                        .label("updating")
+                        .into_node()
+                },
+            ))
+            .placement(ResponsiveRowPlacement::Center)
+            .priority(StatusBarPriority::Critical),
+            StatusBarSlot::new(Node::text("3 services | 18% budget"))
+                .placement(ResponsiveRowPlacement::End),
+        ])
+        .into_node();
+
+        let base = Node::column([
             Node::styled_text(
                 "Operations dashboard",
                 Style {
@@ -144,9 +191,22 @@ impl App for Dashboard {
                 HelpBinding::new("Up/Down", "select service"),
                 HelpBinding::new("Esc", "exit"),
             ])
+            .width_profile(context.width_profile)
             .into_node()
             .with_length(Length::Fixed(1)),
-        ])
+            status,
+        ]);
+
+        let toasts = self.toast.as_ref().map(|record| {
+            let generation = record.generation;
+            let label = record.label.clone();
+            Toast::new("service-toast", move || Node::text(label))
+                .tone(ToastTone::Info)
+                .on_dismiss("service-toast-dismiss", move || {
+                    Message::DismissToast(generation)
+                })
+        });
+        ToastRegion::new(base, toasts).into_node()
     }
 }
 

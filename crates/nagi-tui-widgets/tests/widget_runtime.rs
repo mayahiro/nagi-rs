@@ -1,11 +1,15 @@
 //! Public standard-widget runtime integration tests
 
+mod support;
+
 use nagi_tui::{
-    App, Effect, Event, KeyAction, KeyCode, KeyEvent, KeyProtocol, Length, Modifiers, MouseButton,
-    MouseEvent, MouseKind, Node, NodeId, Runtime, Size, Subscription, VirtualClock,
+    App, Effect, Event, Insets, KeyAction, KeyBinding, KeyCode, KeyEvent, KeyMap, KeyProtocol,
+    KeyScope, KeyStroke, Length, Modifiers, MouseButton, MouseEvent, MouseKind, Node, NodeId,
+    ResolvedAction, Runtime, Size, Subscription, VirtualClock, resolve_actions,
 };
 use nagi_tui_widgets::{
-    Button, List, ListItem, Modal, Progress, Spinner, Table, TableColumn, TableRow,
+    ACTIVATE_ACTION_ID, Button, Help, List, ListItem, Modal, Progress, Spinner, Table, TableColumn,
+    TableRow,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,6 +396,213 @@ fn virtual_table_rows_are_one_cell_high() {
         .expect("initial frame");
 
     assert_eq!(frame.surface().cell(2, 2).unwrap().content(), "B");
+}
+
+#[derive(Clone, Copy)]
+enum ButtonActionMessage {
+    Activate,
+}
+
+struct ButtonActionApp {
+    enabled: bool,
+    key_map: KeyMap,
+    activations: usize,
+}
+
+impl App for ButtonActionApp {
+    type Message = ButtonActionMessage;
+
+    fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+        match message {
+            ButtonActionMessage::Activate => self.activations += 1,
+        }
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        let button = Button::new("button", "Run", || ButtonActionMessage::Activate)
+            .enabled(self.enabled)
+            .into_node();
+        Node::padding(button, Insets::all(0))
+            .with_key_scope(KeyScope::new("root", self.key_map.clone()))
+    }
+}
+
+struct ResolvedHelpApp {
+    actions: Vec<ResolvedAction>,
+}
+
+impl App for ResolvedHelpApp {
+    type Message = ();
+
+    fn update(&mut self, _message: Self::Message) -> Effect<Self::Message> {
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        Help::from_resolved_actions(&self.actions)
+            .separator("|")
+            .show_disabled(true)
+            .into_node()
+    }
+}
+
+#[test]
+fn button_actions_and_help_match_shared_fixtures() {
+    let Some(records) = support::load(
+        "widgets/button-action.txt",
+        "widget-button-action",
+        &[
+            "mode",
+            "enabled",
+            "event",
+            "activate",
+            "consumed",
+            "help",
+            "help-enabled",
+        ],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let enabled = fixture_boolean(record.field("enabled"));
+        let key_map = button_key_map(record.field("mode"));
+        let mut runtime = Runtime::with_clock(
+            ButtonActionApp {
+                enabled,
+                key_map: key_map.clone(),
+                activations: 0,
+            },
+            nagi_tui::RuntimeConfig::new(Size::new(20, 2)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+
+        let actions = if enabled {
+            assert!(runtime.request_focus(&NodeId::from("button")).unwrap());
+            let groups = runtime.active_action_groups().unwrap();
+            let group = groups
+                .iter()
+                .find(|group| group.owner().as_str() == "button")
+                .unwrap_or_else(|| panic!("case {} has no Button action group", record.id));
+            assert_eq!(group.actions()[0].id().as_str(), ACTIVATE_ACTION_ID);
+            group.actions().to_vec()
+        } else {
+            assert!(!runtime.request_focus(&NodeId::from("button")).unwrap());
+            let descriptor = Button::new("button", "Run", || ButtonActionMessage::Activate)
+                .enabled(false)
+                .action_descriptor();
+            resolve_actions(
+                &NodeId::from("button"),
+                &[descriptor],
+                &[KeyScope::new("root", key_map)],
+            )
+            .unwrap()
+            .actions()
+            .to_vec()
+        };
+
+        let dispatch = runtime
+            .dispatch_event(&button_action_event(record.field("event")))
+            .unwrap();
+        runtime.process_pending().unwrap();
+        assert_eq!(
+            runtime.app().activations == 1,
+            fixture_boolean(record.field("activate")),
+            "case {}",
+            record.id
+        );
+        assert_eq!(
+            dispatch.consumed(),
+            fixture_boolean(record.field("consumed")),
+            "case {}",
+            record.id
+        );
+
+        let mut help_runtime = Runtime::with_clock(
+            ResolvedHelpApp { actions },
+            nagi_tui::RuntimeConfig::new(Size::new(64, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        let frame = help_runtime.render_if_dirty().unwrap().unwrap();
+        assert_eq!(
+            row_text(frame.surface(), 0).trim_end(),
+            record.field("help"),
+            "case {}",
+            record.id
+        );
+        if record.field("help-enabled") != "none" {
+            assert_eq!(
+                !frame.surface().cell(0, 0).unwrap().style().dim,
+                fixture_boolean(record.field("help-enabled")),
+                "case {}",
+                record.id
+            );
+        }
+    }
+}
+
+fn button_key_map(mode: &str) -> KeyMap {
+    match mode {
+        "default" => KeyMap::new(),
+        "rebind-x" => KeyMap::new()
+            .rebind(
+                ACTIVATE_ACTION_ID,
+                [KeyBinding::new(KeyStroke::character('x', Modifiers::NONE))],
+            )
+            .unwrap(),
+        "unbound" => KeyMap::new()
+            .rebind(ACTIVATE_ACTION_ID, std::iter::empty())
+            .unwrap(),
+        _ => panic!("unknown Button action mode {mode}"),
+    }
+}
+
+fn button_action_event(value: &str) -> Event {
+    let keyboard = |code, modifiers, action| {
+        Event::Key(KeyEvent {
+            code,
+            modifiers,
+            action,
+            text: None,
+            protocol: KeyProtocol::Legacy,
+        })
+    };
+    match value {
+        "enter" => keyboard(KeyCode::Enter, Modifiers::NONE, KeyAction::Press),
+        "space-text" => Event::Text(" ".to_owned()),
+        "space-key" => keyboard(KeyCode::Character(' '), Modifiers::NONE, KeyAction::Press),
+        "repeat-enter" => keyboard(KeyCode::Enter, Modifiers::NONE, KeyAction::Repeat),
+        "release-enter" => keyboard(KeyCode::Enter, Modifiers::NONE, KeyAction::Release),
+        "control-enter" => keyboard(
+            KeyCode::Enter,
+            Modifiers {
+                control: true,
+                ..Modifiers::NONE
+            },
+            KeyAction::Press,
+        ),
+        "x" => keyboard(KeyCode::Character('x'), Modifiers::NONE, KeyAction::Press),
+        "mouse-left-press" => Event::Mouse(MouseEvent {
+            kind: MouseKind::Press,
+            button: MouseButton::Left,
+            x: 0,
+            y: 0,
+            modifiers: Modifiers::NONE,
+        }),
+        _ => panic!("unknown Button action event {value}"),
+    }
+}
+
+fn fixture_boolean(value: &str) -> bool {
+    match value {
+        "true" => true,
+        "false" => false,
+        _ => panic!("invalid fixture Boolean {value}"),
+    }
 }
 
 fn key(code: KeyCode) -> Event {

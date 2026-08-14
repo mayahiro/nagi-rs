@@ -5,6 +5,7 @@ use crate::command::{
     generated_usage_syntax, option_description, option_display, option_label, usage_command_line,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::lifecycle::Deprecation;
 
 #[derive(Clone)]
 pub(crate) struct UsageVariantDefinition {
@@ -73,6 +74,53 @@ pub struct HelpEntry {
     id: String,
     label: String,
     description: String,
+    sensitive: bool,
+    deprecation: Option<Deprecation>,
+}
+
+/// One option inherited from an ancestor in a Help Document
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HelpInheritedOption {
+    command_path: Vec<String>,
+    command_id_path: Vec<String>,
+    entry: HelpEntry,
+}
+
+impl HelpInheritedOption {
+    /// Returns the source canonical command path
+    pub fn command_path(&self) -> &[String] {
+        &self.command_path
+    }
+
+    /// Returns the source stable command-ID path
+    pub fn command_id_path(&self) -> &[String] {
+        &self.command_id_path
+    }
+
+    /// Returns the source-local stable option ID
+    pub fn id(&self) -> &str {
+        self.entry.id()
+    }
+
+    /// Returns the option display label
+    pub fn label(&self) -> &str {
+        self.entry.label()
+    }
+
+    /// Returns the option description without the rendered origin note
+    pub fn description(&self) -> &str {
+        self.entry.description()
+    }
+
+    /// Reports whether this inherited Value option is Sensitive
+    pub const fn is_sensitive(&self) -> bool {
+        self.entry.is_sensitive()
+    }
+
+    /// Returns replacement metadata when this inherited option is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.entry.deprecation()
+    }
 }
 
 impl HelpEntry {
@@ -85,7 +133,19 @@ impl HelpEntry {
             id: id.into(),
             label: label.into(),
             description: description.into(),
+            sensitive: false,
+            deprecation: None,
         }
+    }
+
+    pub(crate) const fn with_sensitive(mut self, sensitive: bool) -> Self {
+        self.sensitive = sensitive;
+        self
+    }
+
+    pub(crate) fn with_deprecation(mut self, deprecation: Option<Deprecation>) -> Self {
+        self.deprecation = deprecation;
+        self
     }
 
     /// Returns the stable command, argument, option, or generated entry identifier
@@ -101,6 +161,16 @@ impl HelpEntry {
     /// Returns the entry description
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Reports whether this entry describes a Sensitive Value declaration
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
+
+    /// Returns replacement metadata when this entry is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
     }
 }
 
@@ -313,11 +383,13 @@ impl HelpOptionRelation {
 pub struct HelpDocument {
     command_path: Vec<String>,
     description: String,
+    deprecation: Option<Deprecation>,
     usage: Vec<String>,
     usage_variants: Vec<HelpUsageVariant>,
     commands: Vec<HelpEntry>,
     arguments: Vec<HelpEntry>,
     options: Vec<HelpEntry>,
+    inherited_options: Vec<HelpInheritedOption>,
     option_relations: Vec<HelpOptionRelation>,
     option_groups: Vec<HelpOptionGroup>,
     examples: Vec<HelpExample>,
@@ -335,6 +407,11 @@ impl HelpDocument {
     /// Returns the command description
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Returns replacement metadata when the selected command is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
     }
 
     /// Returns rendered usage lines
@@ -360,6 +437,11 @@ impl HelpDocument {
     /// Returns option entries
     pub fn options(&self) -> &[HelpEntry] {
         &self.options
+    }
+
+    /// Returns inherited options in outermost-to-nearest ancestor order
+    pub fn inherited_options(&self) -> &[HelpInheritedOption] {
+        &self.inherited_options
     }
 
     /// Returns pairwise option constraints
@@ -415,6 +497,11 @@ impl HelpRenderer for PlainHelpRenderer {
             output.push_str(&document.description);
             output.push_str("\n\n");
         }
+        if let Some(deprecation) = &document.deprecation {
+            output.push_str("Deprecated: use ");
+            output.push_str(deprecation.replacement());
+            output.push_str("\n\n");
+        }
 
         output.push_str("Usage:\n");
         for usage in &document.usage {
@@ -425,6 +512,23 @@ impl HelpRenderer for PlainHelpRenderer {
         render_entry_section(&mut output, "Commands", &document.commands);
         render_entry_section(&mut output, "Arguments", &document.arguments);
         render_entry_section(&mut output, "Options", &document.options);
+        let inherited_options = document
+            .inherited_options
+            .iter()
+            .map(|option| {
+                let mut description = option.description().to_owned();
+                if !description.is_empty() {
+                    description.push(' ');
+                }
+                description.push_str("[from ");
+                description.push_str(&option.command_path.join(" "));
+                description.push(']');
+                HelpEntry::identified(option.id(), option.label(), description)
+                    .with_sensitive(option.entry.sensitive)
+                    .with_deprecation(option.entry.deprecation.clone())
+            })
+            .collect::<Vec<_>>();
+        render_entry_section(&mut output, "Inherited Options", &inherited_options);
 
         let mut constraints = document
             .option_relations
@@ -486,99 +590,247 @@ impl Command {
         let command_id_path = self
             .command_id_path_at_path(path)
             .expect("the validated Help path was resolved above");
+        let command_lineage = self
+            .commands_at_path(path)
+            .expect("the validated Help path was resolved above");
 
-        let usage_variants = help_usage_variants(command, path, &command_id_path);
-        let usage = usage_variants
-            .iter()
-            .map(|variant| variant.command_line.clone())
-            .collect();
+        Ok(build_help_document(
+            self,
+            command,
+            path,
+            &command_id_path,
+            &command_lineage,
+        ))
+    }
 
-        let mut commands = command
-            .subcommands
-            .iter()
-            .map(|child| HelpEntry::identified(&child.id, &child.name, &child.about))
-            .collect::<Vec<_>>();
-        if path.len() == 1 && !command.subcommands.is_empty() {
-            commands.push(HelpEntry::identified(
-                "help",
-                "help",
-                "Print this message or the help of the given command",
-            ));
+    /// Visits Help for every visible command in definition-order preorder
+    ///
+    /// The graph is validated once before the first callback. The root is
+    /// visited first, hidden command subtrees are omitted, and returning
+    /// `false` from `visitor` stops traversal successfully. The command graph
+    /// must not be mutated while this synchronous traversal is active
+    pub fn visit_help_documents(
+        &self,
+        mut visitor: impl FnMut(&HelpDocument) -> bool,
+    ) -> Result<(), Diagnostic> {
+        self.validate()?;
+
+        let mut path = vec![self.name.clone()];
+        let mut command_id_path = vec![self.id.clone()];
+        let mut lineage = vec![self];
+        let root_document = build_help_document(self, self, &path, &command_id_path, &lineage);
+        if !visitor(&root_document) {
+            return Ok(());
         }
 
-        let arguments = command
-            .arguments
-            .iter()
-            .map(|argument| {
-                HelpEntry::identified(&argument.id, argument_label(argument), &argument.help)
-            })
-            .collect();
-        let mut options = Vec::with_capacity(command.options.len() + 2);
-        let mut option_relations = Vec::new();
-        for option in &command.options {
-            options.push(HelpEntry::identified(
-                &option.id,
-                option_label(option),
-                option_description(option),
-            ));
-            option_relations.extend(option.requires.iter().map(|relation| {
-                help_option_relation(command, option, relation, HelpOptionRelationKind::Requires)
-            }));
-            option_relations.extend(option.conflicts.iter().map(|relation| {
-                help_option_relation(command, option, relation, HelpOptionRelationKind::Conflicts)
-            }));
-        }
-        options.push(HelpEntry::identified("help", "-h, --help", "Print help"));
-        if self.version.is_some() {
-            options.push(HelpEntry::identified(
-                "version",
-                "-V, --version",
-                "Print version",
-            ));
+        let mut stack = vec![(self, 0_usize)];
+        while !stack.is_empty() {
+            let child = {
+                let (command, next_child) = stack
+                    .last_mut()
+                    .expect("the traversal stack was checked above");
+                let mut visible = None;
+                while *next_child < command.subcommands.len() {
+                    let candidate = &command.subcommands[*next_child];
+                    *next_child += 1;
+                    if !candidate.hidden {
+                        visible = Some(candidate);
+                        break;
+                    }
+                }
+                visible
+            };
+
+            if let Some(child) = child {
+                path.push(child.name.clone());
+                command_id_path.push(child.id.clone());
+                lineage.push(child);
+                let document = build_help_document(self, child, &path, &command_id_path, &lineage);
+                if !visitor(&document) {
+                    return Ok(());
+                }
+                stack.push((child, 0));
+            } else {
+                stack.pop();
+                if !stack.is_empty() {
+                    path.pop();
+                    command_id_path.pop();
+                    lineage.pop();
+                }
+            }
         }
 
-        let option_groups = command
-            .option_groups
-            .iter()
-            .map(|group| HelpOptionGroup {
-                id: group.id.clone(),
-                kind: group.kind,
-                presence: group.presence,
-                option_ids: group.options.clone(),
-                option_labels: group
-                    .options
-                    .iter()
-                    .map(|id| {
-                        option_display(
-                            command
-                                .option_by_id(id)
-                                .expect("validated option groups reference local options"),
-                        )
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        Ok(HelpDocument {
-            command_path: path.to_vec(),
-            description: command.about.clone(),
-            usage,
-            usage_variants,
-            commands,
-            arguments,
-            options,
-            option_relations,
-            option_groups,
-            examples: command.examples.clone(),
-            notes: command.notes.clone(),
-            links: command.links.clone(),
-            sections: command.help_sections.clone(),
-        })
+        Ok(())
     }
 
     /// Renders standard Help for a canonical command path
     pub fn render_help(&self, path: &[String]) -> Result<String, Diagnostic> {
         Ok(self.help_document(path)?.render())
+    }
+}
+
+fn build_help_document(
+    root: &Command,
+    command: &Command,
+    path: &[String],
+    command_id_path: &[String],
+    command_lineage: &[&Command],
+) -> HelpDocument {
+    let usage_variants = help_usage_variants(command, path, command_id_path);
+    let usage = usage_variants
+        .iter()
+        .map(|variant| variant.command_line.clone())
+        .collect();
+
+    let mut commands = command
+        .subcommands
+        .iter()
+        .filter(|child| !child.hidden)
+        .map(|child| {
+            HelpEntry::identified(&child.id, &child.name, &child.about)
+                .with_deprecation(child.deprecation.clone())
+        })
+        .collect::<Vec<_>>();
+    if path.len() == 1 && command.subcommands.iter().any(|child| !child.hidden) {
+        commands.push(HelpEntry::identified(
+            "help",
+            "help",
+            "Print this message or the help of the given command",
+        ));
+    }
+
+    let arguments = command
+        .arguments
+        .iter()
+        .map(|argument| {
+            HelpEntry::identified(&argument.id, argument_label(argument), &argument.help)
+                .with_sensitive(argument.sensitive)
+        })
+        .collect();
+    let mut options = Vec::with_capacity(command.options.len() + 2);
+    let mut option_relations = Vec::new();
+    for option in command.options.iter().filter(|option| !option.hidden) {
+        options.push(
+            HelpEntry::identified(&option.id, option_label(option), option_description(option))
+                .with_sensitive(option.sensitive)
+                .with_deprecation(option.deprecation.clone()),
+        );
+        option_relations.extend(
+            option
+                .requires
+                .iter()
+                .filter(|relation| {
+                    command
+                        .option_by_id(&relation.id)
+                        .is_some_and(|target| !target.hidden)
+                })
+                .map(|relation| {
+                    help_option_relation(
+                        command,
+                        option,
+                        relation,
+                        HelpOptionRelationKind::Requires,
+                    )
+                }),
+        );
+        option_relations.extend(
+            option
+                .conflicts
+                .iter()
+                .filter(|relation| {
+                    command
+                        .option_by_id(&relation.id)
+                        .is_some_and(|target| !target.hidden)
+                })
+                .map(|relation| {
+                    help_option_relation(
+                        command,
+                        option,
+                        relation,
+                        HelpOptionRelationKind::Conflicts,
+                    )
+                }),
+        );
+    }
+    options.push(HelpEntry::identified("help", "-h, --help", "Print help"));
+    if root.version.is_some() {
+        options.push(HelpEntry::identified(
+            "version",
+            "-V, --version",
+            "Print version",
+        ));
+    }
+
+    let mut inherited_options = Vec::new();
+    for (scope_index, ancestor) in command_lineage
+        .iter()
+        .take(command_lineage.len().saturating_sub(1))
+        .enumerate()
+    {
+        for option in ancestor
+            .options
+            .iter()
+            .filter(|option| option.inherited && !option.hidden)
+        {
+            inherited_options.push(HelpInheritedOption {
+                command_path: path[..=scope_index].to_vec(),
+                command_id_path: command_id_path[..=scope_index].to_vec(),
+                entry: HelpEntry::identified(
+                    &option.id,
+                    option_label(option),
+                    option_description(option),
+                )
+                .with_sensitive(option.sensitive)
+                .with_deprecation(option.deprecation.clone()),
+            });
+        }
+    }
+
+    let option_groups = command
+        .option_groups
+        .iter()
+        .filter(|group| {
+            group.options.iter().all(|id| {
+                command
+                    .option_by_id(id)
+                    .is_some_and(|option| !option.hidden)
+            })
+        })
+        .map(|group| HelpOptionGroup {
+            id: group.id.clone(),
+            kind: group.kind,
+            presence: group.presence,
+            option_ids: group.options.clone(),
+            option_labels: group
+                .options
+                .iter()
+                .map(|id| {
+                    option_display(
+                        command
+                            .option_by_id(id)
+                            .expect("validated option groups reference local options"),
+                    )
+                })
+                .collect(),
+        })
+        .collect();
+
+    HelpDocument {
+        command_path: path.to_vec(),
+        description: command.about.clone(),
+        deprecation: command.deprecation.clone(),
+        usage,
+        usage_variants,
+        commands,
+        arguments,
+        options,
+        inherited_options,
+        option_relations,
+        option_groups,
+        examples: command.examples.clone(),
+        notes: command.notes.clone(),
+        links: command.links.clone(),
+        sections: command.help_sections.clone(),
     }
 }
 
@@ -597,7 +849,8 @@ fn help_usage_variants(
     };
     match command.subcommand_usage {
         SubcommandUsageMode::Auto
-            if !command.subcommands.is_empty() && !command.subcommand_required =>
+            if command.subcommands.iter().any(|child| !child.hidden)
+                && !command.subcommand_required =>
         {
             variants.push(HelpUsageVariant::new(
                 command_id_path.to_vec(),
@@ -607,7 +860,7 @@ fn help_usage_variants(
             ));
         }
         SubcommandUsageMode::Expanded => {
-            for child in &command.subcommands {
+            for child in command.subcommands.iter().filter(|child| !child.hidden) {
                 let mut child_id_path = command_id_path.to_vec();
                 child_id_path.push(child.id.clone());
                 variants.extend(direct_usage_variants(
@@ -684,6 +937,14 @@ fn render_entries(output: &mut String, entries: &[HelpEntry]) {
             output.push(' ');
         }
         output.push_str(&entry.description);
+        if let Some(deprecation) = &entry.deprecation {
+            if !entry.description.is_empty() {
+                output.push(' ');
+            }
+            output.push_str("[deprecated: use ");
+            output.push_str(deprecation.replacement());
+            output.push(']');
+        }
         output.push('\n');
     }
 }

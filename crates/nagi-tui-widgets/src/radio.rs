@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use nagi_tui::{EventResult, Node, NodeId, Style};
+use nagi_tui::{Action, ActionAvailability, ActionDescriptor, EventResult, Node, NodeId, Style};
 
-use crate::event::is_activation_event;
+use crate::activate_action_descriptor;
+use crate::event::is_pointer_activation_event;
 
 /// Visual styles used by a [`Radio`]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +33,9 @@ impl Default for RadioStyle {
 }
 
 /// One controlled choice in an application-owned radio group
+///
+/// Keyboard activation declares [`crate::ACTIVATE_ACTION_ID`]. Left-button
+/// press remains a raw pointer event so keyboard rebinding does not remove it
 pub struct Radio<Message> {
     id: NodeId,
     label: String,
@@ -74,32 +78,62 @@ impl<Message: 'static> Radio<Message> {
         self
     }
 
+    /// Returns the semantic activation descriptor declared by this radio
+    #[must_use]
+    pub fn action_descriptor(&self) -> ActionDescriptor {
+        activate_action_descriptor().with_availability(if self.enabled {
+            ActionAvailability::Enabled
+        } else {
+            ActionAvailability::DisabledPassThrough
+        })
+    }
+
     /// Builds the public semantic node for this radio
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
         let marker = if self.selected { 'o' } else { ' ' };
         let content = format!("({marker}) {}", self.label);
+        let descriptor = self.action_descriptor();
         if !self.enabled {
-            return Node::styled_text(content, self.style.disabled).with_id(self.id);
+            let id = self.id;
+            return Node::styled_text(content, self.style.disabled)
+                .with_id(id.clone())
+                .on_actions(id, [Action::new(descriptor, |_| EventResult::ignored())]);
         }
 
         let id = self.id;
-        let focus_id = id.clone();
+        let action_focus_id = id.clone();
+        let pointer_focus_id = id.clone();
         let selected = self.selected;
         let on_select = self.on_select;
+        let on_pointer_select = Arc::clone(&on_select);
         Node::styled_text(content, self.style.normal)
             .focusable(id.clone())
             .with_focused_style(self.style.focused)
+            .on_actions(
+                id.clone(),
+                [Action::new(descriptor, move |_| {
+                    selection_result(selected, &action_focus_id, on_select.as_ref())
+                })],
+            )
             .on_event(id, move |event| {
-                if !is_activation_event(event) {
+                if !is_pointer_activation_event(event) {
                     return EventResult::ignored();
                 }
-                let result = EventResult::consumed().focus(focus_id.clone());
-                if selected {
-                    result
-                } else {
-                    result.emit(on_select())
-                }
+                selection_result(selected, &pointer_focus_id, on_pointer_select.as_ref())
             })
+    }
+}
+
+fn selection_result<Message>(
+    selected: bool,
+    focus_id: &NodeId,
+    on_select: &dyn Fn() -> Message,
+) -> EventResult<Message> {
+    let result = EventResult::consumed().focus(focus_id.clone());
+    if selected {
+        result
+    } else {
+        result.emit(on_select())
     }
 }

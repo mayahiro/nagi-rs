@@ -7,9 +7,13 @@ use std::time::Duration;
 
 use nagi_tui::{
     App, DeliveryPolicy, Effect, Event, EventAction, HorizontalAlignment, KeyAction, KeyCode,
-    Length, MouseTracking, Node, Style, Subscription, TerminalOptions, TextSpan, run_terminal,
+    Length, MouseTracking, Node, SplitPaneCollapse, Style, Subscription, TerminalOptions, TextSpan,
+    run_terminal,
 };
-use nagi_tui_widgets::{Help, HelpBinding, List, ListItem, Table, TableColumn, TableRow};
+use nagi_tui_widgets::{
+    Drawer, DrawerSide, Help, HelpBinding, List, ListItem, SplitPane, SplitPaneState, Table,
+    TableColumn, TableRow,
+};
 
 const LOG_INTERVAL: Duration = Duration::from_millis(750);
 const MAX_LOG_LINES: usize = 200;
@@ -27,7 +31,10 @@ enum Message {
     Log(u64),
     SelectSource(usize),
     SelectRow(usize),
+    ResizePanes(SplitPaneState),
     TogglePause,
+    ToggleDetails,
+    DismissDetails,
 }
 
 struct LogViewer {
@@ -36,6 +43,8 @@ struct LogViewer {
     row: usize,
     sequence: Arc<AtomicU64>,
     logs: VecDeque<LogEntry>,
+    panes: SplitPaneState,
+    details_open: bool,
 }
 
 impl Default for LogViewer {
@@ -46,6 +55,8 @@ impl Default for LogViewer {
             row: 0,
             sequence: Arc::new(AtomicU64::new(5)),
             logs: (1..=5).map(generated_log).collect(),
+            panes: SplitPaneState::new(2_500),
+            details_open: false,
         }
     }
 }
@@ -67,7 +78,10 @@ impl App for LogViewer {
                 self.row = 0;
             }
             Message::SelectRow(index) => self.row = index,
+            Message::ResizePanes(state) => self.panes = state,
             Message::TogglePause => self.paused = !self.paused,
+            Message::ToggleDetails => self.details_open = !self.details_open,
+            Message::DismissDetails => self.details_open = false,
         }
         Effect::none()
     }
@@ -85,7 +99,7 @@ impl App for LogViewer {
         )
     }
 
-    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+    fn view(&self, context: nagi_tui::ViewContext) -> Node<Self::Message> {
         let source_list = List::new(
             "sources",
             SOURCES
@@ -134,7 +148,19 @@ impl App for LogViewer {
         );
         let status = if self.paused { "PAUSED" } else { "LIVE" };
 
-        Node::column([
+        let panes = SplitPane::new(
+            "log-panes",
+            Node::panel(source_list, "Sources"),
+            Node::panel(table, "Events"),
+            self.panes,
+        )
+        .minimums(18, 30)
+        .collapse(SplitPaneCollapse::Primary)
+        .focus_targets("sources", "logs")
+        .on_resize(Message::ResizePanes)
+        .into_node()
+        .with_length(Length::Flex(1));
+        let base = Node::column([
             Node::styled_text(
                 format!(
                     "Multi-pane log viewer  {status}  buffered: {}",
@@ -146,28 +172,39 @@ impl App for LogViewer {
                 },
             )
             .with_length(Length::Fixed(1)),
-            Node::row([
-                Node::panel(source_list, "Sources").with_length(Length::Fixed(22)),
-                Node::panel(table, "Events").with_length(Length::Flex(1)),
-            ])
-            .with_length(Length::Flex(1)),
-            Node::panel(
-                Node::paragraph(
-                    [TextSpan::new(detail, Style::default())],
-                    nagi_tui::ParagraphOptions::default(),
-                ),
-                "Details",
-            )
-            .with_length(Length::Fixed(5)),
+            panes,
             Help::new([
-                HelpBinding::new("Tab", "pane focus"),
+                HelpBinding::new("F6", "pane focus"),
+                HelpBinding::new("Alt+Left/Right", "resize"),
                 HelpBinding::new("Up/Down", "select"),
                 HelpBinding::new("p", "pause"),
+                HelpBinding::new("d", "details"),
                 HelpBinding::new("Esc", "exit"),
             ])
+            .width_profile(context.width_profile)
             .into_node()
             .with_length(Length::Fixed(1)),
-        ])
+        ]);
+        Drawer::new("details-drawer", base, self.details_open)
+            .side(DrawerSide::Bottom)
+            .size(Length::Fixed(5))
+            .body(move || {
+                Node::column([
+                    Node::styled_text(
+                        "Details",
+                        Style {
+                            bold: true,
+                            ..Style::default()
+                        },
+                    ),
+                    Node::paragraph(
+                        [TextSpan::new(detail, Style::default())],
+                        nagi_tui::ParagraphOptions::default(),
+                    ),
+                ])
+            })
+            .on_dismiss(|| Message::DismissDetails)
+            .into_node()
     }
 }
 
@@ -207,7 +244,7 @@ fn main() -> Result<(), nagi_tui::RunError> {
         LogViewer::default(),
         TerminalOptions {
             minimum_frame_interval: Duration::from_millis(33),
-            mouse_tracking: Some(MouseTracking::Press),
+            mouse_tracking: Some(MouseTracking::Button),
             focus_first: true,
             ..TerminalOptions::default()
         },
@@ -220,12 +257,29 @@ fn map_event(event: Event) -> EventAction<Message> {
     if is_pause_toggle(&event) {
         return EventAction::Message(Message::TogglePause);
     }
+    if is_details_toggle(&event) {
+        return EventAction::Message(Message::ToggleDetails);
+    }
     match event {
         Event::Key(key) if key.code == KeyCode::Escape => EventAction::Exit,
         Event::Key(key) if key.modifiers.control && key.code == KeyCode::Character('c') => {
             EventAction::Exit
         }
         _ => EventAction::Ignore,
+    }
+}
+
+fn is_details_toggle(event: &Event) -> bool {
+    match event {
+        Event::Text(text) => matches!(text.as_str(), "d" | "D"),
+        Event::Key(key) => {
+            key.action != KeyAction::Release
+                && !key.modifiers.alt
+                && !key.modifiers.control
+                && !key.modifiers.meta
+                && matches!(key.code, KeyCode::Character('d' | 'D'))
+        }
+        _ => false,
     }
 }
 

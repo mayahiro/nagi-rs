@@ -13,7 +13,7 @@ fn application() -> Command {
     Command::new("tool")
         .id("tool-root")
         .about("Inspect one target")
-        .version("0.2.7")
+        .version("0.4.0")
         .require_subcommand()
         .subcommand(
             Command::new("inspect")

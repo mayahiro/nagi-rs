@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use nagi_text::{WidthProfile, text_width};
-use nagi_tui::{Node, Style};
+use nagi_tui::{ActionAvailability, BindingSupport, Node, ResolvedAction, Style};
 
 /// Arrangement of key bindings in a [`Help`] view
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -101,6 +101,7 @@ pub struct Help<Message> {
     separator: String,
     show_disabled: bool,
     style: HelpStyle,
+    width_profile: WidthProfile<'static>,
     message: PhantomData<fn() -> Message>,
 }
 
@@ -114,8 +115,33 @@ impl<Message> Help<Message> {
             separator: " • ".to_owned(),
             show_disabled: false,
             style: HelpStyle::default(),
+            width_profile: WidthProfile::MODERN,
             message: PhantomData,
         }
+    }
+
+    /// Creates compact help from Help-visible resolved actions
+    ///
+    /// Each effective key becomes one binding in action and binding order
+    /// without duplicating key notation. Unavailable actions and bindings with
+    /// unsupported terminal metadata become disabled Help bindings
+    #[must_use]
+    pub fn from_resolved_actions<'a>(
+        actions: impl IntoIterator<Item = &'a ResolvedAction>,
+    ) -> Self {
+        let mut bindings = Vec::new();
+        for action in actions {
+            if !action.is_help_visible() {
+                continue;
+            }
+            let action_enabled = action.availability() == ActionAvailability::Enabled;
+            bindings.extend(action.bindings().iter().map(|binding| HelpBinding {
+                key: binding.stroke().notation(),
+                description: action.label().to_owned(),
+                enabled: action_enabled && binding.support() != BindingSupport::Unsupported,
+            }));
+        }
+        Self::new(bindings)
     }
 
     /// Replaces the binding arrangement
@@ -146,6 +172,15 @@ impl<Message> Help<Message> {
         self
     }
 
+    /// Sets the terminal cell-width policy used by full-mode alignment
+    ///
+    /// Pass `ViewContext::width_profile` to keep the widget aligned with its Runtime
+    #[must_use]
+    pub const fn width_profile(mut self, profile: WidthProfile<'static>) -> Self {
+        self.width_profile = profile;
+        self
+    }
+
     /// Builds the public semantic node for this help view
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
@@ -155,7 +190,7 @@ impl<Message> Help<Message> {
             .filter(|binding| binding.enabled || self.show_disabled)
             .collect();
         if self.mode == HelpMode::Full {
-            return full_node(bindings, self.style);
+            return full_node(bindings, self.style, self.width_profile);
         }
         let mut parts = Vec::with_capacity(bindings.len().saturating_mul(4));
         for (index, binding) in bindings.into_iter().enumerate() {
@@ -175,10 +210,14 @@ impl<Message> Help<Message> {
     }
 }
 
-fn full_node<Message>(bindings: Vec<HelpBinding>, style: HelpStyle) -> Node<Message> {
+fn full_node<Message>(
+    bindings: Vec<HelpBinding>,
+    style: HelpStyle,
+    profile: WidthProfile<'static>,
+) -> Node<Message> {
     let key_width = bindings
         .iter()
-        .map(|binding| text_width(&binding.key, WidthProfile::MODERN))
+        .map(|binding| text_width(&binding.key, profile))
         .max()
         .unwrap_or(0);
     Node::column(bindings.into_iter().map(|binding| {
@@ -187,11 +226,50 @@ fn full_node<Message>(bindings: Vec<HelpBinding>, style: HelpStyle) -> Node<Mess
             key_style = key_style.merged(style.disabled);
             description_style = description_style.merged(style.disabled);
         }
-        let padding = key_width.saturating_sub(text_width(&binding.key, WidthProfile::MODERN));
+        let padding = key_width.saturating_sub(text_width(&binding.key, profile));
         Node::row([
             Node::styled_text(format!("{}{}", binding.key, " ".repeat(padding)), key_style),
             Node::text("  "),
             Node::styled_text(binding.description, description_style),
         ])
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use nagi_tui::{
+        ActionDescriptor, BindingSupport, KeyBinding, KeyStroke, Modifiers, NodeId, resolve_actions,
+    };
+
+    use super::*;
+
+    #[test]
+    fn resolved_help_filters_hidden_actions_and_disables_unsupported_bindings() {
+        let visible = ActionDescriptor::new(
+            "app.visible",
+            "Visible",
+            [
+                KeyBinding::new(KeyStroke::character('u', Modifiers::NONE))
+                    .with_support(BindingSupport::Unsupported),
+                KeyBinding::new(KeyStroke::character('v', Modifiers::NONE)),
+            ],
+        );
+        let hidden = ActionDescriptor::new(
+            "app.hidden",
+            "Hidden",
+            [KeyBinding::new(KeyStroke::character('h', Modifiers::NONE))],
+        )
+        .with_help_visible(false);
+        let resolved = resolve_actions(&NodeId::from("owner"), &[visible, hidden], &[]).unwrap();
+
+        let help = Help::<()>::from_resolved_actions(resolved.actions());
+
+        assert_eq!(
+            help.bindings
+                .iter()
+                .map(|binding| (binding.key(), binding.description(), binding.is_enabled()))
+                .collect::<Vec<_>>(),
+            [("u", "Visible", false), ("v", "Visible", true)]
+        );
+    }
 }

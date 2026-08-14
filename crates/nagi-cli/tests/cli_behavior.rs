@@ -53,6 +53,141 @@ fn parent_options_are_not_recognized_after_child_selection() {
 }
 
 #[test]
+fn help_documents_visit_visible_preorder_and_stop_early() {
+    let command = Command::new("root")
+        .subcommand(
+            Command::new("alpha")
+                .subcommand(Command::new("alpha-child"))
+                .subcommand(
+                    Command::new("alpha-hidden")
+                        .hidden()
+                        .subcommand(Command::new("hidden-descendant")),
+                ),
+        )
+        .subcommand(Command::new("beta"));
+
+    let mut paths = Vec::new();
+    command
+        .visit_help_documents(|document| {
+            paths.push(document.command_path().join("/"));
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        paths,
+        ["root", "root/alpha", "root/alpha/alpha-child", "root/beta"]
+    );
+
+    let mut stopped = Vec::new();
+    command
+        .visit_help_documents(|document| {
+            stopped.push(document.command_path().join("/"));
+            stopped.len() < 2
+        })
+        .unwrap();
+    assert_eq!(stopped, ["root", "root/alpha"]);
+
+    let direct = command
+        .help_document(&["root".to_owned(), "alpha".to_owned()])
+        .unwrap();
+    let mut visited = None;
+    command
+        .visit_help_documents(|document| {
+            if document.command_path() == ["root", "alpha"] {
+                visited = Some(document.clone());
+            }
+            true
+        })
+        .unwrap();
+    assert_eq!(visited.as_ref(), Some(&direct));
+}
+
+#[test]
+fn inherited_options_keep_declaration_scope_validation() {
+    let required = Command::new("root")
+        .id("root-id")
+        .option(
+            OptionSpec::value("token")
+                .long("token")
+                .required()
+                .inherited(),
+        )
+        .subcommand(Command::new("run").id("run-id"));
+    let error = required.parse(["run"]).unwrap_err();
+    assert_eq!(error.code(), DiagnosticCode::MissingRequired);
+    assert_eq!(error.targets()[0].command_id_path(), ["root-id"]);
+
+    let command = Command::new("root")
+        .id("root-id")
+        .option(
+            OptionSpec::value("credential")
+                .long("credential")
+                .inherited(),
+        )
+        .option(
+            OptionSpec::flag("authorize")
+                .long("authorize")
+                .requires("credential")
+                .inherited(),
+        )
+        .option(OptionSpec::flag("json").long("json").inherited())
+        .option(OptionSpec::flag("yaml").long("yaml").inherited())
+        .option_group(OptionGroup::at_most_one("format", ["json", "yaml"]))
+        .validator(|invocation: &Invocation| {
+            assert_eq!(invocation.value_scope_id_path(), ["root-id"]);
+            if invocation.raw_value("credential") == Some(OsStr::new("blocked")) {
+                return Err(
+                    Diagnostic::new(DiagnosticCode::Validation, "credential is blocked")
+                        .with_target(nagi_cli::DiagnosticTarget::option("credential")),
+                );
+            }
+            Ok(())
+        })
+        .subcommand(Command::new("run").id("run-id"));
+
+    let error = command.parse(["run", "--authorize"]).unwrap_err();
+    assert_eq!(error.code(), DiagnosticCode::Requires);
+    assert!(
+        error
+            .targets()
+            .iter()
+            .all(|target| target.command_id_path() == ["root-id"])
+    );
+
+    let ParseResult::Invocation(invocation) = command
+        .parse(["--credential", "allowed", "run", "--authorize"])
+        .unwrap()
+    else {
+        panic!("expected invocation");
+    };
+    let root = invocation.scope(["root-id"]).unwrap();
+    assert_eq!(root.raw_value("credential"), Some(OsStr::new("allowed")));
+    assert_eq!(root.flag("authorize"), Some(true));
+
+    let error = command.parse(["run", "--json", "--yaml"]).unwrap_err();
+    assert_eq!(error.code(), DiagnosticCode::OptionGroup);
+    assert!(
+        error
+            .targets()
+            .iter()
+            .all(|target| target.command_id_path() == ["root-id"])
+    );
+
+    let error = command
+        .parse(["run", "--credential", "blocked"])
+        .unwrap_err();
+    assert_eq!(error.code(), DiagnosticCode::Validation);
+    assert_eq!(error.targets()[0].command_id_path(), ["root-id"]);
+
+    let child_help = command
+        .help_document(&["root".to_owned(), "run".to_owned()])
+        .unwrap();
+    assert!(child_help.option_relations().is_empty());
+    assert!(child_help.option_groups().is_empty());
+    assert_eq!(child_help.inherited_options().len(), 4);
+}
+
+#[test]
 fn command_local_value_scopes_are_explicit_and_shadow_ancestors() {
     let command = Command::new("root")
         .id("root-id")

@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeKind, RuntimeNoticeQueue};
 use crate::subscription::{
     BufferedSubscriptionMessage, DeliveryKind, DeliveryPolicy, SubscriptionAtomicDiagnostics,
     SubscriptionInbox, SubscriptionKind, SubscriptionProducer, SubscriptionSource,
 };
 use crate::wake::WakeHandle;
+use crate::worker_tracker::WorkerTracker;
 use crate::{CancelToken, Subscription, SubscriptionKey, SubscriptionSink, Timestamp};
 
 /// Counters describing subscription lifecycle, backpressure, and failures
@@ -136,6 +138,9 @@ pub(crate) struct SubscriptionSupervisor<Message> {
     stops: u64,
     batch_flushes: u64,
     spawn_failures: u64,
+    notices: Option<Arc<RuntimeNoticeQueue>>,
+    workers: WorkerTracker,
+    closed: bool,
 }
 
 impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
@@ -152,6 +157,9 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             stops: 0,
             batch_flushes: 0,
             spawn_failures: 0,
+            notices: None,
+            workers: WorkerTracker::default(),
+            closed: false,
         }
     }
 
@@ -159,11 +167,24 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
         self.wake = wake;
     }
 
+    pub(crate) fn set_notices(&mut self, notices: Arc<RuntimeNoticeQueue>) {
+        self.notices = Some(notices);
+    }
+
+    pub(crate) fn set_worker_tracker(&mut self, workers: WorkerTracker) {
+        self.workers = workers;
+    }
+
     pub(crate) fn reconcile(
         &mut self,
         subscription: Subscription<Message>,
         now: Timestamp,
     ) -> Result<SubscriptionReconciliation, SubscriptionKey> {
+        if self.closed {
+            return Ok(SubscriptionReconciliation {
+                stopped: Vec::new(),
+            });
+        }
         let mut sources = Vec::new();
         flatten(subscription, &mut sources);
         let mut keys = HashSet::with_capacity(sources.len());
@@ -204,6 +225,9 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
     }
 
     pub(crate) fn poll(&mut self, now: Timestamp) {
+        if self.closed {
+            return;
+        }
         for key in self.order.clone() {
             let Some(active) = self.active.get_mut(&key) else {
                 continue;
@@ -214,6 +238,9 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
     }
 
     pub(crate) fn take_ready(&mut self, maximum: usize) -> Vec<SubscriptionMessage<Message>> {
+        if maximum == 0 || self.order.is_empty() {
+            return Vec::new();
+        }
         let mut ready = Vec::with_capacity(maximum.min(64));
         while ready.len() < maximum {
             let candidate = self
@@ -313,6 +340,18 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             .fetch_add(count as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let active: Vec<_> = self.active.drain().map(|(_, active)| active).collect();
+        for active in active {
+            self.stop_active(active);
+        }
+        self.order.clear();
+    }
+
     pub(crate) fn time_until_deadline(&self, now: Timestamp) -> Option<Duration> {
         if self.active.values().any(source_ready) {
             return Some(Duration::ZERO);
@@ -366,23 +405,61 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             SubscriptionProducer::Stream(producer) => {
                 let token = CancelToken::default();
                 let worker_token = token.clone();
+                let completion_token = worker_token.clone();
                 let sink = SubscriptionSink {
                     inbox: Arc::clone(&inbox),
                 };
+                let completion_sink = sink.clone();
                 let finished = Arc::new(AtomicBool::new(false));
                 let worker_finished = Arc::clone(&finished);
                 let diagnostics = Arc::clone(&self.atomic_diagnostics);
+                let notices = self.notices.clone();
+                let worker_key = source.key.clone();
+                let wake = self.wake.clone();
+                let worker = self.workers.track();
                 let spawn = thread::Builder::new()
                     .name(format!("nagi-tui-subscription-{}", source.key))
                     .spawn(move || {
-                        if catch_unwind(AssertUnwindSafe(|| producer(worker_token, sink))).is_err()
-                        {
-                            diagnostics.producer_panics.fetch_add(1, Ordering::Relaxed);
+                        let _worker = worker;
+                        let outcome =
+                            catch_unwind(AssertUnwindSafe(|| producer(worker_token, sink)));
+                        match outcome {
+                            Err(_) => {
+                                diagnostics.producer_panics.fetch_add(1, Ordering::Relaxed);
+                                if let Some(notices) = &notices {
+                                    notices.push(RuntimeNotice::subscription_stream(
+                                        RuntimeNoticeKind::SubscriptionStreamPanicked,
+                                        worker_key,
+                                        generation,
+                                    ));
+                                }
+                            }
+                            Ok(())
+                                if !completion_token.is_cancelled()
+                                    && !completion_sink.is_closed() =>
+                            {
+                                if let Some(notices) = &notices {
+                                    notices.push(RuntimeNotice::subscription_stream(
+                                        RuntimeNoticeKind::SubscriptionStreamCompleted,
+                                        worker_key,
+                                        generation,
+                                    ));
+                                }
+                            }
+                            Ok(()) => {}
                         }
                         worker_finished.store(true, Ordering::Release);
+                        wake.notify();
                     });
                 if spawn.is_err() {
                     self.spawn_failures = self.spawn_failures.saturating_add(1);
+                    if let Some(notices) = &self.notices {
+                        notices.push(RuntimeNotice::subscription_stream(
+                            RuntimeNoticeKind::SubscriptionSpawnFailed,
+                            source.key.clone(),
+                            generation,
+                        ));
+                    }
                     finished.store(true, Ordering::Release);
                 }
                 ActiveProducer::Stream { token, finished }
@@ -931,6 +1008,45 @@ mod tests {
         assert_eq!(supervisor.running_streams(), 0);
         assert_eq!(supervisor.active_subscriptions(), 1);
         assert_eq!(supervisor.diagnostics().producer_panics(), 1);
+    }
+
+    #[test]
+    fn cancelled_stream_does_not_report_completion() {
+        let notices = Arc::new(RuntimeNoticeQueue::new(4));
+        let mut supervisor = SubscriptionSupervisor::<String>::new(1);
+        supervisor.set_notices(Arc::clone(&notices));
+        let (started_sender, started) = sync_channel(1);
+        supervisor
+            .reconcile(
+                Subscription::stream("events", DeliveryPolicy::reliable(), move |_token, sink| {
+                    started_sender.send(()).unwrap();
+                    sink.wait_closed();
+                }),
+                Timestamp::default(),
+            )
+            .unwrap();
+        started.recv().unwrap();
+        let finished = match &supervisor
+            .active
+            .get(&SubscriptionKey::from("events"))
+            .unwrap()
+            .producer
+        {
+            ActiveProducer::Stream { finished, .. } => Arc::clone(finished),
+            ActiveProducer::Every { .. } => panic!("expected Stream"),
+        };
+
+        supervisor
+            .reconcile(Subscription::none(), Timestamp::default())
+            .unwrap();
+        for _ in 0..10_000 {
+            if finished.load(Ordering::Acquire) {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(notices.pending(), 0);
     }
 
     #[test]

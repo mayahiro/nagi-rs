@@ -1,9 +1,15 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use nagi_tui::{Event, EventResult, KeyAction, KeyCode, Length, Node, NodeId, Style};
+use nagi_tui::{
+    Action, ActionAvailability, ActionDescriptor, EventResult, KeyCode, Length, Node, NodeId, Style,
+};
 
-use crate::event::is_activation_event;
-use crate::navigation::{Navigation, navigate};
+use crate::action::{
+    COLLAPSE_ACTION_ID, COLLECTION_ACTIONS, CollectionAction, EXPAND_ACTION_ID,
+    repeatable_action_binding, vertical_collection_action_descriptors,
+};
+use crate::event::is_pointer_activation_event;
+use crate::navigation::navigate;
 
 /// One preorder item rendered by a [`Tree`]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +125,10 @@ impl Default for TreeStyle {
 }
 
 /// A preorder tree with application-owned selection and expansion state
+///
+/// The root owns standard activation, vertical selection, collapse, and expand
+/// actions. Left-button press stays raw on each row so keyboard rebinding does
+/// not remove pointer selection or branch toggling
 pub struct Tree<Message> {
     id: NodeId,
     items: Vec<TreeItem>,
@@ -182,11 +192,22 @@ impl<Message: 'static> Tree<Message> {
         self
     }
 
+    /// Returns the ordered semantic action descriptors declared by this tree
+    ///
+    /// The order is activate, previous, next, first, last, collapse, and
+    /// expand. Every descriptor is disabled-pass-through when the tree is
+    /// disabled or empty
+    #[must_use]
+    pub fn action_descriptors(&self) -> [ActionDescriptor; 7] {
+        tree_action_descriptors(self.enabled && !self.items.is_empty())
+    }
+
     /// Builds the public semantic node for this tree
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
         let visible_indices = visible_indices(&self.items);
         let selected_position = normalized_visible_selection(&visible_indices, self.selected);
+        let descriptors = tree_action_descriptors(self.enabled && selected_position.is_some());
         let item_metadata: Arc<Vec<TreeMetadata>> = Arc::new(
             self.items
                 .iter()
@@ -244,7 +265,7 @@ impl<Message: 'static> Tree<Message> {
             let has_children = item.has_children;
             let expanded = item.expanded;
             let row = node.with_id(id.clone()).on_event(id, move |event| {
-                if !is_activation_event(event) {
+                if !is_pointer_activation_event(event) {
                     return EventResult::ignored();
                 }
                 let mut result = EventResult::consumed().focus(click_focus.clone());
@@ -259,27 +280,17 @@ impl<Message: 'static> Tree<Message> {
                 result
             });
             if is_selected {
-                let visible = Arc::clone(&visible);
-                let item_metadata = Arc::clone(&item_metadata);
-                let on_select = Arc::clone(&self.on_select);
-                let on_toggle = self.on_toggle.as_ref().map(Arc::clone);
-                let focus_id = root_id.clone();
-                children.push(
-                    Node::column([row])
-                        .focusable(root_id.clone())
-                        .with_focused_style(self.style.focused)
-                        .on_event(root_id.clone(), move |event| {
-                            tree_event_result(
-                                event,
-                                &visible,
-                                &item_metadata,
-                                selected_position.expect("selected tree item"),
-                                &focus_id,
-                                &on_select,
-                                on_toggle.as_ref(),
-                            )
-                        }),
-                );
+                children.push(tree_action_target(
+                    Node::column([row]),
+                    root_id.clone(),
+                    Arc::clone(&visible),
+                    Arc::clone(&item_metadata),
+                    selected_position.expect("selected tree item"),
+                    self.style.focused,
+                    Arc::clone(&self.on_select),
+                    self.on_toggle.as_ref().map(Arc::clone),
+                    descriptors.clone(),
+                ));
                 continue;
             }
             children.push(row);
@@ -294,51 +305,10 @@ impl<Message: 'static> Tree<Message> {
         if self.enabled && selected_position.is_some() {
             root
         } else {
-            root.with_id(root_id)
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn tree_event_result<Message>(
-    event: &Event,
-    visible: &[usize],
-    items: &[TreeMetadata],
-    selected_position: usize,
-    root_id: &NodeId,
-    on_select: &Arc<dyn Fn(usize) -> Message>,
-    on_toggle: Option<&Arc<dyn Fn(usize, bool) -> Message>>,
-) -> EventResult<Message> {
-    if is_activation_event(event) {
-        let original_index = visible[selected_position];
-        let current = items[original_index];
-        let result = EventResult::consumed().focus(root_id.clone());
-        if current.has_children {
-            if let Some(on_toggle) = on_toggle {
-                return result.emit(on_toggle(original_index, !current.expanded));
-            }
-        }
-        return result;
-    }
-    let Some(action) = tree_navigation_event(event, visible, items, selected_position) else {
-        return EventResult::ignored();
-    };
-    match action {
-        TreeAction::Select(next) => {
-            let mut result = EventResult::consumed().focus(root_id.clone());
-            if next != selected_position {
-                result = result.emit(on_select(visible[next]));
-            }
-            result
-        }
-        TreeAction::Toggle(expanded) => {
-            let original_index = visible[selected_position];
-            let result = EventResult::consumed().focus(root_id.clone());
-            if let Some(on_toggle) = on_toggle {
-                result.emit(on_toggle(original_index, expanded))
-            } else {
-                result
-            }
+            root.with_id(root_id.clone()).on_actions(
+                root_id,
+                descriptors.map(|descriptor| Action::new(descriptor, |_| EventResult::ignored())),
+            )
         }
     }
 }
@@ -350,9 +320,190 @@ struct TreeMetadata {
     expanded: bool,
 }
 
-enum TreeAction {
+static TREE_DISCLOSURE_ACTION_DESCRIPTORS: LazyLock<[ActionDescriptor; 2]> = LazyLock::new(|| {
+    [
+        ActionDescriptor::new(
+            COLLAPSE_ACTION_ID,
+            "Collapse",
+            [repeatable_action_binding(KeyCode::Left)],
+        ),
+        ActionDescriptor::new(
+            EXPAND_ACTION_ID,
+            "Expand",
+            [repeatable_action_binding(KeyCode::Right)],
+        ),
+    ]
+});
+
+#[derive(Clone, Copy)]
+enum TreeSemanticAction {
+    Collection(CollectionAction),
+    Collapse,
+    Expand,
+}
+
+const TREE_ACTIONS: [TreeSemanticAction; 7] = [
+    TreeSemanticAction::Collection(COLLECTION_ACTIONS[0]),
+    TreeSemanticAction::Collection(COLLECTION_ACTIONS[1]),
+    TreeSemanticAction::Collection(COLLECTION_ACTIONS[2]),
+    TreeSemanticAction::Collection(COLLECTION_ACTIONS[3]),
+    TreeSemanticAction::Collection(COLLECTION_ACTIONS[4]),
+    TreeSemanticAction::Collapse,
+    TreeSemanticAction::Expand,
+];
+
+#[derive(Clone, Copy)]
+enum TreeTransition {
     Select(usize),
     Toggle(bool),
+}
+
+fn tree_action_descriptors(enabled: bool) -> [ActionDescriptor; 7] {
+    let [activate, previous, next, first, last] = vertical_collection_action_descriptors(enabled);
+    let availability = if enabled {
+        ActionAvailability::Enabled
+    } else {
+        ActionAvailability::DisabledPassThrough
+    };
+    [
+        activate,
+        previous,
+        next,
+        first,
+        last,
+        TREE_DISCLOSURE_ACTION_DESCRIPTORS[0]
+            .clone()
+            .with_availability(availability),
+        TREE_DISCLOSURE_ACTION_DESCRIPTORS[1]
+            .clone()
+            .with_availability(availability),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tree_action_target<Message: 'static>(
+    node: Node<Message>,
+    root_id: NodeId,
+    visible: Arc<Vec<usize>>,
+    items: Arc<Vec<TreeMetadata>>,
+    selected: usize,
+    focused_style: Style,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+    on_toggle: Option<Arc<dyn Fn(usize, bool) -> Message>>,
+    descriptors: [ActionDescriptor; 7],
+) -> Node<Message> {
+    node.focusable(root_id.clone())
+        .with_focused_style(focused_style)
+        .on_actions(
+            root_id.clone(),
+            tree_actions(
+                descriptors,
+                root_id,
+                visible,
+                items,
+                selected,
+                on_select,
+                on_toggle,
+            ),
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tree_actions<Message: 'static>(
+    descriptors: [ActionDescriptor; 7],
+    root_id: NodeId,
+    visible: Arc<Vec<usize>>,
+    items: Arc<Vec<TreeMetadata>>,
+    selected: usize,
+    on_select: Arc<dyn Fn(usize) -> Message>,
+    on_toggle: Option<Arc<dyn Fn(usize, bool) -> Message>>,
+) -> impl Iterator<Item = Action<Message>> {
+    descriptors
+        .into_iter()
+        .zip(TREE_ACTIONS)
+        .map(move |(descriptor, action)| {
+            let focus_id = root_id.clone();
+            let visible = Arc::clone(&visible);
+            let items = Arc::clone(&items);
+            let on_select = Arc::clone(&on_select);
+            let on_toggle = on_toggle.as_ref().map(Arc::clone);
+            Action::new(descriptor, move |_| {
+                tree_action_result(
+                    action,
+                    &focus_id,
+                    &visible,
+                    &items,
+                    selected,
+                    on_select.as_ref(),
+                    on_toggle.as_deref(),
+                )
+            })
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tree_action_result<Message>(
+    action: TreeSemanticAction,
+    root_id: &NodeId,
+    visible: &[usize],
+    items: &[TreeMetadata],
+    selected: usize,
+    on_select: &dyn Fn(usize) -> Message,
+    on_toggle: Option<&dyn Fn(usize, bool) -> Message>,
+) -> EventResult<Message> {
+    let mut result = EventResult::consumed().focus(root_id.clone());
+    match tree_transition(action, visible, items, selected) {
+        Some(TreeTransition::Select(next)) if next != selected => {
+            result = result.emit(on_select(visible[next]));
+        }
+        Some(TreeTransition::Toggle(expanded)) => {
+            if let Some(on_toggle) = on_toggle {
+                result = result.emit(on_toggle(visible[selected], expanded));
+            }
+        }
+        Some(TreeTransition::Select(_)) | None => {}
+    }
+    result
+}
+
+fn tree_transition(
+    action: TreeSemanticAction,
+    visible: &[usize],
+    items: &[TreeMetadata],
+    selected: usize,
+) -> Option<TreeTransition> {
+    let current = items[visible[selected]];
+    match action {
+        TreeSemanticAction::Collection(CollectionAction::Activate) => current
+            .has_children
+            .then_some(TreeTransition::Toggle(!current.expanded)),
+        TreeSemanticAction::Collection(action) => action
+            .navigation()
+            .and_then(|navigation| navigate(visible.len(), selected, navigation))
+            .map(TreeTransition::Select),
+        TreeSemanticAction::Collapse if current.has_children && current.expanded => {
+            Some(TreeTransition::Toggle(false))
+        }
+        TreeSemanticAction::Collapse => (0..selected)
+            .rev()
+            .find(|position| items[visible[*position]].depth < current.depth)
+            .map(TreeTransition::Select)
+            .or(Some(TreeTransition::Select(selected))),
+        TreeSemanticAction::Expand if current.has_children && !current.expanded => {
+            Some(TreeTransition::Toggle(true))
+        }
+        TreeSemanticAction::Expand => {
+            let child = selected.saturating_add(1);
+            if current.has_children
+                && child < visible.len()
+                && items[visible[child]].depth > current.depth
+            {
+                Some(TreeTransition::Select(child))
+            } else {
+                Some(TreeTransition::Select(selected))
+            }
+        }
+    }
 }
 
 fn visible_indices(items: &[TreeItem]) -> Vec<usize> {
@@ -397,64 +548,12 @@ fn tree_viewport_range(count: usize, selected: usize, height: usize) -> (usize, 
     (start, start.saturating_add(height))
 }
 
-fn tree_navigation_event(
-    event: &Event,
-    visible: &[usize],
-    items: &[TreeMetadata],
-    selected: usize,
-) -> Option<TreeAction> {
-    let Event::Key(key) = event else {
-        return None;
-    };
-    if key.action == KeyAction::Release
-        || key.modifiers.alt
-        || key.modifiers.control
-        || key.modifiers.meta
-    {
-        return None;
-    }
-    match key.code {
-        KeyCode::Up => navigate(visible.len(), selected, Navigation::Up).map(TreeAction::Select),
-        KeyCode::Down => {
-            navigate(visible.len(), selected, Navigation::Down).map(TreeAction::Select)
-        }
-        KeyCode::Home => {
-            navigate(visible.len(), selected, Navigation::Home).map(TreeAction::Select)
-        }
-        KeyCode::End => navigate(visible.len(), selected, Navigation::End).map(TreeAction::Select),
-        KeyCode::Left => {
-            let current = items[visible[selected]];
-            if current.has_children && current.expanded {
-                return Some(TreeAction::Toggle(false));
-            }
-            (0..selected)
-                .rev()
-                .find(|position| items[visible[*position]].depth < current.depth)
-                .map(TreeAction::Select)
-                .or(Some(TreeAction::Select(selected)))
-        }
-        KeyCode::Right => {
-            let current = items[visible[selected]];
-            if current.has_children && !current.expanded {
-                return Some(TreeAction::Toggle(true));
-            }
-            let child = selected.saturating_add(1);
-            if current.has_children
-                && child < visible.len()
-                && items[visible[child]].depth > current.depth
-            {
-                Some(TreeAction::Select(child))
-            } else {
-                Some(TreeAction::Select(selected))
-            }
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{TreeItem, normalized_visible_selection, tree_viewport_range, visible_indices};
+    use super::{
+        TreeItem, normalized_visible_selection, tree_action_descriptors, tree_viewport_range,
+        visible_indices,
+    };
 
     #[test]
     fn collapsed_branches_hide_only_their_descendants() {
@@ -491,6 +590,27 @@ mod tests {
                 "case {}",
                 record.id
             );
+        }
+    }
+
+    #[test]
+    fn action_descriptor_clones_reuse_immutable_storage() {
+        let enabled = tree_action_descriptors(true);
+        let disabled = tree_action_descriptors(false);
+
+        for index in 0..enabled.len() {
+            assert!(std::ptr::eq(
+                enabled[index].id().as_str(),
+                disabled[index].id().as_str()
+            ));
+            assert!(std::ptr::eq(
+                enabled[index].label(),
+                disabled[index].label()
+            ));
+            assert!(std::ptr::eq(
+                enabled[index].default_bindings(),
+                disabled[index].default_bindings()
+            ));
         }
     }
 

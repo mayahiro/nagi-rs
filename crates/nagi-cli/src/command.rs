@@ -1,12 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
+use crate::completion::CompletionProvider;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, display_os};
 use crate::help::{HelpBlock, HelpExample, HelpLink, HelpSection, UsageVariantDefinition};
+use crate::lifecycle::{Deprecation, valid_replacement};
 use crate::parser::Invocation;
 use crate::runtime::Handler;
-use crate::value::{ValueParser, raw_parser};
+use crate::value::{REDACTED_VALUE, ValueParser, raw_parser};
 
 /// The storage and parsing behavior of an option
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,7 +24,7 @@ pub enum OptionKind {
 /// Resolved or command-line presence used by validation
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresenceBasis {
-    /// Values from command line, environment, or default
+    /// Values from command line, environment, external resolver, or default
     Resolved,
     /// Values supplied in argv only
     CommandLine,
@@ -56,12 +58,17 @@ pub struct OptionSpec {
     pub(crate) kind: OptionKind,
     pub(crate) parser: Arc<dyn ValueParser>,
     pub(crate) help: String,
+    pub(crate) hidden: bool,
+    pub(crate) sensitive: bool,
+    pub(crate) deprecation: Option<Deprecation>,
+    pub(crate) inherited: bool,
     pub(crate) required: bool,
     pub(crate) repeated: bool,
     pub(crate) environment: Option<String>,
     pub(crate) default: Option<OsString>,
     pub(crate) requires: Vec<OptionRelation>,
     pub(crate) conflicts: Vec<OptionRelation>,
+    pub(crate) completion_provider: Option<Arc<dyn CompletionProvider>>,
 }
 
 impl OptionSpec {
@@ -88,12 +95,17 @@ impl OptionSpec {
             kind,
             parser: raw_parser(),
             help: String::new(),
+            hidden: false,
+            sensitive: false,
+            deprecation: None,
+            inherited: false,
             required: false,
             repeated: false,
             environment: None,
             default: None,
             requires: Vec::new(),
             conflicts: Vec::new(),
+            completion_provider: None,
         }
     }
 
@@ -115,6 +127,39 @@ impl OptionSpec {
         self
     }
 
+    /// Omits this option from Help, completion, and derived documentation
+    /// while preserving explicit argv parsing
+    pub const fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
+    }
+
+    /// Marks this Value option for redaction in framework-controlled display
+    ///
+    /// Raw and typed Invocation access remains unchanged. Graph validation
+    /// rejects this metadata on Flag and Count options
+    pub const fn sensitive(mut self) -> Self {
+        self.sensitive = true;
+        self
+    }
+
+    /// Marks this option deprecated with an application-provided replacement
+    /// hint while preserving parsing
+    pub fn deprecated(mut self, replacement: impl Into<String>) -> Self {
+        self.deprecation = Some(Deprecation::new(replacement));
+        self
+    }
+
+    /// Makes this option visible in its declaring command and selected descendants
+    ///
+    /// Recognition continues after subcommand selection and positionals until
+    /// `--`. Parsed values remain stored in the declaring command's Invocation
+    /// scope. Graph validation rejects descendant spelling collisions
+    pub const fn inherited(mut self) -> Self {
+        self.inherited = true;
+        self
+    }
+
     /// Requires this option after source resolution
     pub fn required(mut self) -> Self {
         self.required = true;
@@ -130,6 +175,18 @@ impl OptionSpec {
     /// Sets the typed parser used by a Value option
     pub fn parser(mut self, parser: Arc<dyn ValueParser>) -> Self {
         self.parser = parser;
+        self
+    }
+
+    /// Sets the dynamic completion provider for this Value option
+    ///
+    /// The provider is only called while this option's value is the active
+    /// completion target. Parsing and handler execution never call it
+    pub fn completion_provider<P>(mut self, provider: P) -> Self
+    where
+        P: CompletionProvider + 'static,
+    {
+        self.completion_provider = Some(Arc::new(provider));
         self
     }
 
@@ -190,6 +247,26 @@ impl OptionSpec {
     pub fn kind(&self) -> OptionKind {
         self.kind
     }
+
+    /// Reports whether this option is visible in selected descendant commands
+    pub const fn is_inherited(&self) -> bool {
+        self.inherited
+    }
+
+    /// Reports whether this option is omitted from generated projections
+    pub const fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Reports whether this Value option is marked for display redaction
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
+    }
+
+    /// Returns replacement metadata when this option is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
+    }
 }
 
 /// One positional argument in a command definition
@@ -198,8 +275,10 @@ pub struct Argument {
     pub(crate) id: String,
     pub(crate) parser: Arc<dyn ValueParser>,
     pub(crate) help: String,
+    pub(crate) sensitive: bool,
     pub(crate) required: bool,
     pub(crate) repeated: bool,
+    pub(crate) completion_provider: Option<Arc<dyn CompletionProvider>>,
 }
 
 impl Argument {
@@ -209,8 +288,10 @@ impl Argument {
             id: id.into(),
             parser: raw_parser(),
             help: String::new(),
+            sensitive: false,
             required: false,
             repeated: false,
+            completion_provider: None,
         }
     }
 
@@ -220,9 +301,28 @@ impl Argument {
         self
     }
 
+    /// Sets the dynamic completion provider for this positional argument
+    ///
+    /// The provider is only called while this argument is the active
+    /// completion target. Parsing and handler execution never call it
+    pub fn completion_provider<P>(mut self, provider: P) -> Self
+    where
+        P: CompletionProvider + 'static,
+    {
+        self.completion_provider = Some(Arc::new(provider));
+        self
+    }
+
     /// Sets the help description
     pub fn help(mut self, help: impl Into<String>) -> Self {
         self.help = help.into();
+        self
+    }
+
+    /// Marks this positional value for redaction in framework-controlled
+    /// display while preserving raw and typed Invocation access
+    pub const fn sensitive(mut self) -> Self {
+        self.sensitive = true;
         self
     }
 
@@ -241,6 +341,11 @@ impl Argument {
     /// Returns the stable value identifier
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Reports whether this positional value is marked for display redaction
+    pub const fn is_sensitive(&self) -> bool {
+        self.sensitive
     }
 }
 
@@ -368,6 +473,8 @@ pub struct Command {
     pub(crate) name: String,
     pub(crate) aliases: Vec<String>,
     pub(crate) about: String,
+    pub(crate) hidden: bool,
+    pub(crate) deprecation: Option<Deprecation>,
     pub(crate) version: Option<String>,
     pub(crate) options: Vec<OptionSpec>,
     pub(crate) arguments: Vec<Argument>,
@@ -393,6 +500,8 @@ impl Command {
             name,
             aliases: Vec::new(),
             about: String::new(),
+            hidden: false,
+            deprecation: None,
             version: None,
             options: Vec::new(),
             arguments: Vec::new(),
@@ -425,6 +534,20 @@ impl Command {
     /// Sets the short command description
     pub fn about(mut self, about: impl Into<String>) -> Self {
         self.about = about.into();
+        self
+    }
+
+    /// Omits this command from parent Help, completion, and derived
+    /// documentation while preserving explicit selection and direct Help
+    pub const fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
+    }
+
+    /// Marks this command deprecated with an application-provided replacement
+    /// hint while preserving parsing and handler execution
+    pub fn deprecated(mut self, replacement: impl Into<String>) -> Self {
+        self.deprecation = Some(Deprecation::new(replacement));
         self
     }
 
@@ -541,9 +664,24 @@ impl Command {
         &self.about
     }
 
+    /// Reports whether this command is omitted from parent projections
+    pub const fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Returns replacement metadata when this command is deprecated
+    pub fn deprecation(&self) -> Option<&Deprecation> {
+        self.deprecation.as_ref()
+    }
+
     /// Validates the entire graph without consuming argv
     pub fn validate(&self) -> Result<(), Diagnostic> {
-        validate_command(self, true)
+        validate_command(
+            self,
+            true,
+            &InheritedSpellings::default(),
+            std::slice::from_ref(&self.name),
+        )
     }
 
     pub(crate) fn command_at_path(&self, path: &[String]) -> Option<&Command> {
@@ -558,6 +696,22 @@ impl Command {
                 .find(|candidate| candidate.name == *name)?;
         }
         Some(command)
+    }
+
+    pub(crate) fn commands_at_path(&self, path: &[String]) -> Option<Vec<&Command>> {
+        if path.first().map(String::as_str) != Some(self.name.as_str()) {
+            return None;
+        }
+        let mut command = self;
+        let mut commands = vec![self];
+        for name in &path[1..] {
+            command = command
+                .subcommands
+                .iter()
+                .find(|candidate| candidate.name == *name)?;
+            commands.push(command);
+        }
+        Some(commands)
     }
 
     pub(crate) fn command_id_path_at_path(&self, path: &[String]) -> Option<Vec<String>> {
@@ -588,13 +742,34 @@ impl Command {
     }
 }
 
-fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
+#[derive(Clone, Default)]
+struct InheritedSpellings {
+    longs: BTreeMap<String, String>,
+    shorts: BTreeMap<char, String>,
+}
+
+fn validate_command(
+    command: &Command,
+    root: bool,
+    inherited: &InheritedSpellings,
+    command_path: &[String],
+) -> Result<(), Diagnostic> {
     if !valid_id(&command.id) {
         return invalid(format!("invalid command ID '{}'", command.id));
     }
     if !valid_name(&command.name) || reserved_long(&command.name) {
         return invalid(format!(
             "invalid or reserved command name '{}'",
+            command.name
+        ));
+    }
+    if command
+        .deprecation
+        .as_ref()
+        .is_some_and(|deprecation| !valid_replacement(deprecation.replacement()))
+    {
+        return invalid(format!(
+            "command '{}' has an invalid deprecation replacement",
             command.name
         ));
     }
@@ -633,10 +808,26 @@ fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
         if option.long.is_none() && option.short.is_none() {
             return invalid(format!("option '{}' has no spelling", option.id));
         }
+        if option
+            .deprecation
+            .as_ref()
+            .is_some_and(|deprecation| !valid_replacement(deprecation.replacement()))
+        {
+            return invalid(format!(
+                "option '{}' has an invalid deprecation replacement",
+                option.id
+            ));
+        }
         if let Some(long) = &option.long {
             if !valid_name(long) || reserved_long(long) || !longs.insert(long.clone()) {
                 return invalid(format!(
                     "duplicate, invalid, or reserved long option '{long}'"
+                ));
+            }
+            if let Some(origin) = inherited.longs.get(long) {
+                return invalid(format!(
+                    "command '{}' option '--{long}' conflicts with inherited option from '{origin}'",
+                    command_path.join(" ")
                 ));
             }
         }
@@ -646,9 +837,19 @@ fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
                     "duplicate, invalid, or reserved short option '{short}'"
                 ));
             }
+            if let Some(origin) = inherited.shorts.get(&short) {
+                return invalid(format!(
+                    "command '{}' option '-{short}' conflicts with inherited option from '{origin}'",
+                    command_path.join(" ")
+                ));
+            }
         }
         if option.kind != OptionKind::Value
-            && (option.repeated || option.environment.is_some() || option.default.is_some())
+            && (option.repeated
+                || option.environment.is_some()
+                || option.default.is_some()
+                || option.completion_provider.is_some()
+                || option.sensitive)
         {
             return invalid(format!(
                 "non-value option '{}' has value-only configuration",
@@ -697,6 +898,20 @@ fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
     }
     validate_help(command)?;
 
+    let mut visible_inherited = inherited.clone();
+    let origin = command_path.join(" ");
+    for option in &command.options {
+        if !option.inherited {
+            continue;
+        }
+        if let Some(long) = &option.long {
+            visible_inherited.longs.insert(long.clone(), origin.clone());
+        }
+        if let Some(short) = option.short {
+            visible_inherited.shorts.insert(short, origin.clone());
+        }
+    }
+
     let mut child_spellings = BTreeSet::new();
     let mut child_ids = BTreeSet::new();
     for child in &command.subcommands {
@@ -714,7 +929,9 @@ fn validate_command(command: &Command, root: bool) -> Result<(), Diagnostic> {
                 ));
             }
         }
-        validate_command(child, false)?;
+        let mut child_path = command_path.to_vec();
+        child_path.push(child.name.clone());
+        validate_command(child, false, &visible_inherited, &child_path)?;
     }
     Ok(())
 }
@@ -814,7 +1031,7 @@ fn invalid<T>(message: String) -> Result<T, Diagnostic> {
     ))
 }
 
-fn valid_id(value: &str) -> bool {
+pub(crate) fn valid_id(value: &str) -> bool {
     let mut bytes = value.bytes();
     matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic())
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
@@ -895,16 +1112,20 @@ pub(crate) fn option_description(option: &OptionSpec) -> String {
         append_note(&mut description, &format!("env: {environment}"));
     }
     if let Some(default) = &option.default {
-        append_note(
-            &mut description,
-            &format!("default: {}", display_os(default)),
-        );
+        let default = if option.sensitive {
+            REDACTED_VALUE.to_owned()
+        } else {
+            display_os(default)
+        };
+        append_note(&mut description, &format!("default: {default}"));
     }
     if !option.parser.possible_values().is_empty() {
-        append_note(
-            &mut description,
-            &format!("possible: {}", option.parser.possible_values().join(", ")),
-        );
+        let possible = if option.sensitive {
+            REDACTED_VALUE.to_owned()
+        } else {
+            option.parser.possible_values().join(", ")
+        };
+        append_note(&mut description, &format!("possible: {possible}"));
     }
     description
 }

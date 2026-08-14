@@ -3,6 +3,8 @@
 //! The codec owns no I/O, file descriptors, timers, threads, or terminal
 //! session state
 
+#![deny(unsafe_code)]
+
 mod event;
 mod input;
 mod output;
@@ -13,7 +15,7 @@ pub use event::{
 };
 pub use input::{Decoder, MAX_PASTE_BYTES, MAX_SEQUENCE_BYTES};
 pub use output::{
-    Capabilities, CursorShape, EraseMode, MouseTracking, SgrColor, SgrStyle, TerminalOp,
-    append_encoded, encode,
+    Capabilities, ColorLevel, CursorShape, EraseMode, KeyboardEnhancements, MouseTracking,
+    SgrColor, SgrStyle, TerminalOp, append_encoded, append_encoded_at, encode, encode_at,
 };
 pub use style::{Attributes, Color, Style};

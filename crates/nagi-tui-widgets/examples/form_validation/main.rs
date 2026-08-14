@@ -67,7 +67,7 @@ impl App for RegistrationForm {
         Effect::none()
     }
 
-    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+    fn view(&self, context: nagi_tui::ViewContext) -> Node<Self::Message> {
         let errors = self.validation_errors();
         let mut error_nodes = Vec::with_capacity(errors.len().max(1) + 1);
         if errors.is_empty() {
@@ -179,6 +179,7 @@ impl App for RegistrationForm {
                     HelpBinding::new("Enter/Space", "activate"),
                     HelpBinding::new("Esc", "exit"),
                 ])
+                .width_profile(context.width_profile)
                 .into_node()
                 .with_length(Length::Fixed(1)),
             ]),

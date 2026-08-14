@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use nagi_tui::{
-    Event, EventResult, HorizontalAlignment, KeyAction, KeyCode, Node, NodeId, Style,
-    VerticalAlignment,
+    Action, ActionAvailability, ActionDescriptor, EventResult, HorizontalAlignment,
+    ModalFocusOptions, ModalInitialFocus, ModalReturnFocus, Node, NodeId, Style, VerticalAlignment,
 };
+
+use crate::dismiss_action_descriptor;
 
 /// Visual styles used by a [`Modal`]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -20,6 +22,7 @@ pub struct Modal<Message> {
     child: Node<Message>,
     title: String,
     style: ModalStyle,
+    focus: ModalFocusOptions,
     on_escape: Option<Arc<dyn Fn() -> Message>>,
 }
 
@@ -32,6 +35,7 @@ impl<Message: 'static> Modal<Message> {
             child,
             title: String::new(),
             style: ModalStyle::default(),
+            focus: ModalFocusOptions::default(),
             on_escape: None,
         }
     }
@@ -50,16 +54,41 @@ impl<Message: 'static> Modal<Message> {
         self
     }
 
-    /// Emits a message when an Escape key press reaches the modal root
+    /// Sets the focus policy used when this modal becomes active
+    #[must_use]
+    pub fn initial_focus(mut self, focus: ModalInitialFocus) -> Self {
+        self.focus.initial = focus;
+        self
+    }
+
+    /// Sets the focus policy used when this modal stops being active
+    #[must_use]
+    pub fn return_focus(mut self, focus: ModalReturnFocus) -> Self {
+        self.focus.return_focus = focus;
+        self
+    }
+
+    /// Sets the message handler used by the semantic dismissal action
     #[must_use]
     pub fn on_escape(mut self, handler: impl Fn() -> Message + 'static) -> Self {
         self.on_escape = Some(Arc::new(handler));
         self
     }
 
+    /// Returns the semantic dismissal descriptor declared by the modal root
+    #[must_use]
+    pub fn action_descriptor(&self) -> ActionDescriptor {
+        dismiss_action_descriptor().with_availability(if self.on_escape.is_some() {
+            ActionAvailability::Enabled
+        } else {
+            ActionAvailability::DisabledPassThrough
+        })
+    }
+
     /// Builds the public semantic node for this modal
     #[must_use]
     pub fn into_node(self) -> Node<Message> {
+        let descriptor = self.action_descriptor();
         let content = if self.title.is_empty() {
             self.child
         } else {
@@ -72,20 +101,11 @@ impl<Message: 'static> Modal<Message> {
             VerticalAlignment::Center,
         );
         let id = self.id;
-        let modal = Node::modal(id.clone(), centered);
-        let Some(on_escape) = self.on_escape else {
-            return modal;
+        let modal = Node::modal_with_focus(id.clone(), centered, self.focus);
+        let action = match self.on_escape {
+            Some(on_escape) => Action::new(descriptor, move |_| EventResult::message(on_escape())),
+            None => Action::new(descriptor, |_| EventResult::ignored()),
         };
-        modal.on_event(id, move |event| {
-            if matches!(
-                event,
-                Event::Key(key)
-                    if key.action != KeyAction::Release && key.code == KeyCode::Escape
-            ) {
-                EventResult::message(on_escape())
-            } else {
-                EventResult::ignored()
-            }
-        })
+        modal.on_actions(id, [action])
     }
 }
