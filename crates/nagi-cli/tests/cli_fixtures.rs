@@ -834,6 +834,7 @@ fn source(source: ValueSource) -> &'static str {
         ValueSource::CommandLine => "cli",
         ValueSource::Environment => "env",
         ValueSource::Default => "default",
+        ValueSource::External => "external",
     }
 }
 

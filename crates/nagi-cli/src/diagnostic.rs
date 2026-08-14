@@ -3,6 +3,8 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
+use crate::value::ValueOrigin;
+
 /// A stable machine-readable framework or application diagnostic code
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DiagnosticCode(&'static str);
@@ -87,6 +89,7 @@ pub struct DiagnosticTarget {
     command_id_path: Vec<String>,
     value_id: String,
     sensitive: bool,
+    origin: Option<ValueOrigin>,
 }
 
 impl DiagnosticTarget {
@@ -97,6 +100,7 @@ impl DiagnosticTarget {
             command_id_path: Vec::new(),
             value_id: value_id.into(),
             sensitive: false,
+            origin: None,
         }
     }
 
@@ -107,6 +111,7 @@ impl DiagnosticTarget {
             command_id_path: Vec::new(),
             value_id: value_id.into(),
             sensitive: false,
+            origin: None,
         }
     }
 
@@ -136,8 +141,18 @@ impl DiagnosticTarget {
         self.sensitive
     }
 
+    /// Returns the value origin when this Diagnostic concerns one raw value
+    pub fn value_origin(&self) -> Option<&ValueOrigin> {
+        self.origin.as_ref()
+    }
+
     pub(crate) const fn with_sensitive(mut self, sensitive: bool) -> Self {
         self.sensitive = sensitive;
+        self
+    }
+
+    pub(crate) fn with_value_origin(mut self, origin: ValueOrigin) -> Self {
+        self.origin = Some(origin);
         self
     }
 

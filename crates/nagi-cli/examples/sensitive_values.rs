@@ -32,6 +32,7 @@ fn run(context: &mut Context, invocation: &Invocation) -> Result<Outcome, Diagno
         ValueSource::CommandLine => "command line",
         ValueSource::Environment => "environment",
         ValueSource::Default => "default",
+        ValueSource::External => "external",
     };
     writeln!(
         context.stdout(),

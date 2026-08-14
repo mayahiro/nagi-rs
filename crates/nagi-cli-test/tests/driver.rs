@@ -2,7 +2,7 @@
 
 use nagi_cli::{
     Argument, Command, Context, Diagnostic, HelpDocument, HelpRenderer, Invocation, Outcome,
-    RuntimePolicy,
+    RuntimePolicy, ValueResolution, ValueResolutionRequest, ValueSource,
 };
 use nagi_cli_test::TestDriver;
 use std::ffi::OsStr;
@@ -51,6 +51,26 @@ fn driver_uses_runtime_policy() {
         .run()
         .unwrap();
     assert_eq!(result.stdout(), b"custom help: sample/child\n");
+}
+
+#[test]
+fn driver_injects_value_resolver() {
+    let command = Command::new("sample")
+        .option(nagi_cli::OptionSpec::value("profile").long("profile"))
+        .handler(|_context: &mut Context, invocation: &Invocation| {
+            let value = &invocation.parsed_values("profile").unwrap()[0];
+            assert_eq!(value.raw(), "workspace");
+            assert_eq!(value.source(), ValueSource::External);
+            assert_eq!(value.origin().identity(), Some("test-config"));
+            Ok(Outcome::success())
+        });
+    let result = TestDriver::new(command)
+        .value_resolver(|_: &ValueResolutionRequest<'_>| {
+            Ok(ValueResolution::replace("test-config", ["workspace"]))
+        })
+        .run()
+        .unwrap();
+    assert_eq!(result.status(), nagi_cli::ExitStatus::SUCCESS);
 }
 
 struct CommandPathRenderer;

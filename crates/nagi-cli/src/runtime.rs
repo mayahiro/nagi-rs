@@ -11,6 +11,7 @@ use crate::diagnostic::{Diagnostic, DiagnosticCode, ExitStatus};
 use crate::parser::{Invocation, ParseResult};
 use crate::policy::RuntimePolicy;
 use crate::signal_unix::SignalGuard;
+use crate::value::ValueResolver;
 
 /// A cooperative cancellation source passed to handlers
 #[derive(Clone, Debug)]
@@ -78,6 +79,7 @@ pub struct Context {
     environment: BTreeMap<OsString, OsString>,
     current_directory: PathBuf,
     cancellation: CancellationToken,
+    value_resolver: Option<Arc<dyn ValueResolver>>,
 }
 
 impl Context {
@@ -134,7 +136,20 @@ impl Context {
                 .collect(),
             current_directory: current_directory.into(),
             cancellation,
+            value_resolver: None,
         }
+    }
+
+    /// Returns a Context using an application-owned Value Resolver
+    ///
+    /// The resolver receives only selected Value Options that remain
+    /// unresolved after command-line and environment processing
+    pub fn with_value_resolver<R>(mut self, resolver: R) -> Self
+    where
+        R: ValueResolver + 'static,
+    {
+        self.value_resolver = Some(Arc::new(resolver));
+        self
     }
 
     /// Returns mutable standard input access
@@ -172,6 +187,11 @@ impl Context {
     /// Returns the cooperative cancellation token
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    /// Returns the configured application Value Resolver
+    pub fn value_resolver(&self) -> Option<&dyn ValueResolver> {
+        self.value_resolver.as_deref()
     }
 }
 
@@ -245,7 +265,12 @@ impl Command {
             .environment_values()
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
-        match self.parse_with_environment(arguments, environment) {
+        let resolver = context.value_resolver.as_ref().map(Arc::clone);
+        let parsed = match resolver.as_deref() {
+            Some(resolver) => self.parse_with_value_resolver(arguments, environment, resolver),
+            None => self.parse_with_environment(arguments, environment),
+        };
+        match parsed {
             Ok(result) => self.run_parsed_with_policy(context, result, policy),
             Err(diagnostic) => {
                 context
@@ -392,11 +417,45 @@ impl Command {
         self.run_process_with_policy(&RuntimePolicy::default())
     }
 
+    /// Executes this command with an application-owned Value Resolver
+    ///
+    /// The helper installs a temporary SIGINT handler and returns an Exit
+    /// Status instead of terminating the process
+    pub fn run_process_with_value_resolver<R>(&self, resolver: R) -> io::Result<ExitStatus>
+    where
+        R: ValueResolver + 'static,
+    {
+        self.run_process_with_policy_and_value_resolver(&RuntimePolicy::default(), resolver)
+    }
+
     /// Executes this command with an explicit Runtime Policy
     ///
     /// The helper installs a temporary SIGINT handler and returns an Exit
     /// Status instead of terminating the process
     pub fn run_process_with_policy(&self, policy: &RuntimePolicy) -> io::Result<ExitStatus> {
+        self.run_process_with_optional_value_resolver(policy, None)
+    }
+
+    /// Executes this command with an explicit Runtime Policy and Value Resolver
+    ///
+    /// The helper installs a temporary SIGINT handler and returns an Exit
+    /// Status instead of terminating the process
+    pub fn run_process_with_policy_and_value_resolver<R>(
+        &self,
+        policy: &RuntimePolicy,
+        resolver: R,
+    ) -> io::Result<ExitStatus>
+    where
+        R: ValueResolver + 'static,
+    {
+        self.run_process_with_optional_value_resolver(policy, Some(Arc::new(resolver)))
+    }
+
+    fn run_process_with_optional_value_resolver(
+        &self,
+        policy: &RuntimePolicy,
+        resolver: Option<Arc<dyn ValueResolver>>,
+    ) -> io::Result<ExitStatus> {
         let _signal_guard = SignalGuard::install()?;
         let current_directory = env::current_dir()?;
         let environment: Vec<(OsString, OsString)> = env::vars_os().collect();
@@ -409,6 +468,7 @@ impl Command {
             current_directory,
             CancellationToken::process(),
         );
+        context.value_resolver = resolver;
         self.run_with_policy(&mut context, arguments, policy)
             .map(Outcome::status)
     }

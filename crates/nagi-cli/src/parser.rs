@@ -6,12 +6,14 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use crate::command::{
     Argument, Command, OptionGroupKind, OptionKind, OptionSpec, PresenceBasis, option_display,
-    quote_value,
+    quote_value, valid_id,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticCode, DiagnosticTarget};
 use crate::lifecycle::DeprecationNotice;
-use crate::value::REDACTED_VALUE;
-use crate::value::{ParsedValue, ValueSource};
+use crate::value::{
+    ParsedValue, REDACTED_VALUE, ValueOrigin, ValueResolution, ValueResolutionMode,
+    ValueResolutionRequest, ValueResolver, ValueSource,
+};
 
 #[derive(Clone, Debug)]
 enum InvocationValue {
@@ -158,7 +160,7 @@ impl Invocation {
     ///
     /// A deprecated root Command comes first. Subsequent targets follow their
     /// first successful argv occurrence. Each stable target occurs at most
-    /// once. Environment and default value resolution do not produce notices
+    /// once. Environment, external, and default resolution do not produce notices
     pub fn deprecation_notices(&self) -> &[DeprecationNotice] {
         &self.deprecation_notices
     }
@@ -291,7 +293,7 @@ impl Invocation {
 
     /// Returns the first typed value or a structured access error
     ///
-    /// Environment and default values are already resolved before this lookup
+    /// Environment, external, and default values are resolved before this lookup
     pub fn require_value<T: Any>(&self, id: &str) -> Result<&T, ValueAccessError> {
         required_value(self.value_scope_id_path(), self.parsed_values(id), id)
     }
@@ -549,20 +551,57 @@ impl Command {
         K: Into<OsString>,
         V: Into<OsString>,
     {
+        self.parse_with_optional_value_resolver(arguments, environment, None)
+    }
+
+    /// Parses arguments, environment values, and application-owned fallbacks
+    ///
+    /// The resolver is called only for selected Value Options that have no
+    /// command-line or environment value
+    pub fn parse_with_value_resolver<I, S, E, K, V>(
+        &self,
+        arguments: I,
+        environment: E,
+        resolver: &dyn ValueResolver,
+    ) -> Result<ParseResult, Diagnostic>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+        E: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.parse_with_optional_value_resolver(arguments, environment, Some(resolver))
+    }
+
+    fn parse_with_optional_value_resolver<I, S, E, K, V>(
+        &self,
+        arguments: I,
+        environment: E,
+        resolver: Option<&dyn ValueResolver>,
+    ) -> Result<ParseResult, Diagnostic>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+        E: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
         self.validate()?;
         let arguments: Vec<OsString> = arguments.into_iter().map(Into::into).collect();
         let environment: BTreeMap<OsString, OsString> = environment
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
-        Parser::new(self, arguments, environment).parse()
+        Parser::new(self, arguments, environment, resolver).parse()
     }
 }
 
-struct Parser<'command> {
+struct Parser<'command, 'resolver> {
     root: &'command Command,
     arguments: Vec<OsString>,
     environment: BTreeMap<OsString, OsString>,
+    resolver: Option<&'resolver dyn ValueResolver>,
     index: usize,
     commands: Vec<&'command Command>,
     command_path: Vec<String>,
@@ -573,16 +612,18 @@ struct Parser<'command> {
     deprecation_notices: Vec<DeprecationNotice>,
 }
 
-impl<'command> Parser<'command> {
+impl<'command, 'resolver> Parser<'command, 'resolver> {
     fn new(
         root: &'command Command,
         arguments: Vec<OsString>,
         environment: BTreeMap<OsString, OsString>,
+        resolver: Option<&'resolver dyn ValueResolver>,
     ) -> Self {
         let mut parser = Self {
             root,
             arguments,
             environment,
+            resolver,
             index: 0,
             commands: vec![root],
             command_path: vec![root.name.clone()],
@@ -640,15 +681,16 @@ impl<'command> Parser<'command> {
             self.index += 1;
         }
 
-        self.resolve_fallbacks()?;
+        let command_id_path = self
+            .commands
+            .iter()
+            .map(|command| command.id.clone())
+            .collect::<Vec<_>>();
+        self.resolve_fallbacks(&command_id_path)?;
         self.validate_values()?;
         let mut invocation = Invocation {
             command_path: self.command_path.clone(),
-            command_id_path: self
-                .commands
-                .iter()
-                .map(|command| command.id.clone())
-                .collect(),
+            command_id_path,
             current_scope: self.scopes.len() - 1,
             scopes: std::mem::take(&mut self.scopes),
             deprecation_notices: std::mem::take(&mut self.deprecation_notices),
@@ -933,7 +975,7 @@ impl<'command> Parser<'command> {
                     &option.id,
                     &option.parser,
                     raw,
-                    ValueSource::CommandLine,
+                    ValueOrigin::command_line(),
                     option.sensitive,
                     self.option_target(scope_index, &option.id),
                 )?;
@@ -1032,7 +1074,7 @@ impl<'command> Parser<'command> {
             &argument.id,
             &argument.parser,
             raw,
-            ValueSource::CommandLine,
+            ValueOrigin::command_line(),
             argument.sensitive,
             DiagnosticTarget::argument(&argument.id),
         )?;
@@ -1043,7 +1085,7 @@ impl<'command> Parser<'command> {
         Ok(())
     }
 
-    fn resolve_fallbacks(&mut self) -> Result<(), Diagnostic> {
+    fn resolve_fallbacks(&mut self, selected_command_id_path: &[String]) -> Result<(), Diagnostic> {
         let commands = self.commands.clone();
         for (command_index, command) in commands.into_iter().enumerate() {
             for option in &command.options {
@@ -1052,33 +1094,150 @@ impl<'command> Parser<'command> {
                 {
                     continue;
                 }
-                let fallback = option
-                    .environment
-                    .as_ref()
-                    .and_then(|name| self.environment.get(OsStr::new(name)))
-                    .cloned()
-                    .map(|value| (value, ValueSource::Environment))
-                    .or_else(|| {
-                        option
-                            .default
-                            .clone()
-                            .map(|value| (value, ValueSource::Default))
-                    });
-                if let Some((raw, source)) = fallback {
+                if let Some((name, raw)) = option.environment.as_ref().and_then(|name| {
+                    self.environment
+                        .get(OsStr::new(name))
+                        .cloned()
+                        .map(|raw| (name, raw))
+                }) {
+                    let origin = ValueOrigin::environment(name.clone());
                     let parsed = self.parse_value(
                         &option.id,
                         &option.parser,
                         raw,
-                        source,
+                        origin.clone(),
                         option.sensitive,
                         DiagnosticTarget::option(&option.id)
-                            .with_command_id_path(self.command_id_path(command_index)),
+                            .with_command_id_path(self.command_id_path(command_index))
+                            .with_value_origin(origin),
+                    )?;
+                    self.push_value(command_index, &option.id, parsed);
+                    continue;
+                }
+
+                if let Some(resolver) = self.resolver {
+                    let request = ValueResolutionRequest::new(
+                        &self.command_path,
+                        selected_command_id_path,
+                        &self.command_path[..=command_index],
+                        &selected_command_id_path[..=command_index],
+                        &option.id,
+                        option.repeated,
+                        option.sensitive,
+                    );
+                    let resolution = resolver.resolve(&request).map_err(|diagnostic| {
+                        self.resolver_diagnostic(diagnostic, command_index, &option.id)
+                    })?;
+                    if resolution.is_resolved() {
+                        self.apply_external_resolution(command_index, option, resolution)?;
+                        continue;
+                    }
+                }
+
+                if let Some(raw) = option.default.clone() {
+                    let origin = ValueOrigin::default_value();
+                    let parsed = self.parse_value(
+                        &option.id,
+                        &option.parser,
+                        raw,
+                        origin.clone(),
+                        option.sensitive,
+                        DiagnosticTarget::option(&option.id)
+                            .with_command_id_path(self.command_id_path(command_index))
+                            .with_value_origin(origin),
                     )?;
                     self.push_value(command_index, &option.id, parsed);
                 }
             }
         }
         Ok(())
+    }
+
+    fn apply_external_resolution(
+        &mut self,
+        command_index: usize,
+        option: &OptionSpec,
+        resolution: ValueResolution,
+    ) -> Result<(), Diagnostic> {
+        let (identity, values, mode) = resolution
+            .into_resolved_parts()
+            .expect("a resolved result has an identity");
+        if !valid_id(&identity) {
+            return Err(self.error_with_targets(
+                DiagnosticCode::InvalidSpecification,
+                format!(
+                    "Value Resolver returned an invalid source identity for '{}'",
+                    option.id
+                ),
+                [self.option_target(command_index, &option.id)],
+            ));
+        }
+        if values.is_empty() {
+            return Err(self.error_with_targets(
+                DiagnosticCode::InvalidSpecification,
+                format!(
+                    "Value Resolver returned an empty resolved result for '{}'",
+                    option.id
+                ),
+                [self.option_target(command_index, &option.id)],
+            ));
+        }
+        if !option.repeated && (values.len() != 1 || mode != ValueResolutionMode::Replace) {
+            return Err(self.error_with_targets(
+                DiagnosticCode::InvalidSpecification,
+                format!(
+                    "Value Resolver returned repeated or merged values for non-repeated '{}'",
+                    option.id
+                ),
+                [self.option_target(command_index, &option.id)],
+            ));
+        }
+
+        for raw in values {
+            let origin = ValueOrigin::external(std::sync::Arc::clone(&identity));
+            let parsed = self.parse_value(
+                &option.id,
+                &option.parser,
+                raw,
+                origin.clone(),
+                option.sensitive,
+                self.option_target(command_index, &option.id)
+                    .with_value_origin(origin),
+            )?;
+            self.push_value(command_index, &option.id, parsed);
+        }
+        if mode == ValueResolutionMode::Merge {
+            if let Some(raw) = option.default.clone() {
+                let origin = ValueOrigin::default_value();
+                let parsed = self.parse_value(
+                    &option.id,
+                    &option.parser,
+                    raw,
+                    origin.clone(),
+                    option.sensitive,
+                    self.option_target(command_index, &option.id)
+                        .with_value_origin(origin),
+                )?;
+                self.push_value(command_index, &option.id, parsed);
+            }
+        }
+        Ok(())
+    }
+
+    fn resolver_diagnostic(
+        &self,
+        mut diagnostic: Diagnostic,
+        command_index: usize,
+        value_id: &str,
+    ) -> Diagnostic {
+        if diagnostic.targets().is_empty() {
+            diagnostic = diagnostic.with_target(self.option_target(command_index, value_id));
+        }
+        diagnostic
+            .with_default_target_path(&self.command_id_path(command_index))
+            .map_targets(|target| self.mark_sensitive_target(target))
+            .with_command_path(self.command_path.clone())
+            .with_usage(self.root.usage_for_path(&self.command_path))
     }
 
     fn validate_values(&self) -> Result<(), Diagnostic> {
@@ -1215,10 +1374,11 @@ impl<'command> Parser<'command> {
         id: &str,
         parser: &std::sync::Arc<dyn crate::value::ValueParser>,
         raw: OsString,
-        source: ValueSource,
+        origin: ValueOrigin,
         sensitive: bool,
         target: DiagnosticTarget,
     ) -> Result<ParsedValue, Diagnostic> {
+        let target = target.with_value_origin(origin.clone());
         let typed = parser.parse(&raw).map_err(|reason| {
             let message = if sensitive {
                 format!("invalid value {REDACTED_VALUE} for '{id}'")
@@ -1227,7 +1387,7 @@ impl<'command> Parser<'command> {
             };
             self.error_with_targets(DiagnosticCode::InvalidValue, message, [target])
         })?;
-        Ok(ParsedValue::new(raw, source, typed, sensitive))
+        Ok(ParsedValue::new(raw, origin, typed, sensitive))
     }
 
     fn push_value(&mut self, scope_index: usize, id: &str, value: ParsedValue) {

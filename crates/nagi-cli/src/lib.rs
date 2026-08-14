@@ -26,6 +26,11 @@
 //! and completion redact or suppress those values while explicit Invocation
 //! access preserves the original raw and typed data
 //!
+//! [`ValueResolver`] adapts already loaded application configuration into
+//! selected Value Option fallbacks without giving Nagi ownership of its schema
+//! or I/O. Fixed precedence remains command line, environment, external
+//! resolver, then command-definition default
+//!
 //! [`CompletionEngine`] snapshots the validated graph without handlers and
 //! resolves static candidates plus only the active Option or Argument
 //! [`CompletionProvider`]. Shell-specific generation remains in the optional
@@ -84,6 +89,7 @@ pub use runtime::{
     CancellationHandle, CancellationToken, Context, Handler, Outcome, cancellation_pair,
 };
 pub use value::{
-    ParsedValue, REDACTED_VALUE, ValueParser, ValueSource, integer_parser, possible_values_parser,
+    ParsedValue, REDACTED_VALUE, ValueOrigin, ValueParser, ValueResolution, ValueResolutionMode,
+    ValueResolutionRequest, ValueResolver, ValueSource, integer_parser, possible_values_parser,
     raw_parser, string_parser, value_parser,
 };

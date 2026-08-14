@@ -24,7 +24,7 @@ pub enum OptionKind {
 /// Resolved or command-line presence used by validation
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresenceBasis {
-    /// Values from command line, environment, or default
+    /// Values from command line, environment, external resolver, or default
     Resolved,
     /// Values supplied in argv only
     CommandLine,
@@ -1031,7 +1031,7 @@ fn invalid<T>(message: String) -> Result<T, Diagnostic> {
     ))
 }
 
-fn valid_id(value: &str) -> bool {
+pub(crate) fn valid_id(value: &str) -> bool {
     let mut bytes = value.bytes();
     matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic())
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')

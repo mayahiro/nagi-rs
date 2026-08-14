@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "diagnostic_json"
 harness = false
+
+[[bench]]
+name = "value_resolution"
+harness = false
