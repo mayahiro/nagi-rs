@@ -11,7 +11,7 @@ use nagi_cli::{
 fn application() -> Command {
     Command::new("greet")
         .about("Print a greeting")
-        .version("0.2.7")
+        .version("0.4.0")
         .usage_variant("named", "<NAME> [OPTIONS]")
         .argument(
             Argument::new("name")

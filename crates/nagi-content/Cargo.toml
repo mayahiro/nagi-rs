@@ -12,4 +12,4 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-nagi-text = { path = "../nagi-text", version = "0.2.7" }
+nagi-text = { path = "../nagi-text", version = "0.4.0" }

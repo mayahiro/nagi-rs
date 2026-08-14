@@ -17,10 +17,10 @@ Add only the application framework and optional components that you use
 
 ```toml
 [dependencies]
-nagi-content = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Source-neutral structured content
-nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
-nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Optional
-nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # CLI applications
+nagi-content = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" } # Source-neutral structured content
+nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" }
+nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" } # Optional
+nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" } # CLI applications
 ```
 
 Commit an application's `Cargo.lock` to preserve its complete dependency
@@ -73,8 +73,8 @@ Add only the matching test support crate
 
 ```toml
 [dev-dependencies]
-nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
-nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
+nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" }
+nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" }
 ```
 
 `nagi-tui-test` drives messages, terminal input, resize, virtual time, Effects,

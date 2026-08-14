@@ -13,4 +13,4 @@ missing_docs = "deny"
 unsafe_code = "forbid"
 
 [dependencies]
-nagi-cli = { path = "../nagi-cli", version = "0.2.7" }
+nagi-cli = { path = "../nagi-cli", version = "0.4.0" }

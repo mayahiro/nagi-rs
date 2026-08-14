@@ -16,10 +16,10 @@ Nagi Rust実装はterminal application向けのnative Content、Text、VT、Surf
 
 ```toml
 [dependencies]
-nagi-content = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Source-neutral structured content
-nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
-nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # Optional
-nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" } # CLI application
+nagi-content = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" } # Source-neutral structured content
+nagi-tui = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" }
+nagi-tui-widgets = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" } # Optional
+nagi-cli = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" } # CLI application
 ```
 
 依存関係全体の解決結果を維持するため、applicationの`Cargo.lock`をcommitしてください
@@ -68,8 +68,8 @@ cargo run -p nagi-cli --example basic -- Nagi
 
 ```toml
 [dev-dependencies]
-nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
-nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
+nagi-tui-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" }
+nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.4.0" }
 ```
 
 `nagi-tui-test`は実terminalを使わずにMessage、terminal input、resize、virtual time、Effect、Subscription、pending terminal taskとclipboard request、Runtime notice、frame、activeなresolved actionを操作できます

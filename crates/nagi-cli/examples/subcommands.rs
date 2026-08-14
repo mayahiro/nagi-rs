@@ -12,7 +12,7 @@ fn application() -> Command {
     Command::new("service")
         .id("service-root")
         .about("Manage a service")
-        .version("0.2.7")
+        .version("0.4.0")
         .option(
             OptionSpec::value("profile")
                 .long("profile")
