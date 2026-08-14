@@ -16,6 +16,7 @@ bench:
 	cargo bench -p nagi-cli --bench completion
 	cargo bench -p nagi-cli --bench diagnostic_json
 	cargo bench -p nagi-cli --bench value_resolution
+	cargo bench -p nagi-cli --bench response_file
 	cargo bench -p nagi-cli-document --bench document
 	cargo bench -p nagi-cli-prompt --bench prompt
 	cargo bench -p nagi-cli-status --bench status

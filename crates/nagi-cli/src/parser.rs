@@ -322,6 +322,9 @@ impl Invocation {
     }
 
     pub(crate) fn mark_sensitive_target(&self, target: DiagnosticTarget) -> DiagnosticTarget {
+        if target.kind() == crate::diagnostic::DiagnosticTargetKind::ResponseFile {
+            return target;
+        }
         let scope_index = if target.command_id_path().is_empty() {
             Some(self.current_scope)
         } else {
@@ -593,6 +596,15 @@ impl Command {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
+        self.parse_validated_with_optional_value_resolver(arguments, environment, resolver)
+    }
+
+    pub(crate) fn parse_validated_with_optional_value_resolver(
+        &self,
+        arguments: Vec<OsString>,
+        environment: BTreeMap<OsString, OsString>,
+        resolver: Option<&dyn ValueResolver>,
+    ) -> Result<ParseResult, Diagnostic> {
         Parser::new(self, arguments, environment, resolver).parse()
     }
 }
@@ -1453,6 +1465,7 @@ impl<'command, 'resolver> Parser<'command, 'resolver> {
                 .iter()
                 .find(|argument| argument.id == target.value_id())
                 .is_some_and(|argument| argument.sensitive),
+            crate::diagnostic::DiagnosticTargetKind::ResponseFile => false,
         };
         target.with_sensitive(sensitive)
     }

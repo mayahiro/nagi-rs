@@ -1,0 +1,4 @@
+# Arguments are tokenized by Nagi, not by a shell
+--profile workspace
+--tag alpha
+--tag "release candidate"

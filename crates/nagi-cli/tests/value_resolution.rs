@@ -321,6 +321,7 @@ fn snapshot_diagnostic(diagnostic: &Diagnostic) -> String {
     let kind = match target.kind() {
         DiagnosticTargetKind::Option => "option",
         DiagnosticTargetKind::Argument => "argument",
+        DiagnosticTargetKind::ResponseFile => "response-file",
     };
     let origin = target.value_origin().map_or_else(
         || "none".to_owned(),

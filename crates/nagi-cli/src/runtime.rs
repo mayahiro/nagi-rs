@@ -10,6 +10,9 @@ use crate::command::Command;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, ExitStatus};
 use crate::parser::{Invocation, ParseResult};
 use crate::policy::RuntimePolicy;
+use crate::response_file::{
+    FilesystemResponseFileReader, ResponseFileOptions, ResponseFileReader, expand_response_files,
+};
 use crate::signal_unix::SignalGuard;
 use crate::value::ValueResolver;
 
@@ -80,6 +83,12 @@ pub struct Context {
     current_directory: PathBuf,
     cancellation: CancellationToken,
     value_resolver: Option<Arc<dyn ValueResolver>>,
+    response_files: Option<ResponseFileRuntime>,
+}
+
+struct ResponseFileRuntime {
+    options: ResponseFileOptions,
+    reader: Box<dyn ResponseFileReader>,
 }
 
 impl Context {
@@ -137,6 +146,7 @@ impl Context {
             current_directory: current_directory.into(),
             cancellation,
             value_resolver: None,
+            response_files: None,
         }
     }
 
@@ -149,6 +159,27 @@ impl Context {
         R: ValueResolver + 'static,
     {
         self.value_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    /// Returns a Context using opt-in Response File expansion
+    ///
+    /// Exact `@-` expansion, when enabled in `options`, consumes this Context's
+    /// standard input. File reads use the injected reader
+    pub fn with_response_files<R>(mut self, options: ResponseFileOptions, reader: R) -> Self
+    where
+        R: ResponseFileReader + 'static,
+    {
+        self.response_files = Some(ResponseFileRuntime {
+            options,
+            reader: Box::new(reader),
+        });
+        self
+    }
+
+    /// Returns a Context without Response File expansion
+    pub fn without_response_files(mut self) -> Self {
+        self.response_files = None;
         self
     }
 
@@ -192,6 +223,69 @@ impl Context {
     /// Returns the configured application Value Resolver
     pub fn value_resolver(&self) -> Option<&dyn ValueResolver> {
         self.value_resolver.as_deref()
+    }
+
+    /// Returns configured Response File options when expansion is enabled
+    pub fn response_file_options(&self) -> Option<ResponseFileOptions> {
+        self.response_files.as_ref().map(|runtime| runtime.options)
+    }
+}
+
+/// Composable services used by complete process integration
+#[derive(Clone, Default)]
+pub struct ProcessOptions {
+    policy: RuntimePolicy,
+    value_resolver: Option<Arc<dyn ValueResolver>>,
+    response_files: Option<ResponseFileOptions>,
+}
+
+impl ProcessOptions {
+    /// Returns a copy using an explicit Runtime Policy
+    pub fn with_policy(mut self, policy: RuntimePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Returns a copy using an application-owned Value Resolver
+    pub fn with_value_resolver<R>(mut self, resolver: R) -> Self
+    where
+        R: ValueResolver + 'static,
+    {
+        self.value_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    /// Returns a copy enabling filesystem-backed Response File expansion
+    pub const fn with_response_files(mut self, options: ResponseFileOptions) -> Self {
+        self.response_files = Some(options);
+        self
+    }
+
+    /// Returns a copy without a Value Resolver
+    pub fn without_value_resolver(mut self) -> Self {
+        self.value_resolver = None;
+        self
+    }
+
+    /// Returns a copy without Response File expansion
+    pub const fn without_response_files(mut self) -> Self {
+        self.response_files = None;
+        self
+    }
+
+    /// Returns the configured Runtime Policy
+    pub const fn policy(&self) -> &RuntimePolicy {
+        &self.policy
+    }
+
+    /// Returns the configured Value Resolver
+    pub fn value_resolver(&self) -> Option<&dyn ValueResolver> {
+        self.value_resolver.as_deref()
+    }
+
+    /// Returns configured Response File options when expansion is enabled
+    pub const fn response_file_options(&self) -> Option<ResponseFileOptions> {
+        self.response_files
     }
 }
 
@@ -261,15 +355,31 @@ impl Command {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
+        let validation = self.validate();
         let environment: Vec<(OsString, OsString)> = context
             .environment_values()
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
         let resolver = context.value_resolver.as_ref().map(Arc::clone);
-        let parsed = match resolver.as_deref() {
-            Some(resolver) => self.parse_with_value_resolver(arguments, environment, resolver),
-            None => self.parse_with_environment(arguments, environment),
-        };
+        let parsed = validation.and_then(|()| {
+            let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+            let arguments = if let Some(response_files) = context.response_files.as_mut() {
+                expand_response_files(
+                    arguments,
+                    &context.current_directory,
+                    &response_files.options,
+                    response_files.reader.as_mut(),
+                    context.stdin.as_mut(),
+                )?
+            } else {
+                arguments
+            };
+            self.parse_validated_with_optional_value_resolver(
+                arguments,
+                environment.into_iter().collect(),
+                resolver.as_deref(),
+            )
+        });
         match parsed {
             Ok(result) => self.run_parsed_with_policy(context, result, policy),
             Err(diagnostic) => {
@@ -414,7 +524,7 @@ impl Command {
     /// The helper installs a temporary SIGINT handler and returns an Exit
     /// Status instead of terminating the process
     pub fn run_process(&self) -> io::Result<ExitStatus> {
-        self.run_process_with_policy(&RuntimePolicy::default())
+        self.run_process_with_options(&ProcessOptions::default())
     }
 
     /// Executes this command with an application-owned Value Resolver
@@ -425,7 +535,7 @@ impl Command {
     where
         R: ValueResolver + 'static,
     {
-        self.run_process_with_policy_and_value_resolver(&RuntimePolicy::default(), resolver)
+        self.run_process_with_options(&ProcessOptions::default().with_value_resolver(resolver))
     }
 
     /// Executes this command with an explicit Runtime Policy
@@ -433,7 +543,7 @@ impl Command {
     /// The helper installs a temporary SIGINT handler and returns an Exit
     /// Status instead of terminating the process
     pub fn run_process_with_policy(&self, policy: &RuntimePolicy) -> io::Result<ExitStatus> {
-        self.run_process_with_optional_value_resolver(policy, None)
+        self.run_process_with_options(&ProcessOptions::default().with_policy(policy.clone()))
     }
 
     /// Executes this command with an explicit Runtime Policy and Value Resolver
@@ -448,14 +558,16 @@ impl Command {
     where
         R: ValueResolver + 'static,
     {
-        self.run_process_with_optional_value_resolver(policy, Some(Arc::new(resolver)))
+        self.run_process_with_options(
+            &ProcessOptions::default()
+                .with_policy(policy.clone())
+                .with_value_resolver(resolver),
+        )
     }
 
-    fn run_process_with_optional_value_resolver(
-        &self,
-        policy: &RuntimePolicy,
-        resolver: Option<Arc<dyn ValueResolver>>,
-    ) -> io::Result<ExitStatus> {
+    /// Executes this command against the current Unix process with composable
+    /// Runtime, Value Resolver, and Response File options
+    pub fn run_process_with_options(&self, options: &ProcessOptions) -> io::Result<ExitStatus> {
         let _signal_guard = SignalGuard::install()?;
         let current_directory = env::current_dir()?;
         let environment: Vec<(OsString, OsString)> = env::vars_os().collect();
@@ -468,8 +580,12 @@ impl Command {
             current_directory,
             CancellationToken::process(),
         );
-        context.value_resolver = resolver;
-        self.run_with_policy(&mut context, arguments, policy)
+        context.value_resolver = options.value_resolver.as_ref().map(Arc::clone);
+        if let Some(response_file_options) = options.response_files {
+            context =
+                context.with_response_files(response_file_options, FilesystemResponseFileReader);
+        }
+        self.run_with_policy(&mut context, arguments, &options.policy)
             .map(Outcome::status)
     }
 }

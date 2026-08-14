@@ -47,6 +47,18 @@ impl DiagnosticCode {
     pub const Cancelled: Self = Self("cancelled");
     /// An injected I/O operation failed
     pub const IoError: Self = Self("io-error");
+    /// A Response File could not be read
+    pub const ResponseFileIo: Self = Self("response-file-io");
+    /// A Response File is not valid UTF-8
+    pub const ResponseFileEncoding: Self = Self("response-file-encoding");
+    /// Response File tokenization failed
+    pub const ResponseFileSyntax: Self = Self("response-file-syntax");
+    /// Recursive Response File inclusion formed a lexical cycle
+    pub const ResponseFileCycle: Self = Self("response-file-cycle");
+    /// Response File expansion exceeded a configured resource limit
+    pub const ResponseFileLimit: Self = Self("response-file-limit");
+    /// Standard-input Response File expansion is disabled or repeated
+    pub const ResponseFileStdin: Self = Self("response-file-stdin");
 
     /// Constructs an application code using the stable identifier grammar
     ///
@@ -73,16 +85,18 @@ fn valid_diagnostic_code(code: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// Identifies the kind of value referenced by a Diagnostic target
+/// Identifies the kind of entity referenced by a Diagnostic target
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticTargetKind {
     /// A command option
     Option,
     /// A positional argument
     Argument,
+    /// A Response File include reference
+    ResponseFile,
 }
 
-/// Identifies one option or argument in a structured Diagnostic
+/// Identifies one option, argument, or Response File in a Diagnostic
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiagnosticTarget {
     kind: DiagnosticTargetKind,
@@ -115,13 +129,28 @@ impl DiagnosticTarget {
         }
     }
 
+    /// Constructs a target for a Response File include reference
+    ///
+    /// `reference` excludes the leading `@` expansion marker
+    pub fn response_file(reference: impl Into<String>) -> Self {
+        Self {
+            kind: DiagnosticTargetKind::ResponseFile,
+            command_id_path: Vec::new(),
+            value_id: reference.into(),
+            sensitive: false,
+            origin: None,
+        }
+    }
+
     /// Returns a copy with an explicit stable command-ID path
     pub fn with_command_id_path(mut self, path: Vec<String>) -> Self {
-        self.command_id_path = path;
+        if self.kind != DiagnosticTargetKind::ResponseFile {
+            self.command_id_path = path;
+        }
         self
     }
 
-    /// Returns whether this target identifies an option or argument
+    /// Returns the entity kind identified by this target
     pub const fn kind(&self) -> DiagnosticTargetKind {
         self.kind
     }
@@ -131,7 +160,7 @@ impl DiagnosticTarget {
         &self.command_id_path
     }
 
-    /// Returns the command-local value ID
+    /// Returns the command-local value ID or Response File reference
     pub fn value_id(&self) -> &str {
         &self.value_id
     }
@@ -157,7 +186,7 @@ impl DiagnosticTarget {
     }
 
     pub(crate) fn set_default_path(&mut self, path: &[String]) {
-        if self.command_id_path.is_empty() {
+        if self.kind != DiagnosticTargetKind::ResponseFile && self.command_id_path.is_empty() {
             self.command_id_path = path.to_vec();
         }
     }
@@ -376,7 +405,12 @@ fn category_for_code(code: DiagnosticCode) -> DiagnosticCategory {
         | "option-group"
         | "validation" => DiagnosticCategory::Usage,
         "cancelled" => DiagnosticCategory::Cancellation,
-        "io-error" => DiagnosticCategory::Io,
+        "io-error" | "response-file-io" => DiagnosticCategory::Io,
+        "response-file-encoding"
+        | "response-file-syntax"
+        | "response-file-cycle"
+        | "response-file-limit"
+        | "response-file-stdin" => DiagnosticCategory::Usage,
         _ => DiagnosticCategory::Execution,
     }
 }

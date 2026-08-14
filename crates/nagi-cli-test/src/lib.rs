@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nagi_cli::{
-    Command, Context, Diagnostic, ExitStatus, RuntimePolicy, ValueResolution,
-    ValueResolutionRequest, ValueResolver, cancellation_pair,
+    Command, Context, Diagnostic, ExitStatus, ResponseFileOptions, ResponseFileReader,
+    RuntimePolicy, ValueResolution, ValueResolutionRequest, ValueResolver, cancellation_pair,
 };
 
 /// A configurable process-free command application driver
@@ -21,6 +21,7 @@ pub struct TestDriver {
     cancelled: bool,
     policy: RuntimePolicy,
     value_resolver: Option<Arc<dyn ValueResolver>>,
+    response_files: Option<(ResponseFileOptions, Box<dyn ResponseFileReader>)>,
 }
 
 impl TestDriver {
@@ -35,6 +36,7 @@ impl TestDriver {
             cancelled: false,
             policy: RuntimePolicy::default(),
             value_resolver: None,
+            response_files: None,
         }
     }
 
@@ -87,6 +89,15 @@ impl TestDriver {
         self
     }
 
+    /// Enables Response File expansion with an injected file reader
+    pub fn response_files<R>(mut self, options: ResponseFileOptions, reader: R) -> Self
+    where
+        R: ResponseFileReader + 'static,
+    {
+        self.response_files = Some((options, Box::new(reader)));
+        self
+    }
+
     /// Runs the application without a child process or signal handler
     pub fn run(self) -> io::Result<TestResult> {
         let stdout = SharedWriter::default();
@@ -108,6 +119,9 @@ impl TestDriver {
         if let Some(resolver) = self.value_resolver {
             context = context.with_value_resolver(SharedValueResolver(resolver));
         }
+        if let Some((options, reader)) = self.response_files {
+            context = context.with_response_files(options, BoxedResponseFileReader(reader));
+        }
         let outcome = self
             .command
             .run_with_policy(&mut context, self.arguments, &self.policy)?;
@@ -116,6 +130,17 @@ impl TestDriver {
             stdout: stdout_capture.bytes(),
             stderr: stderr_capture.bytes(),
         })
+    }
+}
+
+struct BoxedResponseFileReader(Box<dyn ResponseFileReader>);
+
+impl ResponseFileReader for BoxedResponseFileReader {
+    fn read(
+        &mut self,
+        request: &nagi_cli::ResponseFileReadRequest<'_>,
+    ) -> Result<Vec<u8>, Diagnostic> {
+        self.0.read(request)
     }
 }
 

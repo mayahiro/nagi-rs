@@ -52,6 +52,7 @@ fn push_target(output: &mut String, target: &DiagnosticTarget) {
         match target.kind() {
             DiagnosticTargetKind::Option => "option",
             DiagnosticTargetKind::Argument => "argument",
+            DiagnosticTargetKind::ResponseFile => "response-file",
         },
     );
     output.push_str(",\"command_id_path\":");

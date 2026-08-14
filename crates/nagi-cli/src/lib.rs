@@ -31,6 +31,12 @@
 //! or I/O. Fixed precedence remains command line, environment, external
 //! resolver, then command-definition default
 //!
+//! [`expand_response_files`] provides an opt-in, resource-bounded lexical
+//! layer for `@file` arguments without shell, variable, glob, tilde, or
+//! environment expansion. Ordinary parser and runtime entry points preserve
+//! leading `@` literally unless Response Files are enabled through [`Context`]
+//! or [`ProcessOptions`]
+//!
 //! [`CompletionEngine`] snapshots the validated graph without handlers and
 //! resolves static candidates plus only the active Option or Argument
 //! [`CompletionProvider`]. Shell-specific generation remains in the optional
@@ -52,6 +58,7 @@ mod help;
 mod lifecycle;
 mod parser;
 mod policy;
+mod response_file;
 mod runtime;
 #[allow(unsafe_code)]
 mod signal_unix;
@@ -85,8 +92,13 @@ pub use parser::{
     Invocation, InvocationScope, ParseResult, ValueAccessError, ValueAccessErrorKind,
 };
 pub use policy::{DiagnosticRenderer, ExitCodePolicy, PlainDiagnosticRenderer, RuntimePolicy};
+pub use response_file::{
+    FilesystemResponseFileReader, ResponseFileLimits, ResponseFileOptions, ResponseFileReadRequest,
+    ResponseFileReader, expand_response_files,
+};
 pub use runtime::{
-    CancellationHandle, CancellationToken, Context, Handler, Outcome, cancellation_pair,
+    CancellationHandle, CancellationToken, Context, Handler, Outcome, ProcessOptions,
+    cancellation_pair,
 };
 pub use value::{
     ParsedValue, REDACTED_VALUE, ValueOrigin, ValueParser, ValueResolution, ValueResolutionMode,

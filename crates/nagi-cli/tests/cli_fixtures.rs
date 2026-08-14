@@ -162,6 +162,7 @@ fn diagnostic_metadata_matches_shared_fixtures() {
                 let kind = match target.kind() {
                     nagi_cli::DiagnosticTargetKind::Option => "option",
                     nagi_cli::DiagnosticTargetKind::Argument => "argument",
+                    nagi_cli::DiagnosticTargetKind::ResponseFile => "response-file",
                 };
                 format!(
                     "{kind}@{}:{}",
@@ -817,6 +818,7 @@ fn snapshot_inherited_error(error: &Diagnostic) -> String {
             let kind = match target.kind() {
                 nagi_cli::DiagnosticTargetKind::Option => "option",
                 nagi_cli::DiagnosticTargetKind::Argument => "argument",
+                nagi_cli::DiagnosticTargetKind::ResponseFile => "response-file",
             };
             format!(
                 "{kind}@{}:{}",
