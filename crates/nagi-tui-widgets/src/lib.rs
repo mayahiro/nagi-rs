@@ -79,7 +79,10 @@ pub use code::{
 };
 pub use code_view::{CodeCopyKind, CodeCopyRequest, CodeView, CodeViewState, CodeViewStyle};
 pub use command_palette::{Command, CommandPalette, CommandPaletteStyle};
-pub use composer::{Composer, ComposerOverflowPolicy, ComposerState};
+pub use composer::{
+    Composer, ComposerHistory, ComposerHistoryEntry, ComposerHistoryEntryId,
+    ComposerOverflowPolicy, ComposerState, DuplicateComposerHistoryEntryId,
+};
 pub use dialog::{ConfirmDialog, ConfirmDialogDefault, Dialog, DialogAction, DialogStyle};
 pub use diff::{
     DEFAULT_DIFF_DOCUMENT_MAX_LINES, DEFAULT_DIFF_DOCUMENT_MAX_SPANS,

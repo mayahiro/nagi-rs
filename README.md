@@ -91,7 +91,13 @@ explains how process output and timers enter Nagi without a second UI loop
 cell width policy for Core measurement, rendering, hit geometry, and cursor
 placement. Pass `ViewContext::width_profile` to width-sensitive widget builders.
 Unexpected asynchronous lifecycle transitions are available through the
-bounded Runtime notice queue or the terminal notice-handler entry point
+bounded Runtime notice queue, the terminal notice handler, or the direct
+optional-Message notice mapper. Runtime close remains request-only; custom
+owners can optionally wait for Nagi-started producers to return
+
+`RuntimeConfig::max_updates_per_cycle` and
+`TerminalOptions::max_updates_per_cycle` default to 64 and bound consecutive
+asynchronous updates before the terminal runner checks input and resize again
 
 `TerminalOptions::capability_detection` explicitly enables conservative
 environment hints and an active Kitty keyboard query. The immutable result is

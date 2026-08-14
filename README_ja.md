@@ -78,7 +78,9 @@ nagi-cli-test = { git = "https://github.com/mayahiro/nagi-rs", tag = "v0.2.7" }
 
 共有の[event-driven application architecture](https://github.com/mayahiro/nagi/blob/main/docs/EVENT_DRIVEN_APPLICATIONS_ja.md)では、第2のUI loopを作らずprocess outputとtimerをNagiへ渡す方法を説明します
 
-`RuntimeConfig::width_profile`と`TerminalOptions::width_profile`はCoreのmeasure、render、hit geometry、cursor配置で使うcell幅policyを1個選択します。幅計算を行うWidget builderには`ViewContext::width_profile`を渡します。予期しないasync lifecycle transitionは上限付きRuntime notice queueまたはterminal notice-handler entry pointから観測できます
+`RuntimeConfig::width_profile`と`TerminalOptions::width_profile`はCoreのmeasure、render、hit geometry、cursor配置で使うcell幅policyを1個選択します。幅計算を行うWidget builderには`ViewContext::width_profile`を渡します。予期しないasync lifecycle transitionは上限付きRuntime notice queue、terminal notice handler、任意Messageへのdirect mapperから観測できます。Runtime closeは要求だけを行い、custom ownerはNagiが開始したproducerのreturnを任意で待機できます
+
+`RuntimeConfig::max_updates_per_cycle`と`TerminalOptions::max_updates_per_cycle`は既定で64であり、terminal runnerがinputとresizeを再確認するまでの連続した非同期update件数を制限します
 
 `TerminalOptions::capability_detection`は保守的なenvironment hintとactiveなKitty keyboard queryを明示的に有効化します。Immutableな結果は`ViewContext::terminal_capabilities`から参照できます。検出は既定で無効であり、設定済みcolor outputを昇格させず上限として制約し、OSC 52やその他のoutput policyを許可しません。VTの`Capabilities::color_level`はMonochrome、ANSI 16、Indexed 256、True Color outputを選択します
 

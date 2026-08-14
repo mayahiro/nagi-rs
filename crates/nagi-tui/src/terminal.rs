@@ -111,6 +111,8 @@ pub struct TerminalOptions {
     pub escape_timeout: Duration,
     /// Maximum number of messages waiting in the runtime queue
     pub queue_capacity: usize,
+    /// Maximum number of application updates in one scheduling cycle
+    pub max_updates_per_cycle: usize,
     /// Maximum number of effect tasks executing concurrently
     pub task_limit: usize,
     /// Maximum pending values retained by each subscription source
@@ -141,6 +143,7 @@ impl Default for TerminalOptions {
             focus_first: false,
             escape_timeout: Duration::from_millis(25),
             queue_capacity: crate::DEFAULT_QUEUE_CAPACITY,
+            max_updates_per_cycle: crate::DEFAULT_MAX_UPDATES_PER_CYCLE,
             task_limit: crate::DEFAULT_TASK_LIMIT,
             subscription_capacity: crate::DEFAULT_SUBSCRIPTION_CAPACITY,
             runtime_notice_capacity: crate::DEFAULT_RUNTIME_NOTICE_CAPACITY,
@@ -221,7 +224,7 @@ where
     Application: App,
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
 {
-    run_terminal_with_notice_handler(app, options, map_event, |_| {})
+    run_terminal_with_notice_mapper(app, options, map_event, |_| None)
 }
 
 /// Runs an application while synchronously observing recovered failures and
@@ -232,7 +235,7 @@ where
 pub fn run_terminal_with_notice_handler<Application, Mapper, Handler>(
     app: Application,
     options: TerminalOptions,
-    mut map_event: Mapper,
+    map_event: Mapper,
     mut handle_notice: Handler,
 ) -> Result<Application, RunError>
 where
@@ -240,19 +243,36 @@ where
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
     Handler: FnMut(&RuntimeNotice),
 {
+    run_terminal_with_notice_mapper(app, options, map_event, move |notice| {
+        handle_notice(notice);
+        None
+    })
+}
+
+/// Runs an application while mapping Runtime notices directly to optional
+/// application Messages
+///
+/// Each mapped Message is updated before the next notice is mapped, and
+/// rendering remains coalesced. The terminal session restores raw mode and
+/// screen state on normal, error, and panic exits
+pub fn run_terminal_with_notice_mapper<Application, Mapper, NoticeMapper>(
+    app: Application,
+    options: TerminalOptions,
+    mut map_event: Mapper,
+    mut map_notice: NoticeMapper,
+) -> Result<Application, RunError>
+where
+    Application: App,
+    Mapper: FnMut(Event) -> EventAction<Application::Message>,
+    NoticeMapper: FnMut(&RuntimeNotice) -> Option<Application::Message>,
+{
     let mut session = TerminalSession::open(
         options.mouse_tracking,
         options.viewport,
         options.cursor_query_timeout,
     )
     .map_err(run_terminal_error)?;
-    let result = run_terminal_session(
-        &mut session,
-        app,
-        options,
-        &mut map_event,
-        &mut handle_notice,
-    );
+    let result = run_terminal_session(&mut session, app, options, &mut map_event, &mut map_notice);
     let restoration = session.finish().map_err(run_terminal_error);
     match (result, restoration) {
         (Err(error), _) => Err(error),
@@ -271,7 +291,7 @@ fn run_terminal_session<Application, Mapper, Handler>(
 where
     Application: App,
     Mapper: FnMut(Event) -> EventAction<Application::Message>,
-    Handler: FnMut(&RuntimeNotice),
+    Handler: FnMut(&RuntimeNotice) -> Option<Application::Message>,
 {
     let terminal_capabilities = detect_terminal_capabilities(session, options)?;
     let output_capabilities = resolved_output_capabilities(options, terminal_capabilities);
@@ -279,6 +299,7 @@ where
     let clock = SystemClock::new();
     let mut config = RuntimeConfig::new(Size::new(u32::from(columns), u32::from(rows)));
     config.queue_capacity = options.queue_capacity;
+    config.max_updates_per_cycle = options.max_updates_per_cycle;
     config.task_limit = options.task_limit;
     config.subscription_capacity = options.subscription_capacity;
     config.runtime_notice_capacity = options.runtime_notice_capacity;
@@ -297,7 +318,7 @@ where
         runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
     }
     runtime.process_pending()?;
-    handle_runtime_notices(&mut runtime, handle_notice);
+    handle_runtime_notices(&mut runtime, handle_notice)?;
     if !runtime.exit_requested() {
         run_pending_terminal_tasks(session, &mut runtime, &mut decoder, handle_notice)?;
     }
@@ -312,12 +333,16 @@ where
     )?;
 
     while !runtime.exit_requested() {
-        let timeout = nearest_terminal_deadline([
-            decoder.time_until_deadline(),
-            runtime.time_until_effect_deadline(),
-            runtime.time_until_subscription_deadline(),
-            runtime.time_until_frame_deadline(),
-        ]);
+        let timeout = if runtime.has_pending_updates() {
+            Some(Duration::ZERO)
+        } else {
+            nearest_terminal_deadline([
+                decoder.time_until_deadline(),
+                runtime.time_until_effect_deadline(),
+                runtime.time_until_subscription_deadline(),
+                runtime.time_until_frame_deadline(),
+            ])
+        };
         let readable = session.wait(timeout).map_err(run_terminal_error)?;
         if session.take_resize() {
             let (columns, rows) = session.refresh_viewport().map_err(run_terminal_error)?;
@@ -356,7 +381,7 @@ where
             }
         }
         runtime.process_pending()?;
-        handle_runtime_notices(&mut runtime, handle_notice);
+        handle_runtime_notices(&mut runtime, handle_notice)?;
         if !exit && !runtime.exit_requested() {
             run_pending_terminal_tasks(session, &mut runtime, &mut decoder, handle_notice)?;
         }
@@ -420,7 +445,7 @@ fn run_pending_terminal_tasks<Application, Handler>(
 ) -> Result<bool, RunError>
 where
     Application: App,
-    Handler: FnMut(&RuntimeNotice),
+    Handler: FnMut(&RuntimeNotice) -> Option<Application::Message>,
 {
     let mut ran = false;
     while !runtime.exit_requested() && runtime.pending_terminal_tasks() > 0 {
@@ -437,7 +462,7 @@ where
         let (columns, rows) = session.viewport_size().map_err(run_terminal_error)?;
         runtime.resize(Size::new(u32::from(columns), u32::from(rows)));
         runtime.process_pending()?;
-        handle_runtime_notices(runtime, handle_notice);
+        handle_runtime_notices(runtime, handle_notice)?;
         ran = true;
     }
     Ok(ran)
@@ -446,14 +471,19 @@ where
 fn handle_runtime_notices<Application, C, Handler>(
     runtime: &mut Runtime<Application, C>,
     handler: &mut Handler,
-) where
+) -> Result<(), RunError>
+where
     Application: App,
     C: crate::Clock,
-    Handler: FnMut(&RuntimeNotice),
+    Handler: FnMut(&RuntimeNotice) -> Option<Application::Message>,
 {
     for notice in runtime.drain_runtime_notices() {
-        handler(&notice);
+        if let Some(message) = handler(&notice) {
+            runtime.enqueue(message)?;
+            runtime.process_queued()?;
+        }
     }
+    Ok(())
 }
 
 fn nearest_terminal_deadline(deadlines: [Option<Duration>; 4]) -> Option<Duration> {
@@ -500,16 +530,45 @@ fn run_terminal_error(error: TerminalError) -> RunError {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
     use std::time::Duration;
 
-    use crate::{App, Effect, Node, Runtime, RuntimeConfig, Size, ViewContext, VirtualClock};
+    use crate::{
+        App, DeliveryPolicy, Effect, Node, Runtime, RuntimeConfig, RuntimeNoticeKind, Size,
+        Subscription, ViewContext, VirtualClock,
+    };
 
     use super::{
-        TerminalClipboard, TerminalOptions, TerminalViewport, nearest_terminal_deadline,
-        resolved_output_capabilities, take_clipboard_operation,
+        TerminalClipboard, TerminalOptions, TerminalViewport, handle_runtime_notices,
+        nearest_terminal_deadline, resolved_output_capabilities, take_clipboard_operation,
     };
 
     struct ClipboardApp;
+
+    struct NoticeMapperApp {
+        notices: Vec<RuntimeNoticeKind>,
+    }
+
+    impl App for NoticeMapperApp {
+        type Message = RuntimeNoticeKind;
+
+        fn init(&mut self) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+            self.notices.push(message);
+            Effect::none()
+        }
+
+        fn subscriptions(&self) -> Subscription<Self::Message> {
+            Subscription::stream("notice-mapper", DeliveryPolicy::reliable(), |_, _| {})
+        }
+
+        fn view(&self, _context: ViewContext) -> Node<Self::Message> {
+            Node::text("")
+        }
+    }
 
     impl App for ClipboardApp {
         type Message = &'static str;
@@ -536,6 +595,10 @@ mod tests {
         assert_eq!(options.viewport, TerminalViewport::FULLSCREEN);
         assert_eq!(options.cursor_query_timeout, Duration::from_millis(100));
         assert!(!options.focus_first);
+        assert_eq!(
+            options.max_updates_per_cycle,
+            crate::DEFAULT_MAX_UPDATES_PER_CYCLE
+        );
         assert_eq!(
             options.minimum_frame_interval,
             std::time::Duration::from_nanos(8_333_334)
@@ -607,6 +670,34 @@ mod tests {
             ]),
             Some(Duration::from_millis(8))
         );
+    }
+
+    #[test]
+    fn runtime_notice_mapper_updates_application_state_without_a_subscription() {
+        let mut runtime = Runtime::with_clock(
+            NoticeMapperApp {
+                notices: Vec::new(),
+            },
+            RuntimeConfig::new(Size::new(1, 1)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        for _ in 0..10_000 {
+            runtime.poll_effects();
+            if runtime.pending_runtime_notices() != 0 {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        handle_runtime_notices(&mut runtime, &mut |notice| Some(notice.kind())).unwrap();
+
+        assert_eq!(
+            runtime.app().notices,
+            [RuntimeNoticeKind::SubscriptionStreamCompleted]
+        );
+        assert_eq!(runtime.pending_runtime_notices(), 0);
+        runtime.close_and_wait();
     }
 
     #[test]

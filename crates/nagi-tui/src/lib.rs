@@ -36,6 +36,7 @@ mod terminal_unix;
 mod text_edit;
 mod virtual_flow;
 mod wake;
+mod worker_tracker;
 
 #[cfg(test)]
 mod fixture_support;
@@ -95,8 +96,9 @@ pub use responsive_row::{ResponsiveRowItem, ResponsiveRowOptions, ResponsiveRowP
 pub use rich_text::{ParagraphOptions, TextSpan, WrapMode};
 pub use routing::{EventDispatch, EventResult, PointerEventContext, PointerViewport, TextHit};
 pub use runtime::{
-    DEFAULT_QUEUE_CAPACITY, DEFAULT_RUNTIME_NOTICE_CAPACITY, DEFAULT_SUBSCRIPTION_CAPACITY,
-    DEFAULT_TASK_LIMIT, Frame, QueueFull, Runtime, RuntimeConfig, RuntimeError, RuntimeEventError,
+    DEFAULT_MAX_UPDATES_PER_CYCLE, DEFAULT_QUEUE_CAPACITY, DEFAULT_RUNTIME_NOTICE_CAPACITY,
+    DEFAULT_SUBSCRIPTION_CAPACITY, DEFAULT_TASK_LIMIT, Frame, QueueFull, Runtime, RuntimeConfig,
+    RuntimeError, RuntimeEventError,
 };
 pub use runtime_notice::{RuntimeNotice, RuntimeNoticeDiagnostics, RuntimeNoticeKind};
 pub use split_pane::{SplitPaneAxis, SplitPaneCollapse, SplitPaneOptions};
@@ -107,7 +109,7 @@ pub use subscription_supervisor::SubscriptionDiagnostics;
 pub use supervisor::EffectDiagnostics;
 pub use terminal::{
     InvalidInlineViewportHeight, RunError, TerminalClipboard, TerminalOptions, TerminalViewport,
-    run_terminal, run_terminal_with_notice_handler,
+    run_terminal, run_terminal_with_notice_handler, run_terminal_with_notice_mapper,
 };
 pub use terminal_capability::{
     TerminalCapabilityDetection, TerminalCapabilityProfile, TerminalColorLevel,

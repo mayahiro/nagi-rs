@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::effect::{EffectKind, RuntimeCommand, Task};
 use crate::runtime_notice::{RuntimeNotice, RuntimeNoticeKind, RuntimeNoticeQueue};
 use crate::wake::WakeHandle;
+use crate::worker_tracker::WorkerTracker;
 use crate::{CancelToken, Effect, ScopeId, TaskKey, Timestamp};
 
 /// Counters describing supervised task behavior
@@ -132,6 +133,8 @@ pub(crate) struct EffectSupervisor<Message> {
     next_order: u64,
     diagnostics: EffectDiagnostics,
     notices: Option<Arc<RuntimeNoticeQueue>>,
+    workers: WorkerTracker,
+    closed: bool,
 }
 
 impl<Message: Send + 'static> EffectSupervisor<Message> {
@@ -159,6 +162,8 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             next_order: 0,
             diagnostics: EffectDiagnostics::default(),
             notices: None,
+            workers: WorkerTracker::default(),
+            closed: false,
         }
     }
 
@@ -170,11 +175,21 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
         self.notices = Some(notices);
     }
 
+    pub(crate) fn set_worker_tracker(&mut self, workers: WorkerTracker) {
+        self.workers = workers;
+    }
+
     pub(crate) fn schedule(&mut self, effect: Effect<Message>, now: Timestamp) {
+        if self.closed {
+            return;
+        }
         self.start_effect(effect, Vec::new(), Continuation::None, now);
     }
 
     pub(crate) fn poll(&mut self, now: Timestamp) {
+        if self.closed {
+            return;
+        }
         self.poll_timers(now);
         while let Ok(outcome) = self.receiver.try_recv() {
             self.finish_task(outcome, now);
@@ -198,6 +213,29 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
 
     pub(crate) fn ready_messages(&self) -> usize {
         self.ready.len()
+    }
+
+    pub(crate) fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        for task in self.tasks.values() {
+            task.token.cancel();
+        }
+        for task in self.terminal_tasks.values() {
+            task.token.cancel();
+        }
+        self.tasks.clear();
+        self.pending.clear();
+        self.running = 0;
+        self.terminal_tasks.clear();
+        self.pending_terminal.clear();
+        self.latest.clear();
+        self.timers.clear();
+        self.sequences.clear();
+        self.barriers.clear();
+        self.commands.clear();
     }
 
     pub(crate) fn active_tasks(&self) -> usize {
@@ -449,10 +487,12 @@ impl<Message: Send + 'static> EffectSupervisor<Message> {
             let token = state.token.clone();
             let sender = self.sender.clone();
             let wake = self.wake.clone();
+            let worker = self.workers.track();
             self.running += 1;
             let spawned = thread::Builder::new()
                 .name(format!("nagi-tui-effect-{id}"))
                 .spawn(move || {
+                    let _worker = worker;
                     let result = catch_unwind(AssertUnwindSafe(|| task(token)))
                         .map_or(TaskResult::Panicked, TaskResult::Message);
                     if sender.send(TaskOutcome { id, result }).is_ok() {

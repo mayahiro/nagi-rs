@@ -5,10 +5,11 @@ use nagi_tui::{
     TerminalOptions, TextSpan, run_terminal,
 };
 use nagi_tui_widgets::{
-    Button, Checkbox, Command, CommandPalette, Composer, ComposerOverflowPolicy, ComposerState,
-    Dialog, DialogAction, Disclosure, Radio, Scrollbar, ScrollbarOrientation, Select,
-    SelectableText, SelectableTextContent, SelectableTextState, TabItem, Table, TableColumn,
-    TableRow, Tabs, TextArea, TextAreaState, TextCopyKind, TextCopyRequest, Tree, TreeItem,
+    Button, Checkbox, Command, CommandPalette, Composer, ComposerHistory, ComposerHistoryEntry,
+    ComposerOverflowPolicy, ComposerState, Dialog, DialogAction, Disclosure, Radio, Scrollbar,
+    ScrollbarOrientation, Select, SelectableText, SelectableTextContent, SelectableTextState,
+    TabItem, Table, TableColumn, TableRow, Tabs, TextArea, TextAreaState, TextCopyKind,
+    TextCopyRequest, Tree, TreeItem,
 };
 
 enum Message {
@@ -40,7 +41,8 @@ struct Gallery {
     theme: usize,
     notes: TextAreaState,
     composer: ComposerState,
-    composer_history: Vec<String>,
+    composer_history: ComposerHistory,
+    next_composer_history_id: u64,
     row: usize,
     tree: usize,
     tree_expanded: bool,
@@ -62,7 +64,12 @@ impl Default for Gallery {
             theme: 0,
             notes: TextAreaState::at_end("Multiline notes\nremain application state"),
             composer: ComposerState::at_end("Draft message"),
-            composer_history: vec!["Earlier message".to_owned()],
+            composer_history: ComposerHistory::new([ComposerHistoryEntry::new(
+                "message-0",
+                "Earlier message",
+            )])
+            .expect("initial Composer history IDs are unique"),
+            next_composer_history_id: 1,
             row: 0,
             tree: 0,
             tree_expanded: true,
@@ -100,10 +107,17 @@ impl App for Gallery {
             Message::SubmitComposer => {
                 let value = self.composer.text_area().value().to_owned();
                 if !value.trim().is_empty() {
-                    if self.composer_history.len() == 8 {
-                        self.composer_history.remove(0);
+                    let mut entries = self.composer_history.as_slice().to_vec();
+                    if entries.len() == 8 {
+                        entries.remove(0);
                     }
-                    self.composer_history.push(value.clone());
+                    entries.push(ComposerHistoryEntry::new(
+                        format!("message-{}", self.next_composer_history_id),
+                        value.clone(),
+                    ));
+                    self.next_composer_history_id += 1;
+                    self.composer_history = ComposerHistory::new(entries)
+                        .expect("monotonic Composer history IDs are unique");
                     self.composer = ComposerState::at_end("");
                     self.last_action = format!("Submitted: {}", value.replace('\n', " / "));
                 }

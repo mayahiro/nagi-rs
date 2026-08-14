@@ -25,6 +25,7 @@ use crate::subscription_supervisor::{
 use crate::supervisor::{EffectDiagnostics, EffectSupervisor};
 use crate::text_edit::{TextEdit, apply_text_edit, normalize_cursor};
 use crate::wake::WakeHandle;
+use crate::worker_tracker::WorkerTracker;
 use crate::{
     App, BindingConflict, Clock, EventDispatch, EventResult, InteractionState, Node, NodeId, Point,
     Rect, ResolvedActions, ScrollOffset, Size, SubscriptionKey, Surface, SystemClock, TaskKey,
@@ -33,6 +34,9 @@ use crate::{
 
 /// The default maximum number of messages waiting in a runtime queue
 pub const DEFAULT_QUEUE_CAPACITY: usize = 4_096;
+
+/// The default maximum number of application updates in one scheduling cycle
+pub const DEFAULT_MAX_UPDATES_PER_CYCLE: usize = 64;
 
 /// The default maximum number of effect tasks executing concurrently
 pub const DEFAULT_TASK_LIMIT: usize = 64;
@@ -50,6 +54,8 @@ pub struct RuntimeConfig {
     pub size: Size,
     /// Maximum number of messages waiting for sequential processing
     pub queue_capacity: usize,
+    /// Maximum number of application updates in one scheduling cycle
+    pub max_updates_per_cycle: usize,
     /// Maximum number of effect tasks executing concurrently
     pub task_limit: usize,
     /// Maximum pending values retained by each subscription source
@@ -73,6 +79,7 @@ impl RuntimeConfig {
         Self {
             size,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            max_updates_per_cycle: DEFAULT_MAX_UPDATES_PER_CYCLE,
             task_limit: DEFAULT_TASK_LIMIT,
             subscription_capacity: DEFAULT_SUBSCRIPTION_CAPACITY,
             runtime_notice_capacity: DEFAULT_RUNTIME_NOTICE_CAPACITY,
@@ -88,6 +95,8 @@ impl RuntimeConfig {
 pub enum RuntimeError {
     /// Queue capacity must be greater than zero
     ZeroQueueCapacity,
+    /// Per-cycle application update limit must be greater than zero
+    ZeroMaxUpdatesPerCycle,
     /// Concurrent task limit must be greater than zero
     ZeroTaskLimit,
     /// Per-source subscription capacity must be greater than zero
@@ -109,6 +118,9 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::ZeroQueueCapacity => {
                 formatter.write_str("runtime queue capacity must be positive")
+            }
+            Self::ZeroMaxUpdatesPerCycle => {
+                formatter.write_str("runtime maximum updates per cycle must be positive")
             }
             Self::ZeroTaskLimit => formatter.write_str("runtime task limit must be positive"),
             Self::ZeroSubscriptionCapacity => {
@@ -133,6 +145,7 @@ impl Error for RuntimeError {
             Self::Surface(error) => Some(error),
             Self::BindingConflict(error) => Some(error),
             Self::ZeroQueueCapacity
+            | Self::ZeroMaxUpdatesPerCycle
             | Self::ZeroTaskLimit
             | Self::ZeroSubscriptionCapacity
             | Self::ZeroRuntimeNoticeCapacity
@@ -240,6 +253,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     size: Size,
     queue: VecDeque<QueuedMessage<Application::Message>>,
     queue_capacity: usize,
+    max_updates_per_cycle: usize,
     dirty: bool,
     urgent_frame: bool,
     minimum_frame_interval: Duration,
@@ -260,6 +274,7 @@ pub struct Runtime<Application: App, C: Clock = SystemClock> {
     effects: EffectSupervisor<Application::Message>,
     subscriptions: SubscriptionSupervisor<Application::Message>,
     notices: Arc<RuntimeNoticeQueue>,
+    workers: WorkerTracker,
     subscriptions_dirty: bool,
     exit_requested: bool,
     pending_focus: Option<NodeId>,
@@ -298,6 +313,9 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         if config.queue_capacity == 0 {
             return Err(RuntimeError::ZeroQueueCapacity);
         }
+        if config.max_updates_per_cycle == 0 {
+            return Err(RuntimeError::ZeroMaxUpdatesPerCycle);
+        }
         if config.task_limit == 0 {
             return Err(RuntimeError::ZeroTaskLimit);
         }
@@ -310,12 +328,15 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         let startup = app.init();
         let declared_subscriptions = app.subscriptions();
         let notices = Arc::new(RuntimeNoticeQueue::new(config.runtime_notice_capacity));
+        let workers = WorkerTracker::default();
         let mut effects = EffectSupervisor::new(config.task_limit);
         effects.set_notices(Arc::clone(&notices));
+        effects.set_worker_tracker(workers.clone());
         effects.set_wake(wake.clone());
         effects.schedule(startup, clock.now());
         let mut subscriptions = SubscriptionSupervisor::new(config.subscription_capacity);
         subscriptions.set_notices(Arc::clone(&notices));
+        subscriptions.set_worker_tracker(workers.clone());
         subscriptions.set_wake(wake);
         subscriptions
             .reconcile(declared_subscriptions, clock.now())
@@ -326,6 +347,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             size: config.size,
             queue: VecDeque::with_capacity(config.queue_capacity.min(64)),
             queue_capacity: config.queue_capacity,
+            max_updates_per_cycle: config.max_updates_per_cycle,
             dirty: true,
             urgent_frame: true,
             minimum_frame_interval: config.minimum_frame_interval,
@@ -346,6 +368,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
             effects,
             subscriptions,
             notices,
+            workers,
             subscriptions_dirty: false,
             exit_requested: false,
             pending_focus: None,
@@ -374,6 +397,35 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
     #[must_use]
     pub fn into_app(self) -> Application {
         self.app
+    }
+
+    /// Requests cooperative cancellation of active Effects and Subscriptions
+    /// without waiting for their producer functions to return
+    pub fn close(&mut self) {
+        self.effects.close();
+        self.subscriptions.close();
+        self.subscriptions_dirty = false;
+    }
+
+    /// Requests cooperative cancellation and waits until every Nagi-started
+    /// Effect and Stream producer function has returned
+    ///
+    /// A producer that ignores cancellation can block this call indefinitely.
+    /// Application-owned processes or workers started inside a producer are
+    /// outside this wait boundary
+    pub fn close_and_wait(&mut self) {
+        self.close();
+        self.workers.wait();
+    }
+
+    /// Requests cooperative cancellation and waits up to `timeout` for every
+    /// Nagi-started Effect and Stream producer function to return
+    ///
+    /// Returns false when the timeout expires. Cancellation remains requested,
+    /// and a later call may continue waiting
+    pub fn close_and_wait_timeout(&mut self, timeout: Duration) -> bool {
+        self.close();
+        self.workers.wait_timeout(timeout)
     }
 
     /// Returns runtime-owned Interaction State
@@ -427,11 +479,27 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         self.queue.len()
     }
 
+    /// Reports whether another scheduling cycle can apply an update without
+    /// waiting for input, a wake-up, or a future deadline
+    #[must_use]
+    pub fn has_pending_updates(&self) -> bool {
+        !self.queue.is_empty()
+            || self.effects.ready_messages() != 0
+            || self.subscriptions.time_until_deadline(self.clock.now()) == Some(Duration::ZERO)
+    }
+
     /// Polls due timers and completed tasks into the bounded message queue
     pub fn poll_effects(&mut self) -> usize {
+        self.poll_effects_up_to(self.queue_capacity)
+    }
+
+    fn poll_effects_up_to(&mut self, maximum: usize) -> usize {
         self.effects.poll(self.clock.now());
         self.apply_effect_commands();
-        let available = self.queue_capacity.saturating_sub(self.queue.len());
+        let available = self
+            .queue_capacity
+            .saturating_sub(self.queue.len())
+            .min(maximum);
         let mut count = 0;
         while count < available {
             let Some(message) = self.effects.pop_ready() else {
@@ -454,8 +522,15 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
 
     /// Polls subscriptions and moves ready values into the bounded queue
     pub fn poll_subscriptions(&mut self) -> usize {
+        self.poll_subscriptions_up_to(self.queue_capacity)
+    }
+
+    fn poll_subscriptions_up_to(&mut self, maximum: usize) -> usize {
         self.subscriptions.poll(self.clock.now());
-        let available = self.queue_capacity.saturating_sub(self.queue.len());
+        let available = self
+            .queue_capacity
+            .saturating_sub(self.queue.len())
+            .min(maximum);
         let messages = self.subscriptions.take_ready(available);
         let count = messages.len();
         self.queue
@@ -603,21 +678,23 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         })
     }
 
-    /// Applies every queued message in FIFO order without rendering between
-    /// messages
+    /// Applies at most the configured per-cycle number of messages in FIFO
+    /// order without rendering between messages
     pub fn process_pending(&mut self) -> Result<usize, RuntimeError> {
         self.process_pending_with(|_| {})
     }
 
-    /// Applies queued messages and observes each immediately before update
+    /// Applies one bounded scheduling cycle and observes each message
+    /// immediately before update
     pub fn process_pending_with(
         &mut self,
         observe: impl FnMut(&Application::Message),
     ) -> Result<usize, RuntimeError> {
         self.reconcile_subscriptions()?;
-        self.poll_effects();
-        self.poll_subscriptions();
-        self.process_queued_with_inner(observe)
+        let remaining = self.max_updates_per_cycle.saturating_sub(self.queue.len());
+        let effects = self.poll_effects_up_to(remaining);
+        self.poll_subscriptions_up_to(remaining.saturating_sub(effects));
+        self.process_queued_with_inner(observe, Some(self.max_updates_per_cycle))
     }
 
     /// Applies messages already in the application queue without polling
@@ -633,15 +710,19 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         observe: impl FnMut(&Application::Message),
     ) -> Result<usize, RuntimeError> {
         self.reconcile_subscriptions()?;
-        self.process_queued_with_inner(observe)
+        self.process_queued_with_inner(observe, None)
     }
 
     fn process_queued_with_inner(
         &mut self,
         mut observe: impl FnMut(&Application::Message),
+        maximum: Option<usize>,
     ) -> Result<usize, RuntimeError> {
         let mut processed = 0;
-        while let Some(queued) = self.queue.pop_front() {
+        while maximum.is_none_or(|maximum| processed < maximum) {
+            let Some(queued) = self.queue.pop_front() else {
+                break;
+            };
             observe(&queued.message);
             let effect = self.app.update(queued.message);
             let without_redraw = effect.without_redraw;
@@ -1607,7 +1688,7 @@ impl<Application: App, C: Clock> Runtime<Application, C> {
         }))
     }
 
-    /// Processes all queued messages and produces at most one frame
+    /// Processes one bounded scheduling cycle and produces at most one frame
     pub fn step(&mut self) -> Result<Option<Frame>, RuntimeError> {
         self.process_pending()?;
         self.render_if_dirty()
@@ -1735,6 +1816,146 @@ mod tests {
         assert_eq!(frame.surface().cell(0, 0).unwrap().content(), "6");
         assert_eq!(frame.timestamp().as_nanos(), 7_000_000);
         assert!(runtime.render_if_dirty().unwrap().is_none());
+    }
+
+    #[test]
+    fn scheduling_cycle_bounds_updates_without_reordering_the_queue() {
+        let mut config = RuntimeConfig::new(Size::new(3, 1));
+        config.max_updates_per_cycle = 2;
+        let mut runtime = Runtime::with_clock(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            config,
+            VirtualClock::new(),
+        )
+        .unwrap();
+        for value in 1..=5 {
+            runtime.enqueue(Message::Add(value)).unwrap();
+        }
+
+        assert_eq!(runtime.process_pending().unwrap(), 2);
+        assert_eq!(runtime.app().updates, [1, 2]);
+        assert_eq!(runtime.queued_messages(), 3);
+        assert!(runtime.has_pending_updates());
+
+        assert_eq!(runtime.process_queued().unwrap(), 3);
+        assert_eq!(runtime.app().updates, [1, 2, 3, 4, 5]);
+        assert!(!runtime.has_pending_updates());
+    }
+
+    #[test]
+    fn zero_scheduling_cycle_limit_is_rejected() {
+        let mut config = RuntimeConfig::new(Size::new(1, 1));
+        config.max_updates_per_cycle = 0;
+        let result = Runtime::with_clock(
+            Counter {
+                value: 0,
+                updates: Vec::new(),
+            },
+            config,
+            VirtualClock::new(),
+        );
+
+        assert!(matches!(result, Err(RuntimeError::ZeroMaxUpdatesPerCycle)));
+    }
+
+    struct ShutdownWaitApp {
+        effect_returned: Arc<std::sync::atomic::AtomicBool>,
+        stream_returned: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl App for ShutdownWaitApp {
+        type Message = ();
+
+        fn init(&mut self) -> Effect<Self::Message> {
+            let returned = Arc::clone(&self.effect_returned);
+            Effect::run(move |token| {
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+                returned.store(true, Ordering::Release);
+            })
+        }
+
+        fn update(&mut self, (): Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn subscriptions(&self) -> Subscription<Self::Message> {
+            let returned = Arc::clone(&self.stream_returned);
+            Subscription::stream("shutdown", DeliveryPolicy::reliable(), move |token, _| {
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+                returned.store(true, Ordering::Release);
+            })
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::text("")
+        }
+    }
+
+    #[test]
+    fn close_and_wait_observes_effect_and_stream_return() {
+        let effect_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream_returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut runtime = Runtime::new(
+            ShutdownWaitApp {
+                effect_returned: Arc::clone(&effect_returned),
+                stream_returned: Arc::clone(&stream_returned),
+            },
+            Size::new(1, 1),
+        )
+        .unwrap();
+
+        runtime.close_and_wait();
+
+        assert!(effect_returned.load(Ordering::Acquire));
+        assert!(stream_returned.load(Ordering::Acquire));
+    }
+
+    struct IgnoredCancellationApp {
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl App for IgnoredCancellationApp {
+        type Message = ();
+
+        fn init(&mut self) -> Effect<Self::Message> {
+            let release = Arc::clone(&self.release);
+            Effect::run(move |_| {
+                while !release.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+            })
+        }
+
+        fn update(&mut self, (): Self::Message) -> Effect<Self::Message> {
+            Effect::none()
+        }
+
+        fn view(&self, _context: crate::ViewContext) -> Node<Self::Message> {
+            Node::text("")
+        }
+    }
+
+    #[test]
+    fn close_wait_timeout_can_be_retried_after_ignored_cancellation() {
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut runtime = Runtime::new(
+            IgnoredCancellationApp {
+                release: Arc::clone(&release),
+            },
+            Size::new(1, 1),
+        )
+        .unwrap();
+
+        assert!(!runtime.close_and_wait_timeout(Duration::ZERO));
+        release.store(true, Ordering::Release);
+        runtime.close_and_wait();
     }
 
     #[test]

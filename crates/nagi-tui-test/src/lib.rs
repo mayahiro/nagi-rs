@@ -293,6 +293,18 @@ where
         self.runtime.runtime_notice_diagnostics()
     }
 
+    /// Requests cooperative cancellation and waits for Nagi-started Effect and
+    /// Stream producer functions to return
+    pub fn close_and_wait(&mut self) {
+        self.runtime.close_and_wait();
+    }
+
+    /// Requests cooperative cancellation and waits up to `timeout` for
+    /// Nagi-started producer functions to return
+    pub fn close_and_wait_timeout(&mut self, timeout: Duration) -> bool {
+        self.runtime.close_and_wait_timeout(timeout)
+    }
+
     /// Injects one application message and completes one coalesced step
     pub fn send(&mut self, message: Application::Message) -> Result<(), HarnessError> {
         self.runtime.enqueue(message)?;
@@ -327,7 +339,7 @@ where
         self.step()
     }
 
-    /// Processes queued messages and captures at most one rendered frame
+    /// Processes one bounded scheduling cycle and captures at most one frame
     pub fn step(&mut self) -> Result<(), HarnessError> {
         let messages = &mut self.messages;
         self.runtime
@@ -798,6 +810,45 @@ mod tests {
         assert!(!source.is_active());
         assert_eq!(harness.active_subscriptions(), 0);
         assert_eq!(harness.message_history().len(), 2);
+    }
+
+    #[test]
+    fn bounded_stream_cycle_gives_the_next_input_event_priority() {
+        let source = manual_subscription();
+        let mut config = RuntimeConfig::new(Size::new(16, 1));
+        config.max_updates_per_cycle = 2;
+        let mut harness = Harness::with_config(
+            ManualSubscriptionApp {
+                source: source.clone(),
+                running: true,
+                values: Vec::new(),
+            },
+            config,
+            Duration::from_millis(25),
+            |event| match event {
+                Event::Text(value) => EventAction::Message(SubscriptionMessage::Value(value)),
+                _ => EventAction::Ignore,
+            },
+        )
+        .unwrap();
+        source.wait_started();
+        for value in ["s0", "s1", "s2", "s3", "s4", "s5"] {
+            source
+                .send(SubscriptionMessage::Value(value.to_owned()))
+                .unwrap();
+        }
+
+        harness.step().unwrap();
+        assert_eq!(harness.app().values, ["s0", "s1"]);
+
+        harness.input(b"x").unwrap();
+        assert_eq!(harness.app().values, ["s0", "s1", "x", "s2", "s3"]);
+
+        harness.step().unwrap();
+        assert_eq!(
+            harness.app().values,
+            ["s0", "s1", "x", "s2", "s3", "s4", "s5"]
+        );
     }
 
     struct CompletedStreamHarnessApp;

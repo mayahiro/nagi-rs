@@ -107,6 +107,55 @@ fn key_scope_resolution_matches_shared_fixtures() {
 }
 
 #[test]
+fn key_label_resolution_matches_shared_fixtures() {
+    let Some(records) = support::load(
+        "interaction/keymap-label.txt",
+        "keymap-label",
+        &["action", "label", "layers", "expected", "expected-scopes"],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let action_id = ActionId::from(record.field("action"));
+        let descriptor = ActionDescriptor::new(
+            action_id.clone(),
+            record.text("label"),
+            [KeyBinding::new(KeyStroke::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            ))],
+        );
+        let scopes = label_scopes(record.field("layers"), &action_id);
+        let resolved = resolve_actions(&NodeId::from("owner"), &[descriptor], &scopes)
+            .unwrap_or_else(|error| panic!("case {}: {error}", record.id));
+
+        assert_eq!(
+            resolved.actions()[0].label(),
+            record.text("expected"),
+            "case {}",
+            record.id
+        );
+        assert_eq!(
+            resolved.help_actions().next().unwrap().label(),
+            record.text("expected"),
+            "case {}",
+            record.id
+        );
+        assert_eq!(
+            resolved
+                .scope_path()
+                .iter()
+                .map(NodeId::as_str)
+                .collect::<Vec<_>>(),
+            list(record.field("expected-scopes")),
+            "case {}",
+            record.id
+        );
+    }
+}
+
+#[test]
 fn key_conflicts_match_shared_fixtures() {
     let Some(records) = support::load(
         "interaction/key-conflict.txt",
@@ -328,6 +377,24 @@ fn scopes(value: &str, action: &ActionId) -> Vec<KeyScope> {
                     .rebind(action.clone(), bindings(replacement))
                     .expect("one override per fixture scope");
             }
+            KeyScope::new(id, key_map)
+        })
+        .collect()
+}
+
+fn label_scopes(value: &str, action: &ActionId) -> Vec<KeyScope> {
+    if value == "-" {
+        return Vec::new();
+    }
+    value
+        .split(';')
+        .map(|value| {
+            let (id, replacement) = value
+                .split_once(':')
+                .unwrap_or_else(|| panic!("invalid label scope {value}"));
+            let key_map = KeyMap::new()
+                .relabel(action.clone(), replacement)
+                .expect("one label override per fixture scope");
             KeyScope::new(id, key_map)
         })
         .collect()

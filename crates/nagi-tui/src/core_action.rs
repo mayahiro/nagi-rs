@@ -102,10 +102,10 @@ pub(crate) fn resolve_action_group(
     scopes: &[KeyScope],
 ) -> Result<ResolvedActions, BindingConflict> {
     let has_override = scopes.iter().any(|scope| {
-        group
-            .descriptors
-            .iter()
-            .any(|descriptor| scope.key_map().bindings(descriptor.id()).is_some())
+        group.descriptors.iter().any(|descriptor| {
+            scope.key_map().bindings(descriptor.id()).is_some()
+                || scope.key_map().label(descriptor.id()).is_some()
+        })
     });
     if has_override {
         resolve_actions(owner, group.descriptors, scopes)
@@ -214,6 +214,8 @@ fn descriptor(
 
 #[cfg(test)]
 mod tests {
+    use crate::KeyMap;
+
     use super::*;
 
     #[test]
@@ -253,5 +255,25 @@ mod tests {
 
         let again = action_group(true, Some(ScrollAxis::Horizontal)).unwrap();
         assert!(std::ptr::eq(group.descriptors, again.descriptors));
+    }
+
+    #[test]
+    fn core_resolution_honors_a_label_only_scope() {
+        let group = action_group(true, None).unwrap();
+        let key_map = KeyMap::new()
+            .relabel(FOCUS_NEXT_ACTION_ID, "次へ移動")
+            .unwrap();
+        let resolved = resolve_action_group(
+            &NodeId::from("owner"),
+            &group,
+            &[KeyScope::new("localized", key_map)],
+        )
+        .unwrap();
+
+        assert_eq!(resolved.actions()[0].label(), "次へ移動");
+        assert_eq!(
+            resolved.actions()[0].bindings(),
+            group.descriptors[0].default_bindings()
+        );
     }
 }

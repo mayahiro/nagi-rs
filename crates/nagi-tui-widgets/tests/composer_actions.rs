@@ -11,8 +11,9 @@ use nagi_tui::{
     TEXT_INSERT_LINE_BREAK_ACTION_ID, VirtualClock,
 };
 use nagi_tui_widgets::{
-    COMPOSER_SUBMIT_ACTION_ID, Composer, ComposerOverflowPolicy, ComposerState,
-    HISTORY_NEXT_ACTION_ID, HISTORY_PREVIOUS_ACTION_ID, TextAreaState,
+    COMPOSER_SUBMIT_ACTION_ID, Composer, ComposerHistory, ComposerHistoryEntry,
+    ComposerHistoryEntryId, ComposerOverflowPolicy, ComposerState, HISTORY_NEXT_ACTION_ID,
+    HISTORY_PREVIOUS_ACTION_ID, TextAreaState,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,7 +31,7 @@ enum FixtureLimit {
 
 struct ComposerApp {
     state: ComposerState,
-    history: Vec<String>,
+    history: ComposerHistory,
     wrap: Option<u32>,
     min_rows: u32,
     max_rows: u32,
@@ -278,6 +279,108 @@ fn composer_matches_shared_fixtures() {
 }
 
 #[test]
+fn composer_history_reconciliation_matches_shared_fixtures() {
+    let Some(records) = support::load(
+        "widgets/composer-history.txt",
+        "widget-composer-history",
+        &[
+            "draft",
+            "draft-cursor",
+            "initial-history",
+            "previous-count",
+            "replacement-history",
+            "expected",
+            "expected-cursor",
+            "expected-index",
+            "expected-id",
+            "expected-draft",
+            "expected-draft-cursor",
+        ],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let initial_history = fixture_identified_history(record.field("initial-history"));
+        let mut runtime = Runtime::with_clock(
+            ComposerApp {
+                state: ComposerState::new(TextAreaState::new(
+                    record.text("draft"),
+                    number(record.field("draft-cursor")),
+                )),
+                history: initial_history,
+                wrap: None,
+                min_rows: 1,
+                max_rows: 6,
+                limit: FixtureLimit::None,
+                overflow: ComposerOverflowPolicy::Reject,
+                enabled: true,
+                submit_enabled: true,
+                key_map: KeyMap::new(),
+                validation: false,
+                messages: Vec::new(),
+            },
+            nagi_tui::RuntimeConfig::new(Size::new(16, 4)),
+            VirtualClock::new(),
+        )
+        .unwrap();
+        runtime.render_if_dirty().unwrap();
+        assert!(runtime.request_focus(&NodeId::from("composer")).unwrap());
+        runtime.render_if_dirty().unwrap();
+        for _ in 0..number(record.field("previous-count")) {
+            runtime.dispatch_event(&fixture_event("up")).unwrap();
+            runtime.process_pending().unwrap();
+            runtime.render_if_dirty().unwrap();
+        }
+
+        let replacement = fixture_identified_history(record.field("replacement-history"));
+        let state = runtime.app().state.clone().reconcile_history(&replacement);
+
+        assert_eq!(
+            state.text_area().value(),
+            record.text("expected"),
+            "case {}",
+            record.id
+        );
+        assert_eq!(
+            state.text_area().cursor(),
+            number(record.field("expected-cursor")),
+            "case {}",
+            record.id
+        );
+        assert_eq!(
+            state.history_index(),
+            optional_number(record.field("expected-index")),
+            "case {}",
+            record.id
+        );
+        assert_eq!(
+            state.history_entry_id().map(ComposerHistoryEntryId::as_str),
+            (record.field("expected-id") != "-").then(|| record.field("expected-id")),
+            "case {}",
+            record.id
+        );
+        match state.draft() {
+            Some(draft) => {
+                assert_eq!(
+                    draft.value(),
+                    record.text("expected-draft"),
+                    "case {}",
+                    record.id
+                );
+                assert_eq!(
+                    draft.cursor(),
+                    number(record.field("expected-draft-cursor")),
+                    "case {}",
+                    record.id
+                );
+            }
+            None => assert_eq!(record.field("expected-draft"), "-", "case {}", record.id),
+        }
+    }
+}
+
+#[test]
 fn composer_descriptor_defaults_are_ordered_and_have_a_legacy_newline_fallback() {
     let descriptors = Composer::new(
         "composer",
@@ -384,15 +487,31 @@ fn fixture_composer_state(value: String, cursor: usize, selection: &str) -> Comp
     ComposerState::new(text_area)
 }
 
-fn fixture_history(value: &str) -> Vec<String> {
+fn fixture_history(value: &str) -> ComposerHistory {
     if value == "-" {
-        Vec::new()
+        ComposerHistory::default()
     } else {
-        value
-            .split('/')
-            .map(|entry| support::text_value(entry).unwrap())
-            .collect()
+        ComposerHistory::new(value.split('/').enumerate().map(|(index, entry)| {
+            ComposerHistoryEntry::new(
+                format!("fixture-history-{index}"),
+                support::text_value(entry).unwrap(),
+            )
+        }))
+        .unwrap()
     }
+}
+
+fn fixture_identified_history(value: &str) -> ComposerHistory {
+    if value == "-" {
+        return ComposerHistory::default();
+    }
+    ComposerHistory::new(value.split('/').map(|entry| {
+        let (id, value) = entry
+            .split_once('=')
+            .unwrap_or_else(|| panic!("invalid identified Composer history entry {entry}"));
+        ComposerHistoryEntry::new(id, support::text_value(value).unwrap())
+    }))
+    .unwrap()
 }
 
 fn fixture_limit(value: &str) -> FixtureLimit {

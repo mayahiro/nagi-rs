@@ -11,6 +11,7 @@ use crate::subscription::{
     SubscriptionInbox, SubscriptionKind, SubscriptionProducer, SubscriptionSource,
 };
 use crate::wake::WakeHandle;
+use crate::worker_tracker::WorkerTracker;
 use crate::{CancelToken, Subscription, SubscriptionKey, SubscriptionSink, Timestamp};
 
 /// Counters describing subscription lifecycle, backpressure, and failures
@@ -138,6 +139,8 @@ pub(crate) struct SubscriptionSupervisor<Message> {
     batch_flushes: u64,
     spawn_failures: u64,
     notices: Option<Arc<RuntimeNoticeQueue>>,
+    workers: WorkerTracker,
+    closed: bool,
 }
 
 impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
@@ -155,6 +158,8 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             batch_flushes: 0,
             spawn_failures: 0,
             notices: None,
+            workers: WorkerTracker::default(),
+            closed: false,
         }
     }
 
@@ -166,11 +171,20 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
         self.notices = Some(notices);
     }
 
+    pub(crate) fn set_worker_tracker(&mut self, workers: WorkerTracker) {
+        self.workers = workers;
+    }
+
     pub(crate) fn reconcile(
         &mut self,
         subscription: Subscription<Message>,
         now: Timestamp,
     ) -> Result<SubscriptionReconciliation, SubscriptionKey> {
+        if self.closed {
+            return Ok(SubscriptionReconciliation {
+                stopped: Vec::new(),
+            });
+        }
         let mut sources = Vec::new();
         flatten(subscription, &mut sources);
         let mut keys = HashSet::with_capacity(sources.len());
@@ -211,6 +225,9 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
     }
 
     pub(crate) fn poll(&mut self, now: Timestamp) {
+        if self.closed {
+            return;
+        }
         for key in self.order.clone() {
             let Some(active) = self.active.get_mut(&key) else {
                 continue;
@@ -323,6 +340,18 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
             .fetch_add(count as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let active: Vec<_> = self.active.drain().map(|(_, active)| active).collect();
+        for active in active {
+            self.stop_active(active);
+        }
+        self.order.clear();
+    }
+
     pub(crate) fn time_until_deadline(&self, now: Timestamp) -> Option<Duration> {
         if self.active.values().any(source_ready) {
             return Some(Duration::ZERO);
@@ -387,9 +416,11 @@ impl<Message: Send + 'static> SubscriptionSupervisor<Message> {
                 let notices = self.notices.clone();
                 let worker_key = source.key.clone();
                 let wake = self.wake.clone();
+                let worker = self.workers.track();
                 let spawn = thread::Builder::new()
                     .name(format!("nagi-tui-subscription-{}", source.key))
                     .spawn(move || {
+                        let _worker = worker;
                         let outcome =
                             catch_unwind(AssertUnwindSafe(|| producer(worker_token, sink)));
                         match outcome {

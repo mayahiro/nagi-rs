@@ -533,10 +533,17 @@ struct KeyOverride {
     bindings: Arc<[KeyBinding]>,
 }
 
-/// One immutable Action-ID-to-binding override layer
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KeyLabelOverride {
+    action: ActionId,
+    label: Arc<str>,
+}
+
+/// One immutable Action-ID override layer
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KeyMap {
     overrides: Arc<[KeyOverride]>,
+    label_overrides: Arc<[KeyLabelOverride]>,
 }
 
 impl KeyMap {
@@ -570,6 +577,7 @@ impl KeyMap {
         });
         Ok(Self {
             overrides: overrides.into(),
+            label_overrides: self.label_overrides.clone(),
         })
     }
 
@@ -586,10 +594,52 @@ impl KeyMap {
             .map(|binding_override| &binding_override.bindings)
     }
 
+    /// Returns a new layer with one user-facing label replacement
+    ///
+    /// A label replacement is independent from a binding replacement for the
+    /// same Action ID. Replacing a label already present in this layer returns
+    /// [`KeyMapError::DuplicateActionLabelOverride`]
+    pub fn relabel(
+        &self,
+        action: impl Into<ActionId>,
+        label: impl Into<String>,
+    ) -> Result<Self, KeyMapError> {
+        let action = action.into();
+        if self
+            .label_overrides
+            .iter()
+            .any(|label_override| label_override.action == action)
+        {
+            return Err(KeyMapError::DuplicateActionLabelOverride(action));
+        }
+        let mut label_overrides = self.label_overrides.to_vec();
+        label_overrides.push(KeyLabelOverride {
+            action,
+            label: Arc::from(label.into()),
+        });
+        Ok(Self {
+            overrides: self.overrides.clone(),
+            label_overrides: label_overrides.into(),
+        })
+    }
+
+    /// Returns the user-facing label replacement when this layer names action
+    #[must_use]
+    pub fn label(&self, action: &ActionId) -> Option<&str> {
+        self.label_storage(action).map(AsRef::as_ref)
+    }
+
+    fn label_storage(&self, action: &ActionId) -> Option<&Arc<str>> {
+        self.label_overrides
+            .iter()
+            .find(|label_override| &label_override.action == action)
+            .map(|label_override| &label_override.label)
+    }
+
     /// Reports whether the layer contains no overrides
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.overrides.is_empty()
+        self.overrides.is_empty() && self.label_overrides.is_empty()
     }
 }
 
@@ -598,6 +648,8 @@ impl KeyMap {
 pub enum KeyMapError {
     /// One layer attempted to override the same Action ID twice
     DuplicateActionOverride(ActionId),
+    /// One layer attempted to replace the same Action ID label twice
+    DuplicateActionLabelOverride(ActionId),
 }
 
 impl KeyMapError {
@@ -605,7 +657,9 @@ impl KeyMapError {
     #[must_use]
     pub const fn action_id(&self) -> &ActionId {
         match self {
-            Self::DuplicateActionOverride(action) => action,
+            Self::DuplicateActionOverride(action) | Self::DuplicateActionLabelOverride(action) => {
+                action
+            }
         }
     }
 }
@@ -615,6 +669,9 @@ impl fmt::Display for KeyMapError {
         match self {
             Self::DuplicateActionOverride(action) => {
                 write!(formatter, "duplicate key override for ActionId {action}")
+            }
+            Self::DuplicateActionLabelOverride(action) => {
+                write!(formatter, "duplicate label override for ActionId {action}")
             }
         }
     }
@@ -903,10 +960,14 @@ pub fn resolve_actions(
             ));
         }
 
+        let mut label = action.label.clone();
         let mut bindings = action.default_bindings.clone();
         for scope in scopes {
             if let Some(replacement) = scope.key_map.binding_storage(&action.id) {
                 bindings = replacement.clone();
+            }
+            if let Some(replacement) = scope.key_map.label_storage(&action.id) {
+                label = replacement.clone();
             }
         }
 
@@ -940,7 +1001,7 @@ pub fn resolve_actions(
 
         resolved.push(ResolvedAction {
             id: action.id.clone(),
-            label: action.label.clone(),
+            label,
             bindings,
             availability: action.availability,
             help_visible: action.help_visible,
@@ -1040,5 +1101,64 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn binding_and_label_overrides_are_independent() {
+        let action = ActionId::from("app.submit");
+        let key_map = KeyMap::new()
+            .rebind(
+                action.clone(),
+                [KeyBinding::new(KeyStroke::new(
+                    KeyCode::Enter,
+                    Modifiers::NONE,
+                ))],
+            )
+            .unwrap()
+            .relabel(action.clone(), "Send")
+            .unwrap();
+
+        assert_eq!(key_map.bindings(&action).unwrap().len(), 1);
+        assert_eq!(key_map.label(&action), Some("Send"));
+        assert!(!key_map.is_empty());
+    }
+
+    #[test]
+    fn duplicate_label_override_does_not_mutate_the_original_map() {
+        let action = ActionId::from("app.submit");
+        let original = KeyMap::new().relabel(action.clone(), "Send").unwrap();
+        let error = original.relabel(action.clone(), "Submit").unwrap_err();
+
+        assert!(matches!(
+            &error,
+            KeyMapError::DuplicateActionLabelOverride(_)
+        ));
+        assert_eq!(error.action_id(), &action);
+        assert_eq!(original.label(&action), Some("Send"));
+    }
+
+    #[test]
+    fn nearest_label_override_wins_without_changing_bindings() {
+        let action = ActionDescriptor::new(
+            "app.submit",
+            "Submit",
+            [KeyBinding::new(KeyStroke::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            ))],
+        );
+        let outer = KeyMap::new().relabel("app.submit", "Send").unwrap();
+        let inner = KeyMap::new().relabel("app.submit", "送信").unwrap();
+
+        let resolved = resolve_actions(
+            &NodeId::from("composer"),
+            &[action],
+            &[KeyScope::new("outer", outer), KeyScope::new("inner", inner)],
+        )
+        .unwrap();
+
+        assert_eq!(resolved.actions()[0].label(), "送信");
+        assert_eq!(resolved.actions()[0].bindings().len(), 1);
+        assert_eq!(resolved.help_actions().next().unwrap().label(), "送信");
     }
 }

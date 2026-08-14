@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::sync::{Arc, LazyLock};
 
 use nagi_text::{WidthProfile, graphemes};
@@ -21,11 +24,164 @@ const DEFAULT_MAX_ROWS: u32 = 6;
 const TEXT_ACTION_COUNT: usize = 18;
 const COMPOSER_ACTION_COUNT: usize = 3 + TEXT_ACTION_COUNT;
 
+/// One stable application-defined Composer history entry identity
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ComposerHistoryEntryId(Arc<str>);
+
+impl ComposerHistoryEntryId {
+    /// Creates an opaque history entry identity
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(Arc::from(value.into()))
+    }
+
+    /// Returns the application-defined identity
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for ComposerHistoryEntryId {
+    fn from(value: &str) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+impl From<String> for ComposerHistoryEntryId {
+    fn from(value: String) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+/// One immutable Composer history entry
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComposerHistoryEntry {
+    id: ComposerHistoryEntryId,
+    value: Arc<str>,
+}
+
+impl ComposerHistoryEntry {
+    /// Creates an entry from a stable identity and recalled text
+    #[must_use]
+    pub fn new(id: impl Into<ComposerHistoryEntryId>, value: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            value: Arc::from(value.into()),
+        }
+    }
+
+    /// Returns the stable application-defined identity
+    #[must_use]
+    pub const fn id(&self) -> &ComposerHistoryEntryId {
+        &self.id
+    }
+
+    /// Returns the recalled text
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Error returned when Composer history contains the same stable ID twice
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DuplicateComposerHistoryEntryId {
+    id: ComposerHistoryEntryId,
+}
+
+impl DuplicateComposerHistoryEntryId {
+    /// Returns the duplicated entry identity
+    #[must_use]
+    pub const fn id(&self) -> &ComposerHistoryEntryId {
+        &self.id
+    }
+}
+
+impl fmt::Display for DuplicateComposerHistoryEntryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "duplicate Composer history entry ID {}",
+            self.id.as_str()
+        )
+    }
+}
+
+impl Error for DuplicateComposerHistoryEntryId {}
+
+/// Immutable unique oldest-to-newest Composer history
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComposerHistory {
+    inner: Arc<ComposerHistoryData>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ComposerHistoryData {
+    entries: Box<[ComposerHistoryEntry]>,
+    positions: HashMap<ComposerHistoryEntryId, usize>,
+}
+
+impl ComposerHistory {
+    /// Creates validated history whose stable entry IDs are unique
+    pub fn new(
+        entries: impl IntoIterator<Item = ComposerHistoryEntry>,
+    ) -> Result<Self, DuplicateComposerHistoryEntryId> {
+        let entries: Vec<ComposerHistoryEntry> = entries.into_iter().collect();
+        if entries.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut positions = HashMap::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            if positions.insert(entry.id.clone(), index).is_some() {
+                return Err(DuplicateComposerHistoryEntryId {
+                    id: entry.id.clone(),
+                });
+            }
+        }
+        Ok(Self {
+            inner: Arc::new(ComposerHistoryData {
+                entries: entries.into_boxed_slice(),
+                positions,
+            }),
+        })
+    }
+
+    /// Returns the number of history entries
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.entries.len()
+    }
+
+    /// Reports whether history is empty
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.entries.is_empty()
+    }
+
+    /// Returns one entry by its current oldest-to-newest index
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&ComposerHistoryEntry> {
+        self.inner.entries.get(index)
+    }
+
+    /// Returns immutable oldest-to-newest entries
+    #[must_use]
+    pub fn as_slice(&self) -> &[ComposerHistoryEntry] {
+        &self.inner.entries
+    }
+
+    fn position(&self, id: &ComposerHistoryEntryId) -> Option<usize> {
+        self.inner.positions.get(id).copied()
+    }
+}
+
 /// Application-owned editor, history position, and draft for a [`Composer`]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ComposerState {
     text_area: TextAreaState,
     history_index: Option<usize>,
+    history_entry_id: Option<ComposerHistoryEntryId>,
     draft: Option<TextAreaState>,
 }
 
@@ -36,6 +192,7 @@ impl ComposerState {
         Self {
             text_area,
             history_index: None,
+            history_entry_id: None,
             draft: None,
         }
     }
@@ -58,6 +215,12 @@ impl ComposerState {
         self.history_index
     }
 
+    /// Returns the stable entry identity currently being browsed
+    #[must_use]
+    pub const fn history_entry_id(&self) -> Option<&ComposerHistoryEntryId> {
+        self.history_entry_id.as_ref()
+    }
+
     /// Returns the TextArea state restored after browsing past newest history
     #[must_use]
     pub const fn draft(&self) -> Option<&TextAreaState> {
@@ -69,8 +232,44 @@ impl ComposerState {
     pub fn with_text_area(mut self, text_area: TextAreaState) -> Self {
         self.text_area = text_area;
         self.history_index = None;
+        self.history_entry_id = None;
         self.draft = None;
         self
+    }
+
+    /// Reconciles a browsing position against replacement history
+    ///
+    /// The same stable entry ID follows reordering and front truncation. A
+    /// changed value for that ID replaces the editor value. A missing ID exits
+    /// browsing and restores the preserved draft
+    #[must_use]
+    pub fn reconcile_history(mut self, history: &ComposerHistory) -> Self {
+        let Some(id) = self.history_entry_id.as_ref() else {
+            if self.history_index.is_some() {
+                self.restore_draft();
+            }
+            return self;
+        };
+        let Some(index) = history.position(id) else {
+            self.restore_draft();
+            return self;
+        };
+        self.history_index = Some(index);
+        let entry = history
+            .get(index)
+            .expect("Composer history position refers to an entry");
+        if self.text_area.value() != entry.value() {
+            self.text_area = TextAreaState::at_end(entry.value().to_owned());
+        }
+        self
+    }
+
+    fn restore_draft(&mut self) {
+        if let Some(draft) = self.draft.take() {
+            self.text_area = draft;
+        }
+        self.history_index = None;
+        self.history_entry_id = None;
     }
 }
 
@@ -107,7 +306,7 @@ pub struct Composer<Message> {
     viewport_id: NodeId,
     caret_id: NodeId,
     state: ComposerState,
-    history: Vec<String>,
+    history: ComposerHistory,
     enabled: bool,
     submit_enabled: bool,
     placeholder: String,
@@ -141,7 +340,7 @@ impl<Message: 'static> Composer<Message> {
             viewport_id: viewport_id.into(),
             caret_id: caret_id.into(),
             state,
-            history: Vec::new(),
+            history: ComposerHistory::default(),
             enabled: true,
             submit_enabled: true,
             placeholder: String::new(),
@@ -269,14 +468,11 @@ impl<Message: 'static> Composer<Message> {
         self
     }
 
-    /// Replaces oldest-to-newest recall entries without taking persistence ownership
+    /// Replaces immutable oldest-to-newest recall history
     #[must_use]
-    pub fn history<I, S>(mut self, entries: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.history = entries.into_iter().map(Into::into).collect();
+    pub fn history(mut self, history: ComposerHistory) -> Self {
+        self.state = self.state.reconcile_history(&history);
+        self.history = history;
         self
     }
 
@@ -331,7 +527,7 @@ impl<Message: 'static> Composer<Message> {
         let leading = composer_leading_descriptors(
             self.enabled,
             self.submit_enabled,
-            !has_up && composer_has_history_previous(&self.state, self.history.len()),
+            !has_up && composer_has_history_previous(&self.state, &self.history),
             !has_down && self.state.history_index.is_some(),
         );
         std::array::from_fn(|index| {
@@ -345,7 +541,8 @@ impl<Message: 'static> Composer<Message> {
 
     /// Builds the public semantic Node for this Composer
     #[must_use]
-    pub fn into_node(self) -> Node<Message> {
+    pub fn into_node(mut self) -> Node<Message> {
+        self.state = self.state.reconcile_history(&self.history);
         let rows = self.visible_rows();
         let has_undo = self.on_undo.is_some();
         let has_redo = self.on_redo.is_some();
@@ -528,13 +725,18 @@ fn composer_changed_state(current: &ComposerState, text_area: TextAreaState) -> 
     next.text_area = text_area;
     if value_changed {
         next.history_index = None;
+        next.history_entry_id = None;
         next.draft = None;
     }
     next
 }
 
-fn composer_history_previous(state: &ComposerState, history: &[String]) -> Option<ComposerState> {
-    if !composer_has_history_previous(state, history.len()) {
+fn composer_history_previous(
+    state: &ComposerState,
+    history: &ComposerHistory,
+) -> Option<ComposerState> {
+    let state = state.clone().reconcile_history(history);
+    if !composer_has_history_previous(&state, history) {
         return None;
     }
     let target = state
@@ -542,30 +744,41 @@ fn composer_history_previous(state: &ComposerState, history: &[String]) -> Optio
         .map_or(history.len().saturating_sub(1), |index| {
             index.min(history.len()).saturating_sub(1)
         });
-    let mut next = state.clone();
+    let entry = history
+        .get(target)
+        .expect("Composer history target refers to an entry");
+    let mut next = state;
     if next.draft.is_none() {
         next.draft = Some(next.text_area.clone());
     }
     next.history_index = Some(target);
-    next.text_area = TextAreaState::at_end(history[target].clone());
+    next.history_entry_id = Some(entry.id.clone());
+    next.text_area = TextAreaState::at_end(entry.value().to_owned());
     Some(next)
 }
 
-const fn composer_has_history_previous(state: &ComposerState, history_len: usize) -> bool {
-    history_len != 0 && !matches!(state.history_index, Some(0))
+fn composer_has_history_previous(state: &ComposerState, history: &ComposerHistory) -> bool {
+    !history.is_empty() && !matches!(state.history_index, Some(0))
 }
 
-fn composer_history_next(state: &ComposerState, history: &[String]) -> Option<ComposerState> {
+fn composer_history_next(
+    state: &ComposerState,
+    history: &ComposerHistory,
+) -> Option<ComposerState> {
+    let state = state.clone().reconcile_history(history);
     let index = state.history_index?;
-    let mut next = state.clone();
+    let mut next = state;
     if index.saturating_add(1) < history.len() {
         let target = index + 1;
+        let entry = history
+            .get(target)
+            .expect("Composer history target refers to an entry");
         next.history_index = Some(target);
-        next.text_area = TextAreaState::at_end(history[target].clone());
+        next.history_entry_id = Some(entry.id.clone());
+        next.text_area = TextAreaState::at_end(entry.value().to_owned());
         return Some(next);
     }
-    next.text_area = next.draft.take().unwrap_or_else(|| state.text_area.clone());
-    next.history_index = None;
+    next.restore_draft();
     Some(next)
 }
 
@@ -703,6 +916,15 @@ const fn repeatable_binding(code: KeyCode, modifiers: Modifiers) -> KeyBinding {
 mod tests {
     use super::*;
 
+    fn history(entries: &[(&str, &str)]) -> ComposerHistory {
+        ComposerHistory::new(
+            entries
+                .iter()
+                .map(|(id, value)| ComposerHistoryEntry::new(*id, *value)),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn leading_descriptor_clones_reuse_immutable_storage() {
         let enabled = composer_leading_descriptors(true, true, true, true);
@@ -722,5 +944,57 @@ mod tests {
                 unavailable[index].default_bindings()
             ));
         }
+    }
+
+    #[test]
+    fn history_rejects_duplicate_stable_ids() {
+        let error = ComposerHistory::new([
+            ComposerHistoryEntry::new("same", "first"),
+            ComposerHistoryEntry::new("same", "second"),
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.id().as_str(), "same");
+    }
+
+    #[test]
+    fn history_reconciliation_follows_id_across_front_truncation() {
+        let original = history(&[("old", "old"), ("middle", "middle"), ("new", "new")]);
+        let draft = TextAreaState::new("draft", 2).select(0);
+        let state = ComposerState::new(draft.clone());
+        let state = composer_history_previous(&state, &original).unwrap();
+        let state = composer_history_previous(&state, &original).unwrap();
+        let state = composer_changed_state(&state, TextAreaState::new("middle", 1));
+        let truncated = history(&[("middle", "middle"), ("new", "new")]);
+
+        let reconciled = state.reconcile_history(&truncated);
+
+        assert_eq!(reconciled.history_index(), Some(0));
+        assert_eq!(
+            reconciled.history_entry_id().map(|id| id.as_str()),
+            Some("middle")
+        );
+        assert_eq!(reconciled.text_area().value(), "middle");
+        assert_eq!(reconciled.text_area().cursor(), 1);
+        assert_eq!(reconciled.draft(), Some(&draft));
+    }
+
+    #[test]
+    fn history_reconciliation_updates_value_and_restores_draft_when_removed() {
+        let original = history(&[("entry", "old value")]);
+        let draft = TextAreaState::new("draft", 2).select(0);
+        let state =
+            composer_history_previous(&ComposerState::new(draft.clone()), &original).unwrap();
+        let replaced = history(&[("entry", "replacement")]);
+
+        let replaced_state = state.clone().reconcile_history(&replaced);
+        assert_eq!(replaced_state.text_area().value(), "replacement");
+        assert_eq!(replaced_state.text_area().cursor(), "replacement".len());
+
+        let restored = state.reconcile_history(&ComposerHistory::default());
+        assert_eq!(restored.text_area(), &draft);
+        assert_eq!(restored.history_index(), None);
+        assert_eq!(restored.history_entry_id(), None);
+        assert_eq!(restored.draft(), None);
     }
 }

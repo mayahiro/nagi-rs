@@ -34,6 +34,24 @@ impl App for Echo {
     }
 }
 
+#[derive(Default)]
+struct SchedulingApp {
+    messages: Vec<String>,
+}
+
+impl App for SchedulingApp {
+    type Message = String;
+
+    fn update(&mut self, message: Self::Message) -> Effect<Self::Message> {
+        self.messages.push(message);
+        Effect::none()
+    }
+
+    fn view(&self, _context: nagi_tui::ViewContext) -> Node<Self::Message> {
+        Node::text(self.messages.join(","))
+    }
+}
+
 #[test]
 fn input_update_surface_and_vt_output_match_shared_fixtures() {
     let Some(records) = support::load(
@@ -73,6 +91,55 @@ fn input_update_surface_and_vt_output_match_shared_fixtures() {
         assert!(
             output.windows(input.len()).any(|window| window == input),
             "case {} did not reach VT output",
+            record.id
+        );
+    }
+}
+
+#[test]
+fn bounded_scheduling_cycles_match_shared_fixtures() {
+    let Some(records) = support::load(
+        "runtime/scheduling.txt",
+        "runtime-scheduling",
+        &[
+            "maximum",
+            "messages",
+            "expected-cycle",
+            "expected-remaining",
+            "expected-final",
+        ],
+    ) else {
+        return;
+    };
+
+    for record in records {
+        let mut config = nagi_tui::RuntimeConfig::new(Size::new(8, 1));
+        config.max_updates_per_cycle = number(record.field("maximum")) as usize;
+        let mut runtime =
+            Runtime::with_clock(SchedulingApp::default(), config, VirtualClock::new()).unwrap();
+        for message in fixture_list(record.field("messages")) {
+            runtime.enqueue(message).unwrap();
+        }
+
+        runtime.process_pending().unwrap();
+        assert_eq!(
+            runtime.app().messages,
+            fixture_list(record.field("expected-cycle")),
+            "case {} cycle",
+            record.id
+        );
+        assert_eq!(
+            runtime.queued_messages(),
+            number(record.field("expected-remaining")) as usize,
+            "case {} remaining",
+            record.id
+        );
+
+        runtime.process_queued().unwrap();
+        assert_eq!(
+            runtime.app().messages,
+            fixture_list(record.field("expected-final")),
+            "case {} final",
             record.id
         );
     }
